@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db import get_db
 from enums import ExtractionStatus
 from main import app, reset_runtime_counters
-from models import Asset, PostExtraction, RawPost
+from models import Asset, AssetAlias, Kol, KolView, PostExtraction, RawPost
 from services.extraction import OpenAIRequestError, normalize_extracted_json
 from settings import get_settings
 
@@ -37,6 +37,9 @@ class FakeAsyncSession:
             RawPost: {},
             PostExtraction: {},
             Asset: {},
+            AssetAlias: {},
+            Kol: {},
+            KolView: {},
         }
         self._new: list[object] = []
 
@@ -61,9 +64,16 @@ class FakeAsyncSession:
     async def rollback(self) -> None:
         return None
 
+    async def delete(self, obj: object) -> None:
+        model = type(obj)
+        obj_id = getattr(obj, "id", None)
+        if obj_id is None:
+            return
+        self._data.get(model, {}).pop(obj_id, None)
+
     async def execute(self, query) -> FakeResult:  # noqa: ANN001
         entity = query.column_descriptions[0]["entity"]
-        items = list(self._data[entity].values())
+        items = list(self._data.get(entity, {}).values())
 
         for criterion in getattr(query, "_where_criteria", ()):
             key = criterion.left.key
@@ -245,6 +255,8 @@ def test_long_content_gets_truncated_with_meta(monkeypatch: pytest.MonkeyPatch) 
     app.dependency_overrides[get_db] = override_get_db
     client = TestClient(app)
     response = client.post("/raw-posts/1/extract")
+    extraction_id = response.json()["id"] if response.status_code == 201 else 0
+    detail = client.get(f"/extractions/{extraction_id}") if extraction_id else None
     app.dependency_overrides.clear()
 
     assert response.status_code == 201
@@ -608,3 +620,261 @@ def test_dummy_extractor_persists_prompt_and_raw_output(monkeypatch: pytest.Monk
     assert isinstance(body["prompt_text"], str) and "Post Content:" in body["prompt_text"]
     assert isinstance(body["prompt_hash"], str) and len(body["prompt_hash"]) == 64
     assert isinstance(body["raw_model_output"], str) and "\"horizon\": \"1w\"" in body["raw_model_output"]
+
+
+def test_normalize_derives_asset_views_from_global_payload() -> None:
+    normalized = normalize_extracted_json(
+        {
+            "assets": ["BTC", "VIX"],
+            "stance": "看空",
+            "horizon": "今晚",
+            "confidence": 0.82,
+            "summary": "风险偏好回落",
+            "reasoning": "避险情绪升温",
+        },
+        posted_at="2026-02-21T08:00:00+00:00",
+        include_meta=True,
+    )
+
+    assert len(normalized["asset_views"]) == 2
+    assert normalized["asset_views"][0]["stance"] == "bear"
+    assert normalized["asset_views"][0]["horizon"] == "intraday"
+    assert normalized["asset_views"][0]["confidence"] == 82
+    assert normalized["meta"]["derived_from_global"] is True
+
+
+def test_auto_approve_applies_threshold_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.setenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "70")
+    monkeypatch.setenv("AUTO_APPROVE_MAX_VIEWS", "10")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "market": "CRYPTO"}, {"symbol": "VIX", "market": "AUTO"}],
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 82,
+                    "reasoning": "risk-on momentum",
+                    "summary": "BTC stronger",
+                },
+                {
+                    "symbol": "VIX",
+                    "stance": "bear",
+                    "horizon": "1w",
+                    "confidence": 77,
+                    "reasoning": "volatility easing",
+                    "summary": "VIX lower",
+                },
+                {
+                    "symbol": "US10Y",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 60,
+                    "reasoning": "rates sticky",
+                    "summary": "yields up",
+                },
+                {
+                    "symbol": "SPX",
+                    "stance": "bear",
+                    "horizon": "1w",
+                    "confidence": 49,
+                    "reasoning": "weak breadth",
+                    "summary": "suspicious rally",
+                },
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    extraction_id = response.json()["id"] if response.status_code == 201 else 0
+    detail = client.get(f"/extractions/{extraction_id}") if extraction_id else None
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["auto_applied_count"] == 2
+    assert body["auto_policy"] == "threshold"
+    assert isinstance(body["auto_applied_kol_view_ids"], list)
+    assert len(body["auto_applied_kol_view_ids"]) == 2
+    assert len(fake_db._data[KolView]) == 2
+    assert all(view.confidence >= 70 for view in fake_db._data[KolView].values())
+    assert detail is not None and detail.status_code == 200
+    detail_body = detail.json()
+    assert isinstance(detail_body["auto_applied_asset_view_keys"], list)
+    assert len(detail_body["auto_applied_asset_view_keys"]) == 2
+    assert isinstance(detail_body["auto_applied_views"], list)
+    assert len(detail_body["auto_applied_views"]) == 2
+
+
+def test_auto_approve_repeat_trigger_skips_same_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.setenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "70")
+    monkeypatch.setenv("AUTO_APPROVE_MAX_VIEWS", "10")
+
+    call = {"n": 0}
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        call["n"] += 1
+        return {
+            "assets": [{"symbol": "BTC", "market": "CRYPTO"}],
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 82,
+                    "reasoning": "risk-on",
+                    "summary": f"BTC view v{call['n']}",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    first = client.post("/raw-posts/1/extract")
+    second = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    second_body = second.json()
+    assert second_body["auto_applied_count"] == 0
+    assert len(fake_db._data[KolView]) == 1
+    only_view = list(fake_db._data[KolView].values())[0]
+    assert only_view.summary == "BTC view v1"
+
+
+def test_approve_batch_on_auto_applied_same_key_does_not_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.setenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "70")
+    monkeypatch.setenv("AUTO_APPROVE_MAX_VIEWS", "10")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "market": "CRYPTO"}],
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 82,
+                    "reasoning": "risk-on",
+                    "summary": "auto summary",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    extract_resp = client.post("/raw-posts/1/extract")
+    assert extract_resp.status_code == 201
+    extraction = extract_resp.json()
+
+    approve_resp = client.post(
+        f"/extractions/{extraction['id']}/approve-batch",
+        json={
+            "kol_id": 1,
+            "views": [
+                {
+                    "asset_id": 1,
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 91,
+                    "summary": "manual summary",
+                    "source_url": "https://x.com/alice/status/post-1",
+                    "as_of": "2026-02-21",
+                }
+            ],
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert approve_resp.status_code == 200
+    approve_body = approve_resp.json()
+    assert approve_body["approve_inserted_count"] == 0
+    assert approve_body["approve_skipped_count"] == 1
+    assert len(fake_db._data[KolView]) == 1
+    only_view = list(fake_db._data[KolView].values())[0]
+    assert only_view.confidence == 82
+    assert only_view.summary == "auto summary"
+
+
+def test_auto_approve_fallback_top1_applies_only_best_above_min_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.setenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "70")
+    monkeypatch.setenv("AUTO_APPROVE_MIN_DISPLAY_CONFIDENCE", "50")
+    monkeypatch.setenv("AUTO_APPROVE_MAX_VIEWS", "10")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "market": "CRYPTO"}, {"symbol": "VIX", "market": "AUTO"}],
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 68, "summary": "btc"},
+                {"symbol": "VIX", "stance": "bear", "horizon": "1w", "confidence": 55, "summary": "vix"},
+                {"symbol": "US10Y", "stance": "bull", "horizon": "1w", "confidence": 49, "summary": "us10y"},
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["auto_policy"] == "top1_fallback"
+    assert body["auto_applied_count"] == 1
+    assert len(fake_db._data[KolView]) == 1
+    only_view = list(fake_db._data[KolView].values())[0]
+    assert only_view.asset_id == 1
+    assert only_view.confidence == 68

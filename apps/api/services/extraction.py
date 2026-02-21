@@ -67,10 +67,27 @@ class ExtractionPayload(BaseModel):
     source_url: str | None = None
     as_of: date | None = None
     event_tags: list[str] = Field(default_factory=list)
+    asset_views: list["AssetView"] = Field(default_factory=list)
+
+
+class AssetView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    stance: Literal["bull", "bear", "neutral"]
+    horizon: Literal["intraday", "1w", "1m", "3m", "1y"]
+    confidence: int = Field(ge=0, le=100)
+    reasoning: str | None = Field(default=None, max_length=1024)
+    summary: str | None = Field(default=None, max_length=1024)
+    drivers: list[str] = Field(default_factory=list)
+
+
+ExtractionPayload.model_rebuild()
 
 
 _EXTRACTION_TOP_LEVEL_KEYS = set(ExtractionPayload.model_fields.keys())
 _ASSET_KEYS = set(ExtractedAsset.model_fields.keys())
+_ASSET_VIEW_KEYS = set(AssetView.model_fields.keys())
 _STANCE_ALIAS_MAP: dict[str, str] = {
     "bull": "bull",
     "long": "bull",
@@ -139,6 +156,7 @@ EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
         "source_url",
         "as_of",
         "event_tags",
+        "asset_views",
     ],
     "properties": {
         "assets": {
@@ -164,6 +182,26 @@ EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
         "event_tags": {
             "type": "array",
             "items": {"type": "string", "minLength": 1, "maxLength": 64},
+        },
+        "asset_views": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["symbol", "stance", "horizon", "confidence", "reasoning", "summary"],
+                "properties": {
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": 32},
+                    "stance": {"type": "string", "enum": STANCE_VALUES},
+                    "horizon": {"type": "string", "enum": HORIZON_VALUES},
+                    "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "reasoning": {"type": ["string", "null"], "maxLength": 1024},
+                    "summary": {"type": ["string", "null"], "maxLength": 1024},
+                    "drivers": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1, "maxLength": 64},
+                    },
+                },
+            },
         },
     },
 }
@@ -215,8 +253,12 @@ def normalize_extracted_json(
     extracted_json: dict[str, Any],
     *,
     posted_at: datetime | date | str | None = None,
+    include_meta: bool = False,
 ) -> dict[str, Any]:
     normalized = {k: v for k, v in extracted_json.items() if k in _EXTRACTION_TOP_LEVEL_KEYS}
+    normalized_meta: dict[str, Any] = {}
+    if isinstance(extracted_json.get("meta"), dict):
+        normalized_meta = dict(extracted_json["meta"])
 
     reasoning_raw = normalized.get("reasoning")
     normalized["reasoning"] = _normalize_reasoning(reasoning_raw)
@@ -233,6 +275,13 @@ def normalize_extracted_json(
     assets_raw = normalized.get("assets")
     normalized["assets"] = _normalize_assets(assets_raw)
 
+    asset_views_raw = normalized.get("asset_views")
+    normalized["asset_views"] = _normalize_asset_views(asset_views_raw)
+    if not normalized["asset_views"] and normalized["assets"]:
+        normalized["asset_views"] = _derive_asset_views_from_global(normalized)
+        if normalized["asset_views"]:
+            normalized_meta["derived_from_global"] = True
+
     event_tags_raw = normalized.get("event_tags")
     normalized["event_tags"] = _normalize_event_tags(event_tags_raw)
 
@@ -241,6 +290,8 @@ def normalize_extracted_json(
         as_of_raw,
         posted_at=posted_at if posted_at is not None else extracted_json.get("posted_at"),
     )
+    if include_meta and normalized_meta:
+        normalized["meta"] = normalized_meta
 
     return normalized
 
@@ -365,6 +416,68 @@ def _normalize_assets(value: Any) -> list[dict[str, Any]]:
     return normalized_assets
 
 
+def _normalize_asset_views(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        candidates = [value]
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        return []
+
+    normalized_views: list[dict[str, Any]] = []
+    for candidate in candidates:
+        normalized_view = _normalize_asset_view_item(candidate)
+        if normalized_view is not None:
+            normalized_views.append(normalized_view)
+    return normalized_views
+
+
+def _normalize_asset_view_item(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized = {k: v for k, v in value.items() if k in _ASSET_VIEW_KEYS}
+    symbol_raw = normalized.get("symbol")
+    if not isinstance(symbol_raw, str) or not symbol_raw.strip():
+        return None
+
+    drivers_raw = normalized.get("drivers")
+    normalized["drivers"] = _normalize_drivers(drivers_raw)
+    normalized["symbol"] = symbol_raw.strip().upper()
+    normalized["stance"] = _normalize_stance(normalized.get("stance")) or "neutral"
+    normalized["horizon"] = _normalize_horizon(normalized.get("horizon"))
+    normalized["confidence"] = _normalize_confidence(normalized.get("confidence"))
+    normalized["reasoning"] = _normalize_reasoning(normalized.get("reasoning"))
+    normalized["summary"] = _normalize_reasoning(normalized.get("summary"))
+    return normalized
+
+
+def _derive_asset_views_from_global(normalized: dict[str, Any]) -> list[dict[str, Any]]:
+    views: list[dict[str, Any]] = []
+    stance = _normalize_stance(normalized.get("stance")) or "neutral"
+    horizon = _normalize_horizon(normalized.get("horizon"))
+    confidence = _normalize_confidence(normalized.get("confidence"))
+    reasoning = _normalize_reasoning(normalized.get("reasoning"))
+    summary = _normalize_reasoning(normalized.get("summary"))
+    for asset in normalized.get("assets", []):
+        symbol = asset.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            continue
+        views.append(
+            {
+                "symbol": symbol.strip().upper(),
+                "stance": stance,
+                "horizon": horizon,
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "summary": summary,
+                "drivers": [],
+            }
+        )
+    return views
+
+
 def _normalize_asset_item(value: Any) -> dict[str, Any] | None:
     if isinstance(value, str):
         symbol = value.strip()
@@ -444,6 +557,19 @@ def _normalize_event_tags(value: Any) -> list[str]:
         if tag:
             normalized_tags.append(tag[:64])
     return normalized_tags
+
+
+def _normalize_drivers(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    drivers: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if cleaned:
+            drivers.append(cleaned[:64])
+    return drivers
 
 
 class DummyExtractor(Extractor):
@@ -570,6 +696,8 @@ class OpenAIExtractor(Extractor):
             "include event_tags as string array. "
             "assets should be array of objects with symbol/name/market, symbol is required. "
             "assets[*].market must be one of CRYPTO/STOCK/ETF/FOREX/OTHER/AUTO. "
+            "asset_views must be array of per-asset views, each contains "
+            "symbol/stance/horizon/confidence/reasoning/summary and optional drivers. "
             "as_of must be date-only string in YYYY-MM-DD (no time)."
         )
         system_prompt = (
@@ -689,6 +817,7 @@ def default_extracted_json(raw_post: RawPost) -> dict[str, Any]:
         source_url=raw_post.url.strip() or None,
         as_of=raw_post.posted_at.date(),
         event_tags=[],
+        asset_views=[],
     )
     return payload.model_dump(mode="json")
 

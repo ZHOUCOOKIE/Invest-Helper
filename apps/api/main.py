@@ -1,5 +1,5 @@
 from collections import defaultdict, deque
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 from types import SimpleNamespace
@@ -16,13 +16,16 @@ from sqlalchemy.orm import selectinload
 from db import get_db
 from enums import HORIZON_ORDER, Stance
 from enums import ExtractionStatus
-from models import Asset, Kol, KolView, PostExtraction, RawPost
+from models import Asset, AssetAlias, Kol, KolView, PostExtraction, RawPost
 from schemas import (
     AssetCreate,
+    AssetAliasCreate,
+    AssetAliasRead,
     AssetViewsGroupRead,
     AssetViewsMetaRead,
     AssetRead,
     AssetViewsRead,
+    AutoAppliedViewRead,
     DashboardClarityRead,
     DashboardExtractionStatsRead,
     DashboardPendingExtractionRead,
@@ -30,6 +33,7 @@ from schemas import (
     DashboardTopAssetRead,
     ExtractorStatusRead,
     ExtractionApproveRequest,
+    ExtractionApproveBatchRequest,
     ExtractionRejectRequest,
     KolCreate,
     KolRead,
@@ -47,6 +51,7 @@ from services.extraction import (
     OpenAIFallbackError,
     OpenAIExtractor,
     default_extracted_json,
+    normalize_extracted_json,
     get_openai_call_budget_remaining,
     reset_openai_call_budget_counter,
     select_extractor,
@@ -80,7 +85,8 @@ def is_newer_view(candidate: KolView, current: KolView) -> bool:
 def select_latest_views(views: list[KolView]) -> list[KolView]:
     latest_by_key: dict[tuple[int, int, str], KolView] = {}
     for view in views:
-        key = (view.kol_id, view.asset_id, str(view.horizon.value))
+        horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
+        key = (view.kol_id, view.asset_id, horizon_value)
         prev = latest_by_key.get(key)
         if prev is None or is_newer_view(view, prev):
             latest_by_key[key] = view
@@ -94,7 +100,10 @@ def build_asset_views_response(asset_id: int, views: list[KolView]) -> AssetView
         lambda: {Stance.bull: [], Stance.bear: [], Stance.neutral: []}
     )
     for view in latest_views:
-        grouped[view.horizon.value][view.stance].append(KolViewRead.model_validate(view))
+        horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
+        stance_value = view.stance.value if hasattr(view.stance, "value") else str(view.stance)
+        stance = Stance(stance_value) if stance_value in {"bull", "bear", "neutral"} else Stance.neutral
+        grouped[horizon_value][stance].append(KolViewRead.model_validate(view))
 
     groups: list[AssetViewsGroupRead] = []
     order_index = {value: idx for idx, value in enumerate(HORIZON_ORDER)}
@@ -218,6 +227,57 @@ async def _load_assets_for_prompt(db: AsyncSession, limit: int) -> list[dict[str
     return [{"symbol": item.symbol, "name": item.name, "market": item.market} for item in items]
 
 
+async def _load_aliases_for_prompt(db: AsyncSession) -> list[dict[str, str]]:
+    result = await db.execute(
+        select(AssetAlias, Asset.symbol)
+        .join(Asset, Asset.id == AssetAlias.asset_id)
+        .order_by(AssetAlias.id.asc())
+    )
+    aliases: list[dict[str, str]] = []
+    for alias, symbol in result.all():
+        aliases.append({"alias": alias.alias, "symbol": symbol})
+    return aliases
+
+
+def _normalize_alias_key(value: str) -> str:
+    return value.strip().lower()
+
+
+def _build_alias_to_symbol_map(aliases: list[dict[str, str]]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in aliases:
+        alias = _normalize_alias_key(item.get("alias", ""))
+        symbol = item.get("symbol", "").strip().upper()
+        if alias and symbol:
+            mapping[alias] = symbol
+    return mapping
+
+
+def _apply_alias_symbol_mapping(extracted_json: dict[str, Any], alias_to_symbol: dict[str, str]) -> None:
+    if not alias_to_symbol:
+        return
+
+    for asset in extracted_json.get("assets", []):
+        if not isinstance(asset, dict):
+            continue
+        symbol = asset.get("symbol")
+        if not isinstance(symbol, str):
+            continue
+        mapped = alias_to_symbol.get(_normalize_alias_key(symbol))
+        if mapped:
+            asset["symbol"] = mapped
+
+    for view in extracted_json.get("asset_views", []):
+        if not isinstance(view, dict):
+            continue
+        symbol = view.get("symbol")
+        if not isinstance(symbol, str):
+            continue
+        mapped = alias_to_symbol.get(_normalize_alias_key(symbol))
+        if mapped:
+            view["symbol"] = mapped
+
+
 async def upsert_asset(
     db: AsyncSession,
     *,
@@ -261,12 +321,18 @@ async def ensure_assets_from_extracted_json(
     raw_post: RawPost | SimpleNamespace,
     extracted_json: dict[str, Any],
 ) -> None:
+    seen_symbols: set[str] = set()
+    candidates: list[Any] = []
     assets = extracted_json.get("assets")
-    if not isinstance(assets, list) or not assets:
+    if isinstance(assets, list):
+        candidates.extend(assets)
+    asset_views = extracted_json.get("asset_views")
+    if isinstance(asset_views, list):
+        candidates.extend(asset_views)
+    if not candidates:
         return
 
-    seen_symbols: set[str] = set()
-    for item in assets:
+    for item in candidates:
         if isinstance(item, str):
             symbol = _normalize_asset_symbol(item)
             name = None
@@ -305,11 +371,343 @@ def _resolve_extractor_name(
     return extractor.extractor_name
 
 
+async def _upsert_kol_by_author(db: AsyncSession, *, platform: str, handle: str) -> Kol:
+    platform_normalized = platform.strip().lower()
+    handle_normalized = handle.strip().lower()
+    result = await db.execute(
+        select(Kol).where(
+            Kol.platform == platform_normalized,
+            Kol.handle == handle_normalized,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        if not existing.enabled:
+            existing.enabled = True
+            await db.flush()
+        return existing
+
+    kol = Kol(
+        platform=platform_normalized,
+        handle=handle_normalized,
+        display_name=None,
+        enabled=True,
+    )
+    db.add(kol)
+    await db.flush()
+    return kol
+
+
+async def _find_existing_kol_view(
+    db: AsyncSession,
+    *,
+    kol_id: int,
+    asset_id: int,
+    horizon: str,
+    as_of: date,
+) -> KolView | None:
+    result = await db.execute(
+        select(KolView).where(
+            KolView.kol_id == kol_id,
+            KolView.asset_id == asset_id,
+            KolView.horizon == horizon,
+            KolView.as_of == as_of,
+        )
+    )
+    candidates = list(result.scalars().all())
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            item.created_at or datetime.min.replace(tzinfo=UTC),
+            item.id or 0,
+        ),
+        reverse=True,
+    )
+    keep = candidates[0]
+    for duplicated in candidates[1:]:
+        await db.delete(duplicated)
+    if len(candidates) > 1:
+        await db.flush()
+    return keep
+
+
+def _build_kol_asset_view_key(*, kol_id: int, asset_id: int, horizon: str, as_of: date) -> str:
+    return f"{kol_id}:{asset_id}:{horizon}:{as_of.isoformat()}"
+
+
+async def _insert_kol_view_if_absent(
+    db: AsyncSession,
+    *,
+    kol_id: int,
+    asset_id: int,
+    stance: str,
+    horizon: str,
+    confidence: int,
+    summary: str,
+    source_url: str,
+    as_of: date,
+) -> tuple[KolView, bool, str]:
+    key = _build_kol_asset_view_key(kol_id=kol_id, asset_id=asset_id, horizon=horizon, as_of=as_of)
+    existing = await _find_existing_kol_view(
+        db,
+        kol_id=kol_id,
+        asset_id=asset_id,
+        horizon=horizon,
+        as_of=as_of,
+    )
+    if existing is not None:
+        return existing, False, key
+
+    view = KolView(
+        kol_id=kol_id,
+        asset_id=asset_id,
+        stance=stance,
+        horizon=horizon,
+        confidence=confidence,
+        summary=summary,
+        source_url=source_url,
+        as_of=as_of,
+    )
+    db.add(view)
+    await db.flush()
+    return view, True, key
+
+
+def _iter_asset_view_candidates(extracted_json: dict[str, Any]) -> list[dict[str, Any]]:
+    asset_views = extracted_json.get("asset_views")
+    if not isinstance(asset_views, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in asset_views:
+        if not isinstance(item, dict):
+            continue
+        symbol = _normalize_asset_symbol(item.get("symbol"))
+        if symbol is None:
+            continue
+        stance = item.get("stance")
+        horizon = item.get("horizon")
+        confidence_raw = item.get("confidence")
+        if stance not in {"bull", "bear", "neutral"}:
+            continue
+        if horizon not in {"intraday", "1w", "1m", "3m", "1y"}:
+            continue
+        if not isinstance(confidence_raw, (int, float)):
+            continue
+        confidence = int(max(0, min(100, round(float(confidence_raw)))))
+        reasoning = item.get("reasoning") if isinstance(item.get("reasoning"), str) else None
+        summary = item.get("summary") if isinstance(item.get("summary"), str) else None
+        candidates.append(
+            {
+                "symbol": symbol,
+                "stance": stance,
+                "horizon": horizon,
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "summary": summary,
+            }
+        )
+    candidates.sort(key=lambda item: item["confidence"], reverse=True)
+    return candidates
+
+
+async def _auto_apply_extraction_views(
+    db: AsyncSession,
+    *,
+    extraction: PostExtraction,
+    raw_post: RawPost,
+) -> None:
+    settings = get_settings()
+    extraction.auto_applied_count = 0
+    extraction.auto_policy = None
+    extraction.auto_applied_kol_view_ids = None
+    setattr(extraction, "auto_applied_asset_view_keys", [])
+    setattr(extraction, "auto_applied_views", [])
+    if not settings.auto_approve_enabled or extraction.status != ExtractionStatus.pending:
+        print(
+            "[auto-approve]",
+            {
+                "AUTO_APPROVE_ENABLED": settings.auto_approve_enabled,
+                "threshold": settings.auto_approve_confidence_threshold,
+                "min_display": settings.auto_approve_min_display_confidence,
+                "candidates": 0,
+                "applied": 0,
+                "policy": None,
+            },
+        )
+        return
+
+    candidates = _iter_asset_view_candidates(extraction.extracted_json)
+    if not candidates:
+        print(
+            "[auto-approve]",
+            {
+                "AUTO_APPROVE_ENABLED": settings.auto_approve_enabled,
+                "threshold": settings.auto_approve_confidence_threshold,
+                "min_display": settings.auto_approve_min_display_confidence,
+                "candidates": 0,
+                "applied": 0,
+                "policy": None,
+            },
+        )
+        return
+    min_display = max(0, min(100, settings.auto_approve_min_display_confidence))
+    candidates = [item for item in candidates if item["confidence"] >= min_display]
+    if not candidates:
+        print(
+            "[auto-approve]",
+            {
+                "AUTO_APPROVE_ENABLED": settings.auto_approve_enabled,
+                "threshold": settings.auto_approve_confidence_threshold,
+                "min_display": settings.auto_approve_min_display_confidence,
+                "candidates": 0,
+                "applied": 0,
+                "policy": None,
+            },
+        )
+        return
+    max_views = max(1, settings.auto_approve_max_views)
+    threshold = max(0, min(100, settings.auto_approve_confidence_threshold))
+    candidates = candidates[:max_views]
+    selected = [item for item in candidates if item["confidence"] >= threshold]
+    policy: str | None = None
+    if selected:
+        policy = "threshold"
+    else:
+        selected = candidates[:1]
+        policy = "top1_fallback" if selected else None
+    if not selected:
+        return
+
+    kol = await _upsert_kol_by_author(db, platform=raw_post.platform, handle=raw_post.author_handle)
+    created_ids: list[int] = []
+    applied_keys: list[str] = []
+    applied_views: list[AutoAppliedViewRead] = []
+    skipped_count = 0
+    for item in selected:
+        asset = await upsert_asset(
+            db,
+            symbol=item["symbol"],
+            market=_infer_auto_market(raw_post, item["symbol"]),
+        )
+        summary = (item.get("summary") or item.get("reasoning") or extraction.extracted_json.get("summary") or "").strip()
+        if not summary:
+            summary = f"{item['symbol']} {item['stance']} ({item['horizon']})"
+        source_url = (extraction.extracted_json.get("source_url") or raw_post.url or "").strip()
+        if not source_url:
+            source_url = raw_post.url
+        as_of = raw_post.posted_at.date()
+        extracted_as_of = extraction.extracted_json.get("as_of")
+        if isinstance(extracted_as_of, str):
+            try:
+                as_of = datetime.fromisoformat(extracted_as_of).date()
+            except ValueError:
+                pass
+        view, inserted, key = await _insert_kol_view_if_absent(
+            db,
+            kol_id=kol.id,
+            asset_id=asset.id,
+            stance=item["stance"],
+            horizon=item["horizon"],
+            confidence=item["confidence"],
+            summary=summary[:1024],
+            source_url=source_url[:1024],
+            as_of=as_of,
+        )
+        if not inserted:
+            skipped_count += 1
+            continue
+        created_ids.append(view.id)
+        applied_keys.append(key)
+        applied_views.append(
+            AutoAppliedViewRead(
+                kol_view_id=view.id,
+                symbol=asset.symbol,
+                asset_id=asset.id,
+                stance=view.stance,
+                horizon=view.horizon,
+                as_of=view.as_of,
+                confidence=view.confidence,
+            )
+        )
+
+    extraction.auto_applied_count = len(created_ids)
+    extraction.auto_policy = policy
+    extraction.auto_applied_kol_view_ids = created_ids
+    setattr(extraction, "auto_applied_asset_view_keys", applied_keys)
+    setattr(extraction, "auto_applied_views", applied_views)
+    print(
+        "[auto-approve]",
+        {
+            "AUTO_APPROVE_ENABLED": settings.auto_approve_enabled,
+            "threshold": threshold,
+            "min_display": min_display,
+            "candidates": len(candidates),
+            "applied": len(created_ids),
+            "skipped": skipped_count,
+            "policy": policy,
+        },
+    )
+
+
+async def _attach_auto_applied_metadata(db: AsyncSession, extraction: PostExtraction) -> None:
+    kol_view_ids = extraction.auto_applied_kol_view_ids
+    if not isinstance(kol_view_ids, list) or not kol_view_ids:
+        setattr(extraction, "auto_applied_asset_view_keys", None)
+        setattr(extraction, "auto_applied_views", None)
+        return
+
+    auto_applied_asset_view_keys: list[str] = []
+    auto_applied_views: list[AutoAppliedViewRead] = []
+    for kol_view_id in kol_view_ids:
+        if not isinstance(kol_view_id, int):
+            continue
+        kol_view = await db.get(KolView, kol_view_id)
+        if kol_view is None:
+            continue
+        asset = await db.get(Asset, kol_view.asset_id)
+        symbol = asset.symbol if asset is not None else str(kol_view.asset_id)
+        horizon = kol_view.horizon.value if hasattr(kol_view.horizon, "value") else str(kol_view.horizon)
+        stance = kol_view.stance.value if hasattr(kol_view.stance, "value") else str(kol_view.stance)
+        auto_applied_asset_view_keys.append(
+            _build_kol_asset_view_key(
+                kol_id=kol_view.kol_id,
+                asset_id=kol_view.asset_id,
+                horizon=horizon,
+                as_of=kol_view.as_of,
+            )
+        )
+        auto_applied_views.append(
+            AutoAppliedViewRead(
+                kol_view_id=kol_view.id,
+                symbol=symbol,
+                asset_id=kol_view.asset_id,
+                stance=stance,
+                horizon=horizon,
+                as_of=kol_view.as_of,
+                confidence=kol_view.confidence,
+            )
+        )
+
+    setattr(extraction, "auto_applied_asset_view_keys", auto_applied_asset_view_keys)
+    setattr(extraction, "auto_applied_views", auto_applied_views)
+
+
+def _attach_extraction_auto_approve_settings(extraction: PostExtraction) -> None:
+    settings = get_settings()
+    setattr(extraction, "auto_approve_confidence_threshold", settings.auto_approve_confidence_threshold)
+    setattr(extraction, "auto_approve_min_display_confidence", settings.auto_approve_min_display_confidence)
+
+
 async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> PostExtraction:
     settings = get_settings()
     extraction_input, truncation_meta = _build_extraction_input(raw_post)
     extractor = select_extractor(settings)
     assets_for_prompt = await _load_assets_for_prompt(db, settings.max_assets_in_prompt)
+    try:
+        aliases_for_prompt = await _load_aliases_for_prompt(db)
+    except Exception:  # noqa: BLE001
+        aliases_for_prompt = []
     prompt_bundle = build_extract_prompt(
         prompt_version=settings.prompt_version,
         platform=extraction_input.platform,
@@ -318,6 +716,7 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         posted_at=extraction_input.posted_at,
         content_text=extraction_input.content_text,
         assets=assets_for_prompt,
+        aliases=aliases_for_prompt,
         max_assets_in_prompt=settings.max_assets_in_prompt,
     )
     extractor.set_prompt_bundle(prompt_bundle)
@@ -342,6 +741,17 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
             extractor = DummyExtractor()
             extractor.set_prompt_bundle(prompt_bundle)
             extracted_json = extractor.extract(extraction_input)
+
+    if isinstance(extracted_json, dict):
+        extracted_json = extracted_json.copy()
+    else:
+        extracted_json = default_extracted_json(extraction_input)
+    extracted_json = normalize_extracted_json(
+        extracted_json,
+        posted_at=extraction_input.posted_at,
+        include_meta=True,
+    )
+    _apply_alias_symbol_mapping(extracted_json, _build_alias_to_symbol_map(aliases_for_prompt))
 
     base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
     safe_meta = base_meta if isinstance(base_meta, dict) else {}
@@ -398,6 +808,13 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         last_error=last_error,
     )
     db.add(extraction)
+    await db.flush()
+    try:
+        await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post)
+    except Exception as exc:  # noqa: BLE001
+        auto_error = _build_last_error(exc)
+        extraction.last_error = auto_error if not extraction.last_error else f"{extraction.last_error}; auto_apply={auto_error}"
+    _attach_extraction_auto_approve_settings(extraction)
     return extraction
 
 
@@ -437,6 +854,39 @@ async def upsert_asset_endpoint(payload: AssetCreate, db: AsyncSession = Depends
     await db.commit()
     await db.refresh(asset)
     return asset
+
+
+@app.get("/assets/{asset_id}/aliases", response_model=list[AssetAliasRead])
+async def list_asset_aliases(asset_id: int, db: AsyncSession = Depends(get_db)):
+    asset = await db.get(Asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+    result = await db.execute(
+        select(AssetAlias).where(AssetAlias.asset_id == asset_id).order_by(AssetAlias.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+@app.post("/assets/{asset_id}/aliases", response_model=list[AssetAliasRead], status_code=status.HTTP_201_CREATED)
+async def create_asset_alias(asset_id: int, payload: AssetAliasCreate, db: AsyncSession = Depends(get_db)):
+    asset = await db.get(Asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+    alias = payload.alias.strip()
+    if not alias:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="alias is required")
+
+    alias_row = AssetAlias(asset_id=asset_id, alias=alias)
+    db.add(alias_row)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="alias already exists")
+    result = await db.execute(
+        select(AssetAlias).where(AssetAlias.asset_id == asset_id).order_by(AssetAlias.id.asc())
+    )
+    return list(result.scalars().all())
 
 
 @app.get("/kols", response_model=list[KolRead])
@@ -740,7 +1190,10 @@ async def list_extractions(
         .offset(offset)
         .limit(limit)
     )
-    return list(result.scalars().all())
+    items = list(result.scalars().all())
+    for extraction in items:
+        _attach_extraction_auto_approve_settings(extraction)
+    return items
 
 
 @app.get("/extractions/{extraction_id}", response_model=PostExtractionWithRawPostRead)
@@ -753,6 +1206,8 @@ async def get_extraction(extraction_id: int, db: AsyncSession = Depends(get_db))
     extraction = result.scalar_one_or_none()
     if extraction is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+    await _attach_auto_applied_metadata(db, extraction)
+    _attach_extraction_auto_approve_settings(extraction)
     return extraction
 
 
@@ -778,25 +1233,29 @@ async def approve_extraction(
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
 
-    view = KolView(
-        kol_id=payload.kol_id,
-        asset_id=payload.asset_id,
-        stance=payload.stance,
-        horizon=payload.horizon,
-        confidence=payload.confidence,
-        summary=payload.summary.strip(),
-        source_url=payload.source_url.strip(),
-        as_of=payload.as_of,
-    )
-    db.add(view)
-
     extraction.status = ExtractionStatus.approved
     extraction.reviewed_at = datetime.now(UTC)
     extraction.reviewed_by = EXTRACTION_REVIEWER
     extraction.review_note = None
 
+    inserted_count = 0
+    skipped_count = 0
     try:
-        await db.flush()
+        view, inserted, _ = await _insert_kol_view_if_absent(
+            db,
+            kol_id=payload.kol_id,
+            asset_id=payload.asset_id,
+            stance=payload.stance.value,
+            horizon=payload.horizon.value,
+            confidence=payload.confidence,
+            summary=payload.summary.strip(),
+            source_url=payload.source_url.strip(),
+            as_of=payload.as_of,
+        )
+        if inserted:
+            inserted_count = 1
+        else:
+            skipped_count = 1
         extraction.applied_kol_view_id = view.id
         await db.commit()
     except IntegrityError:
@@ -804,6 +1263,73 @@ async def approve_extraction(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate kol view")
 
     await db.refresh(extraction)
+    setattr(extraction, "approve_inserted_count", inserted_count)
+    setattr(extraction, "approve_skipped_count", skipped_count)
+    _attach_extraction_auto_approve_settings(extraction)
+    return extraction
+
+
+@app.post("/extractions/{extraction_id}/approve-batch", response_model=PostExtractionRead)
+async def approve_extraction_batch(
+    extraction_id: int,
+    payload: ExtractionApproveBatchRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    extraction = await db.get(PostExtraction, extraction_id)
+    if extraction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+    if extraction.status != ExtractionStatus.pending:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"extraction already {extraction.status.value}",
+        )
+
+    kol = await db.get(Kol, payload.kol_id)
+    if kol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol not found")
+
+    inserted_count = 0
+    skipped_count = 0
+    first_applied_kol_view_id: int | None = None
+    try:
+        for item in payload.views:
+            asset = await db.get(Asset, item.asset_id)
+            if asset is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"asset {item.asset_id} not found")
+            view, inserted, _ = await _insert_kol_view_if_absent(
+                db,
+                kol_id=payload.kol_id,
+                asset_id=item.asset_id,
+                stance=item.stance.value,
+                horizon=item.horizon.value,
+                confidence=item.confidence,
+                summary=item.summary.strip(),
+                source_url=item.source_url.strip(),
+                as_of=item.as_of,
+            )
+            if first_applied_kol_view_id is None:
+                first_applied_kol_view_id = view.id
+            if inserted:
+                inserted_count += 1
+            else:
+                skipped_count += 1
+        extraction.status = ExtractionStatus.approved
+        extraction.reviewed_at = datetime.now(UTC)
+        extraction.reviewed_by = EXTRACTION_REVIEWER
+        extraction.review_note = None
+        extraction.applied_kol_view_id = first_applied_kol_view_id
+        await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate kol view")
+
+    await db.refresh(extraction)
+    setattr(extraction, "approve_inserted_count", inserted_count)
+    setattr(extraction, "approve_skipped_count", skipped_count)
+    _attach_extraction_auto_approve_settings(extraction)
     return extraction
 
 
@@ -830,4 +1356,3 @@ async def reject_extraction(
     await db.commit()
     await db.refresh(extraction)
     return extraction
-    ExtractorStatusRead,

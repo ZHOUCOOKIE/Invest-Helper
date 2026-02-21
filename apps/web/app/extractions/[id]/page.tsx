@@ -54,8 +54,38 @@ type Extraction = {
   reviewed_by: string | null;
   review_note: string | null;
   applied_kol_view_id: number | null;
+  auto_applied_count: number | null;
+  auto_policy: "threshold" | "top1_fallback" | null;
+  auto_applied_kol_view_ids: number[] | null;
+  auto_approve_confidence_threshold: number | null;
+  auto_approve_min_display_confidence: number | null;
+  approve_inserted_count: number | null;
+  approve_skipped_count: number | null;
+  auto_applied_asset_view_keys: string[] | null;
+  auto_applied_views:
+    | {
+        kol_view_id: number;
+        symbol: string;
+        asset_id: number;
+        stance: "bull" | "bear" | "neutral";
+        horizon: "intraday" | "1w" | "1m" | "3m" | "1y";
+        as_of: string;
+        confidence: number;
+      }[]
+    | null;
   created_at: string;
   raw_post: RawPost;
+};
+
+type AssetViewItem = {
+  symbol: string;
+  stance: "bull" | "bear" | "neutral";
+  horizon: "intraday" | "1w" | "1m" | "3m" | "1y";
+  confidence: number;
+  reasoning: string | null;
+  summary: string | null;
+  as_of: string | null;
+  drivers: string[];
 };
 
 type ExtractorStatus = {
@@ -138,6 +168,42 @@ function todayIsoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function pickAssetViews(extracted: Record<string, unknown>): AssetViewItem[] {
+  const value = extracted.asset_views;
+  if (!Array.isArray(value)) return [];
+  const items: AssetViewItem[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    if (typeof item.symbol !== "string" || !item.symbol.trim()) continue;
+    if (typeof item.stance !== "string" || !VALID_STANCE.has(item.stance)) continue;
+    if (typeof item.horizon !== "string" || !VALID_HORIZON.has(item.horizon)) continue;
+    if (typeof item.confidence !== "number") continue;
+    items.push({
+      symbol: item.symbol.trim().toUpperCase(),
+      stance: item.stance as AssetViewItem["stance"],
+      horizon: item.horizon as AssetViewItem["horizon"],
+      confidence: Math.max(0, Math.min(100, Math.round(item.confidence))),
+      reasoning: typeof item.reasoning === "string" ? item.reasoning : null,
+      summary: typeof item.summary === "string" ? item.summary : null,
+      as_of: typeof item.as_of === "string" ? item.as_of : null,
+      drivers: Array.isArray(item.drivers)
+        ? item.drivers.filter((driver): driver is string => typeof driver === "string")
+        : [],
+    });
+  }
+  return items.sort((a, b) => b.confidence - a.confidence);
+}
+
+function normalizeAsOfDate(value: string | null | undefined, fallback: string): string {
+  if (!value || !value.trim()) return fallback;
+  return value.slice(0, 10);
+}
+
+function buildAssetViewKey(item: AssetViewItem, fallbackAsOf: string): string {
+  return `${item.symbol}|${item.horizon}|${normalizeAsOfDate(item.as_of, fallbackAsOf)}`;
+}
+
 function getHttpErrorMessage(status: number, detail: string | undefined, fallback: string): string {
   if (status === 422) return detail ?? "参数不合法（422），请检查输入内容。";
   if (status === 409) return detail ?? "状态冲突（409），该 extraction 可能已被处理。";
@@ -175,6 +241,7 @@ export default function ExtractionDetailPage() {
   });
   const [rejectReason, setRejectReason] = useState("");
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const [selectedBatchKeys, setSelectedBatchKeys] = useState<string[]>([]);
 
   useEffect(() => {
     const load = async () => {
@@ -260,6 +327,35 @@ export default function ExtractionDetailPage() {
           as_of: todayIsoDate(),
           ...defaults,
         });
+
+        const extractedViews = pickAssetViews(extractionData.extracted_json);
+        const minDisplayConfidence = extractionData.auto_approve_min_display_confidence ?? 50;
+        const threshold = extractionData.auto_approve_confidence_threshold ?? 70;
+        const extractedAsOf = normalizeAsOfDate(
+          typeof extractionData.extracted_json.as_of === "string"
+            ? (extractionData.extracted_json.as_of as string)
+            : null,
+          extractionData.raw_post.posted_at.slice(0, 10),
+        );
+        const autoAppliedKeys = new Set(
+          (extractionData.auto_applied_views || []).map((item) =>
+            `${item.symbol.toUpperCase()}|${item.horizon}|${normalizeAsOfDate(item.as_of, extractedAsOf)}`,
+          ),
+        );
+        const selectableViews = extractedViews.filter(
+          (item) =>
+            item.confidence >= minDisplayConfidence && !autoAppliedKeys.has(buildAssetViewKey(item, extractedAsOf)),
+        );
+        const highConfidenceKeys = selectableViews
+          .filter((item) => item.confidence >= threshold)
+          .map((item) => buildAssetViewKey(item, extractedAsOf));
+        if (highConfidenceKeys.length > 0) {
+          setSelectedBatchKeys(Array.from(new Set(highConfidenceKeys)));
+        } else if (selectableViews[0]) {
+          setSelectedBatchKeys([buildAssetViewKey(selectableViews[0], extractedAsOf)]);
+        } else {
+          setSelectedBatchKeys([]);
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unknown error");
       } finally {
@@ -335,6 +431,64 @@ export default function ExtractionDetailPage() {
     }
   };
 
+  const approveBatch = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setActionError(null);
+    if (!form.kol_id) {
+      setActionError("请选择 KOL");
+      return;
+    }
+    const selected = extractedAssetViews
+      .map((item) => ({ item, key: buildAssetViewKey(item, extractedAsOf) }))
+      .filter((item) => selectedBatchKeys.includes(item.key) && !autoAppliedKeySet.has(item.key));
+    if (selected.length === 0) {
+      setActionError("请至少勾选一条资产观点");
+      return;
+    }
+    const views = selected
+      .map(({ item }) => {
+        const matchedAsset = assets.find((asset) => asset.symbol.toUpperCase() === item.symbol);
+        if (!matchedAsset) {
+          return null;
+        }
+        return {
+          asset_id: matchedAsset.id,
+          stance: item.stance,
+          horizon: item.horizon,
+          confidence: item.confidence,
+          summary: (item.summary || item.reasoning || `${item.symbol} ${item.stance}`).slice(0, 1024),
+          source_url: (form.source_url || extraction?.raw_post.url || "").trim(),
+          as_of: normalizeAsOfDate(item.as_of, extractedAsOf),
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+    if (views.length === 0) {
+      setActionError("所选观点无法匹配资产，请先创建对应资产或检查 symbol");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const res = await fetch(`/api/extractions/${extractionId}/approve-batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kol_id: Number(form.kol_id),
+          views,
+        }),
+      });
+      const body = (await res.json()) as { detail?: string };
+      if (!res.ok) {
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `Approve batch failed: ${res.status}`));
+      }
+      router.push("/extractions?msg=Approve%20success&status=pending");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Approve batch failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const reject = async () => {
     setActionError(null);
     setSubmitting(true);
@@ -377,6 +531,30 @@ export default function ExtractionDetailPage() {
     if (!meta || typeof meta !== "object") return false;
     return (meta as Record<string, unknown>)["fallback_reason"] === "budget_exhausted";
   }, [extraction]);
+
+  const extractedAssetViews = useMemo(() => {
+    if (!extraction) return [];
+    const minDisplayConfidence = extraction.auto_approve_min_display_confidence ?? 50;
+    return pickAssetViews(extraction.extracted_json).filter((item) => item.confidence >= minDisplayConfidence);
+  }, [extraction]);
+
+  const extractedAsOf = useMemo(() => {
+    if (!extraction) return todayIsoDate();
+    const rawAsOf = extraction.extracted_json["as_of"];
+    return normalizeAsOfDate(
+      typeof rawAsOf === "string" ? rawAsOf : null,
+      extraction.raw_post.posted_at.slice(0, 10),
+    );
+  }, [extraction]);
+
+  const autoAppliedKeySet = useMemo(() => {
+    if (!extraction) return new Set<string>();
+    const fallbackAsOf = extractedAsOf;
+    const keys = (extraction.auto_applied_views || []).map(
+      (item) => `${item.symbol.toUpperCase()}|${item.horizon}|${normalizeAsOfDate(item.as_of, fallbackAsOf)}`,
+    );
+    return new Set(keys);
+  }, [extractedAsOf, extraction]);
 
   const copyRawOutput = async () => {
     if (!extraction?.raw_model_output) {
@@ -464,6 +642,47 @@ export default function ExtractionDetailPage() {
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
+            <h2 style={{ marginTop: 0 }}>Per-Asset Views</h2>
+            {extractedAssetViews.length === 0 && <div>(none)</div>}
+            {extractedAssetViews.length > 0 && (
+              <div style={{ display: "grid", gap: "8px" }}>
+                {extractedAssetViews.map((item, index) => (
+                  <div key={`${index}:${item.symbol}:${item.horizon}`} style={{ border: "1px solid #eee", padding: "8px" }}>
+                    <div>
+                      {item.symbol} | {item.stance} | {item.horizon} | confidence={item.confidence}
+                      {autoAppliedKeySet.has(buildAssetViewKey(item, extractedAsOf)) && (
+                        <span
+                          style={{
+                            marginLeft: "6px",
+                            padding: "1px 6px",
+                            borderRadius: "10px",
+                            fontSize: "12px",
+                            color: "#666",
+                            background: "#f0f0f0",
+                          }}
+                        >
+                          Auto approved
+                        </span>
+                      )}
+                    </div>
+                    <div>summary: {item.summary || "(none)"}</div>
+                    <div>reasoning: {item.reasoning || "(none)"}</div>
+                    {item.drivers.length > 0 && <div>drivers: {item.drivers.join(", ")}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ marginTop: "8px" }}>
+              auto_applied_count={extraction.auto_applied_count}, auto_policy={extraction.auto_policy || "null"},
+              auto_applied_kol_view_ids=
+              {extraction.auto_applied_kol_view_ids ? extraction.auto_applied_kol_view_ids.join(",") : "[]"}
+            </div>
+            {extraction.auto_policy === "top1_fallback" && (
+              <div style={{ color: "#8a5800" }}>自动审核未达到阈值，已按 top1_fallback 仅落最高分一条。</div>
+            )}
+          </section>
+
+          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
             <details>
               <summary style={{ cursor: "pointer", fontWeight: 700 }}>Debug / 模型输出</summary>
               <div style={{ marginTop: "10px", display: "grid", gap: "6px" }}>
@@ -525,26 +744,30 @@ export default function ExtractionDetailPage() {
               {reExtracting ? "Re-extracting..." : "Re-extract（需确认）"}
             </button>
             {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
-            <form onSubmit={approve} style={{ display: "grid", gap: "8px", maxWidth: "720px" }}>
-              <label>
-                Asset
-                <select
-                  value={form.asset_id}
-                  onChange={(event) => setForm((prev) => ({ ...prev, asset_id: event.target.value }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                >
-                  <option value="" disabled>
-                    请选择资产
-                  </option>
-                  {assets.map((asset) => (
-                    <option key={asset.id} value={asset.id}>
-                      {asset.symbol} {asset.name ? `- ${asset.name}` : ""}
+            <form
+              onSubmit={extractedAssetViews.length > 0 ? approveBatch : approve}
+              style={{ display: "grid", gap: "8px", maxWidth: "720px" }}
+            >
+              {extractedAssetViews.length === 0 && (
+                <label>
+                  Asset
+                  <select
+                    value={form.asset_id}
+                    onChange={(event) => setForm((prev) => ({ ...prev, asset_id: event.target.value }))}
+                    style={{ display: "block", width: "100%" }}
+                    required
+                  >
+                    <option value="" disabled>
+                      请选择资产
                     </option>
-                  ))}
-                </select>
-              </label>
-
+                    {assets.map((asset) => (
+                      <option key={asset.id} value={asset.id}>
+                        {asset.symbol} {asset.name ? `- ${asset.name}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <label>
                 KOL
                 <select
@@ -563,62 +786,121 @@ export default function ExtractionDetailPage() {
                   ))}
                 </select>
               </label>
+              {extractedAssetViews.length > 0 && (
+                <div>
+                  <div style={{ marginBottom: "6px" }}>Asset views（可多选）</div>
+                  <div style={{ display: "grid", gap: "4px" }}>
+                    {extractedAssetViews.map((item, index) => {
+                      const key = buildAssetViewKey(item, extractedAsOf);
+                      const checked = selectedBatchKeys.includes(key);
+                      const isAutoApproved = autoAppliedKeySet.has(key);
+                      return (
+                        <label
+                          key={`${index}:${key}`}
+                          style={{
+                            border: "1px solid #eee",
+                            padding: "6px",
+                            borderRadius: "6px",
+                            opacity: isAutoApproved ? 0.6 : 1,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={isAutoApproved}
+                            onChange={(event) => {
+                              setSelectedBatchKeys((prev) => {
+                                if (event.target.checked) return Array.from(new Set([...prev, key]));
+                                return prev.filter((itemKey) => itemKey !== key);
+                              });
+                            }}
+                          />{" "}
+                          {item.symbol} | {item.stance} | {item.horizon} | confidence={item.confidence} |{" "}
+                          {item.summary || item.reasoning || "(none)"}
+                          {isAutoApproved && (
+                            <span
+                              style={{
+                                marginLeft: "6px",
+                                padding: "1px 6px",
+                                borderRadius: "10px",
+                                fontSize: "12px",
+                                color: "#666",
+                                background: "#f0f0f0",
+                              }}
+                            >
+                              Auto approved
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
-              <label>
-                stance
-                <select
-                  value={form.stance}
-                  onChange={(event) => setForm((prev) => ({ ...prev, stance: event.target.value as FormState["stance"] }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                >
-                  <option value="bull">bull</option>
-                  <option value="bear">bear</option>
-                  <option value="neutral">neutral</option>
-                </select>
-              </label>
+              {extractedAssetViews.length === 0 && (
+                <label>
+                  stance
+                  <select
+                    value={form.stance}
+                    onChange={(event) => setForm((prev) => ({ ...prev, stance: event.target.value as FormState["stance"] }))}
+                    style={{ display: "block", width: "100%" }}
+                    required
+                  >
+                    <option value="bull">bull</option>
+                    <option value="bear">bear</option>
+                    <option value="neutral">neutral</option>
+                  </select>
+                </label>
+              )}
 
-              <label>
-                horizon
-                <select
-                  value={form.horizon}
-                  onChange={(event) =>
-                    setForm((prev) => ({ ...prev, horizon: event.target.value as FormState["horizon"] }))
-                  }
-                  style={{ display: "block", width: "100%" }}
-                  required
-                >
-                  <option value="intraday">intraday</option>
-                  <option value="1w">1w</option>
-                  <option value="1m">1m</option>
-                  <option value="3m">3m</option>
-                  <option value="1y">1y</option>
-                </select>
-              </label>
+              {extractedAssetViews.length === 0 && (
+                <label>
+                  horizon
+                  <select
+                    value={form.horizon}
+                    onChange={(event) =>
+                      setForm((prev) => ({ ...prev, horizon: event.target.value as FormState["horizon"] }))
+                    }
+                    style={{ display: "block", width: "100%" }}
+                    required
+                  >
+                    <option value="intraday">intraday</option>
+                    <option value="1w">1w</option>
+                    <option value="1m">1m</option>
+                    <option value="3m">3m</option>
+                    <option value="1y">1y</option>
+                  </select>
+                </label>
+              )}
 
-              <label>
-                confidence (0-100)
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  value={form.confidence}
-                  onChange={(event) => setForm((prev) => ({ ...prev, confidence: event.target.value }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                />
-              </label>
+              {extractedAssetViews.length === 0 && (
+                <label>
+                  confidence (0-100)
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={form.confidence}
+                    onChange={(event) => setForm((prev) => ({ ...prev, confidence: event.target.value }))}
+                    style={{ display: "block", width: "100%" }}
+                    required
+                  />
+                </label>
+              )}
 
-              <label>
-                summary
-                <textarea
-                  rows={3}
-                  value={form.summary}
-                  onChange={(event) => setForm((prev) => ({ ...prev, summary: event.target.value }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                />
-              </label>
+              {extractedAssetViews.length === 0 && (
+                <label>
+                  summary
+                  <textarea
+                    rows={3}
+                    value={form.summary}
+                    onChange={(event) => setForm((prev) => ({ ...prev, summary: event.target.value }))}
+                    style={{ display: "block", width: "100%" }}
+                    required
+                  />
+                </label>
+              )}
 
               <label>
                 source_url
@@ -643,7 +925,7 @@ export default function ExtractionDetailPage() {
               </label>
 
               <button type="submit" disabled={submitting || extraction.status !== "pending"}>
-                {submitting ? "Submitting..." : "Approve"}
+                {submitting ? "Submitting..." : extractedAssetViews.length > 0 ? "Approve Batch" : "Approve"}
               </button>
             </form>
           </section>

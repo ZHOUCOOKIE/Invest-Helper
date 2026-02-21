@@ -15,6 +15,7 @@ def build_extract_prompt(
     posted_at: datetime,
     content_text: str,
     assets: list[dict[str, Any]],
+    aliases: list[dict[str, str]],
     max_assets_in_prompt: int,
 ) -> PromptBundle:
     version = (prompt_version or "").strip() or "extract_v1"
@@ -28,6 +29,7 @@ def build_extract_prompt(
         posted_at=posted_at,
         content_text=content_text,
         assets=assets,
+        aliases=aliases,
         max_assets_in_prompt=max_assets_in_prompt,
     )
     return PromptBundle(version=version, text=bundle.text, hash=bundle.hash)

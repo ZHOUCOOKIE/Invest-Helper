@@ -37,7 +37,25 @@ class Asset(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    aliases: Mapped[list["AssetAlias"]] = relationship(back_populates="asset", cascade="all, delete-orphan")
     kol_views: Mapped[list["KolView"]] = relationship(back_populates="asset", cascade="all, delete-orphan")
+
+
+class AssetAlias(Base):
+    __tablename__ = "asset_aliases"
+    __table_args__ = (
+        Index("ix_asset_aliases_asset_id", "asset_id"),
+        Index("uq_asset_aliases_alias_norm", text("lower(trim(alias))"), unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), nullable=False)
+    alias: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    asset: Mapped["Asset"] = relationship(back_populates="aliases")
 
 
 class Kol(Base):
@@ -185,6 +203,9 @@ class PostExtraction(Base):
         ForeignKey("kol_views.id", ondelete="SET NULL"),
         nullable=True,
     )
+    auto_applied_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
+    auto_policy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    auto_applied_kol_view_ids: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

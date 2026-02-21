@@ -21,6 +21,19 @@ class AssetRead(BaseModel):
     created_at: datetime
 
 
+class AssetAliasCreate(BaseModel):
+    alias: str = Field(min_length=1, max_length=255)
+
+
+class AssetAliasRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    asset_id: int
+    alias: str
+    created_at: datetime
+
+
 class KolCreate(BaseModel):
     platform: str = Field(min_length=1, max_length=32)
     handle: str = Field(min_length=1, max_length=64)
@@ -143,7 +156,26 @@ class PostExtractionRead(BaseModel):
     reviewed_by: str | None
     review_note: str | None
     applied_kol_view_id: int | None
+    auto_applied_count: int | None
+    auto_policy: str | None
+    auto_applied_kol_view_ids: list[int] | None
+    auto_approve_confidence_threshold: int | None = None
+    auto_approve_min_display_confidence: int | None = None
+    approve_inserted_count: int | None = None
+    approve_skipped_count: int | None = None
+    auto_applied_asset_view_keys: list[str] | None = None
+    auto_applied_views: list["AutoAppliedViewRead"] | None = None
     created_at: datetime
+
+
+class AutoAppliedViewRead(BaseModel):
+    kol_view_id: int
+    symbol: str
+    asset_id: int
+    stance: Stance
+    horizon: Horizon
+    as_of: date
+    confidence: int
 
 
 class ExtractionApproveRequest(BaseModel):
@@ -155,6 +187,21 @@ class ExtractionApproveRequest(BaseModel):
     summary: str = Field(min_length=1, max_length=1024)
     source_url: str = Field(min_length=1, max_length=1024)
     as_of: date
+
+
+class ExtractionApproveBatchViewRequest(BaseModel):
+    asset_id: int
+    stance: Stance
+    horizon: Horizon
+    confidence: int = Field(ge=0, le=100)
+    summary: str = Field(min_length=1, max_length=1024)
+    source_url: str = Field(min_length=1, max_length=1024)
+    as_of: date
+
+
+class ExtractionApproveBatchRequest(BaseModel):
+    kol_id: int
+    views: list[ExtractionApproveBatchViewRequest] = Field(min_length=1, max_length=50)
 
 
 class ExtractionRejectRequest(BaseModel):

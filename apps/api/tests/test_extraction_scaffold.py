@@ -38,8 +38,10 @@ def test_dummy_extractor_returns_pending_payload_shape():
     extractor = DummyExtractor()
     result = extractor.extract(raw_post)
 
-    assert extractor.model_name == "dummy-v1"
-    assert result["raw_post_id"] == 123
-    assert result["platform"] == "x"
-    assert result["candidates"][0]["stance"] == "neutral"
-    assert result["candidates"][0]["horizon"] == "1w"
+    assert extractor.model_name == "dummy-v2"
+    assert extractor.extractor_name == "dummy"
+    assert result["assets"] == []
+    assert result["stance"] == "neutral"
+    assert result["horizon"] == "1w"
+    assert result["confidence"] == 50
+    assert result["source_url"] == "https://x.com/alice/status/post-001"

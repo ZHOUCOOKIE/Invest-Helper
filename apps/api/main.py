@@ -1,6 +1,7 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 import hashlib
+from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -21,9 +22,11 @@ from schemas import (
     AssetRead,
     AssetViewsRead,
     DashboardClarityRead,
+    DashboardExtractionStatsRead,
     DashboardPendingExtractionRead,
     DashboardRead,
     DashboardTopAssetRead,
+    ExtractorStatusRead,
     ExtractionApproveRequest,
     ExtractionRejectRequest,
     KolCreate,
@@ -37,10 +40,12 @@ from schemas import (
     RawPostCreate,
     RawPostRead,
 )
-from services.extraction import DummyExtractor
+from services.extraction import default_extracted_json, select_extractor
+from settings import get_settings
 
 app = FastAPI(title="InvestPulse API")
 EXTRACTION_REVIEWER = "human-review"
+REEXTRACT_ATTEMPTS: dict[int, deque[datetime]] = defaultdict(deque)
 
 # 先放开本地前端跨域，后面再收紧
 app.add_middleware(
@@ -120,6 +125,87 @@ def build_external_id(url: str) -> str:
 def calc_clarity(bull_count: int, bear_count: int) -> float:
     total = bull_count + bear_count
     return abs(bull_count - bear_count) / max(1, total)
+
+
+def _build_last_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def reset_reextract_rate_limiter() -> None:
+    REEXTRACT_ATTEMPTS.clear()
+
+
+def _check_reextract_rate_limit(raw_post_id: int) -> None:
+    settings = get_settings()
+    window = timedelta(seconds=max(1, settings.reextract_rate_limit_window_seconds))
+    max_attempts = max(1, settings.reextract_rate_limit_max_attempts)
+    now = datetime.now(UTC)
+
+    attempts = REEXTRACT_ATTEMPTS[raw_post_id]
+    while attempts and now - attempts[0] > window:
+        attempts.popleft()
+
+    if len(attempts) >= max_attempts:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"re-extract rate limit exceeded: max {max_attempts} per {window.seconds}s",
+        )
+
+    attempts.append(now)
+
+
+def _build_extraction_input(raw_post: RawPost) -> tuple[RawPost | SimpleNamespace, dict | None]:
+    settings = get_settings()
+    max_length = max(1, settings.extraction_max_content_chars)
+    original_content = raw_post.content_text or ""
+    original_length = len(original_content)
+    if original_length <= max_length:
+        return raw_post, None
+
+    truncated_content = original_content[:max_length]
+    extraction_input = SimpleNamespace(
+        platform=raw_post.platform,
+        author_handle=raw_post.author_handle,
+        url=raw_post.url,
+        posted_at=raw_post.posted_at,
+        content_text=truncated_content,
+    )
+    return extraction_input, {
+        "truncated": True,
+        "original_length": original_length,
+        "max_length": max_length,
+    }
+
+
+async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> PostExtraction:
+    extraction_input, truncation_meta = _build_extraction_input(raw_post)
+    extractor = select_extractor(get_settings())
+    extracted_json = default_extracted_json(extraction_input)
+    last_error: str | None = None
+
+    try:
+        extracted_json = extractor.extract(extraction_input)
+    except Exception as exc:  # noqa: BLE001
+        last_error = _build_last_error(exc)
+
+    if truncation_meta:
+        base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
+        safe_meta = base_meta if isinstance(base_meta, dict) else {}
+        extracted_json["meta"] = {
+            **safe_meta,
+            **truncation_meta,
+        }
+
+    extraction = PostExtraction(
+        raw_post_id=raw_post.id,
+        status=ExtractionStatus.pending,
+        extracted_json=extracted_json,
+        model_name=extractor.model_name,
+        extractor_name=extractor.extractor_name,
+        last_error=last_error,
+    )
+    db.add(extraction)
+    return extraction
 
 
 @app.get("/assets", response_model=list[AssetRead])
@@ -266,14 +352,7 @@ async def ingest_manual(payload: ManualIngestCreate, db: AsyncSession = Depends(
 
     try:
         await db.flush()
-        extractor = DummyExtractor()
-        extraction = PostExtraction(
-            raw_post_id=raw_post.id,
-            status=ExtractionStatus.pending,
-            extracted_json=extractor.extract(raw_post),
-            model_name=extractor.model_name,
-        )
-        db.add(extraction)
+        extraction = await create_pending_extraction(db, raw_post)
         await db.commit()
     except IntegrityError:
         await db.rollback()
@@ -289,18 +368,22 @@ async def extract_raw_post(raw_post_id: int, db: AsyncSession = Depends(get_db))
     raw_post = await db.get(RawPost, raw_post_id)
     if raw_post is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="raw post not found")
+    _check_reextract_rate_limit(raw_post_id)
 
-    extractor = DummyExtractor()
-    extraction = PostExtraction(
-        raw_post_id=raw_post.id,
-        status=ExtractionStatus.pending,
-        extracted_json=extractor.extract(raw_post),
-        model_name=extractor.model_name,
-    )
-    db.add(extraction)
+    extraction = await create_pending_extraction(db, raw_post)
     await db.commit()
     await db.refresh(extraction)
     return extraction
+
+
+@app.get("/extractor-status", response_model=ExtractorStatusRead)
+def get_extractor_status():
+    settings = get_settings()
+    return ExtractorStatusRead(
+        mode=settings.extractor_mode.strip().lower(),
+        has_api_key=bool(settings.openai_api_key.strip()),
+        default_model=settings.openai_model,
+    )
 
 
 @app.get("/dashboard", response_model=DashboardRead)
@@ -309,6 +392,7 @@ async def get_dashboard(
     db: AsyncSession = Depends(get_db),
 ):
     cutoff = datetime.now(UTC) - timedelta(days=days)
+    stats_cutoff = datetime.now(UTC) - timedelta(hours=24)
 
     pending_count_result = await db.execute(
         select(func.count(PostExtraction.id)).where(PostExtraction.status == ExtractionStatus.pending)
@@ -406,11 +490,29 @@ async def get_dashboard(
                 )
             )
 
+    stats_result = await db.execute(
+        select(PostExtraction)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(5000)
+    )
+    all_recent = list(stats_result.scalars().all())
+    window_items = [item for item in all_recent if item.created_at and item.created_at >= stats_cutoff]
+    dummy_count = sum(1 for item in window_items if item.extractor_name == "dummy")
+    openai_count = sum(1 for item in window_items if item.extractor_name.startswith("openai"))
+    error_count = sum(1 for item in window_items if item.last_error is not None)
+
     return DashboardRead(
         pending_extractions_count=int(pending_extractions_count),
         latest_pending_extractions=latest_pending_extractions,
         top_assets=top_assets,
         clarity=clarity,
+        extraction_stats=DashboardExtractionStatsRead(
+            window_hours=24,
+            extraction_count=len(window_items),
+            dummy_count=dummy_count,
+            openai_count=openai_count,
+            error_count=error_count,
+        ),
     )
 
 
@@ -519,3 +621,4 @@ async def reject_extraction(
     await db.commit()
     await db.refresh(extraction)
     return extraction
+    ExtractorStatusRead,

@@ -40,6 +40,8 @@ type Extraction = {
   status: "pending" | "approved" | "rejected";
   extracted_json: Record<string, unknown>;
   model_name: string;
+  extractor_name: string;
+  last_error: string | null;
   reviewed_at: string | null;
   reviewed_by: string | null;
   review_note: string | null;
@@ -67,6 +69,15 @@ function pickDefaults(extracted: Record<string, unknown>, rawPostUrl: string): P
     source_url: rawPostUrl,
   };
 
+  if (typeof extracted.stance === "string" && VALID_STANCE.has(extracted.stance)) {
+    result.stance = extracted.stance as FormState["stance"];
+  }
+  if (typeof extracted.horizon === "string" && VALID_HORIZON.has(extracted.horizon)) {
+    result.horizon = extracted.horizon as FormState["horizon"];
+  }
+  if (typeof extracted.confidence === "number") {
+    result.confidence = String(Math.max(0, Math.min(100, Math.round(extracted.confidence))));
+  }
   if (typeof extracted.summary === "string") result.summary = extracted.summary;
   if (typeof extracted.source_url === "string") result.source_url = extracted.source_url;
   if (typeof extracted.as_of === "string") result.as_of = extracted.as_of;
@@ -91,8 +102,27 @@ function pickDefaults(extracted: Record<string, unknown>, rawPostUrl: string): P
   return result;
 }
 
+function pickFirstAssetSymbol(extracted: Record<string, unknown>): string | null {
+  const assets = extracted.assets;
+  if (!Array.isArray(assets) || assets.length === 0) {
+    return null;
+  }
+  const first = assets[0] as Record<string, unknown>;
+  if (typeof first.symbol !== "string" || !first.symbol.trim()) {
+    return null;
+  }
+  return first.symbol.trim().toUpperCase();
+}
+
 function todayIsoDate(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+function getHttpErrorMessage(status: number, detail: string | undefined, fallback: string): string {
+  if (status === 422) return detail ?? "参数不合法（422），请检查输入内容。";
+  if (status === 409) return detail ?? "状态冲突（409），该 extraction 可能已被处理。";
+  if (status === 429) return detail ?? "请求过于频繁（429），请稍后再试。";
+  return detail ?? fallback;
 }
 
 export default function ExtractionDetailPage() {
@@ -105,8 +135,12 @@ export default function ExtractionDetailPage() {
   const [kols, setKols] = useState<Kol[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [matchingAssetHint, setMatchingAssetHint] = useState<string | null>(null);
+  const [reExtracting, setReExtracting] = useState(false);
+  const [reExtractCooldown, setReExtractCooldown] = useState(false);
   const [form, setForm] = useState<FormState>({
     kol_id: "",
     asset_id: "",
@@ -123,6 +157,7 @@ export default function ExtractionDetailPage() {
     const load = async () => {
       setLoading(true);
       setError(null);
+      setErrorStatus(null);
       setActionError(null);
 
       if (Number.isNaN(extractionId)) {
@@ -140,8 +175,13 @@ export default function ExtractionDetailPage() {
 
         const extractionBody = (await extractionRes.json()) as Extraction | { detail?: string };
         if (!extractionRes.ok) {
+          setErrorStatus(extractionRes.status);
           throw new Error(
-            "detail" in extractionBody ? (extractionBody.detail ?? "Load extraction failed") : "Load extraction failed",
+            getHttpErrorMessage(
+              extractionRes.status,
+              "detail" in extractionBody ? extractionBody.detail : undefined,
+              "Load extraction failed",
+            ),
           );
         }
 
@@ -164,12 +204,28 @@ export default function ExtractionDetailPage() {
         setKols(kolList);
 
         const defaults = pickDefaults(extractionData.extracted_json, extractionData.raw_post.url);
-        setForm((prev) => ({
-          ...prev,
+        const extractedSymbol = pickFirstAssetSymbol(extractionData.extracted_json);
+        const matchedAsset = extractedSymbol
+          ? assetList.find((asset) => asset.symbol.toUpperCase() === extractedSymbol)
+          : null;
+
+        if (extractedSymbol && !matchedAsset) {
+          setMatchingAssetHint(`提取到资产 ${extractedSymbol}，未匹配资产，请手动选择/先创建资产。`);
+        } else {
+          setMatchingAssetHint(null);
+        }
+
+        setForm({
+          kol_id: kolList[0] ? String(kolList[0].id) : "",
+          asset_id: matchedAsset ? String(matchedAsset.id) : assetList[0] ? String(assetList[0].id) : "",
+          stance: "neutral",
+          horizon: "1w",
+          confidence: "50",
+          summary: "",
+          source_url: extractionData.raw_post.url,
+          as_of: todayIsoDate(),
           ...defaults,
-          asset_id: prev.asset_id || (assetList[0] ? String(assetList[0].id) : ""),
-          kol_id: prev.kol_id || (kolList[0] ? String(kolList[0].id) : ""),
-        }));
+        });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unknown error");
       } finally {
@@ -179,6 +235,34 @@ export default function ExtractionDetailPage() {
 
     void load();
   }, [extractionId]);
+
+  const reExtract = async () => {
+    if (!extraction) {
+      return;
+    }
+    if (reExtractCooldown) {
+      return;
+    }
+    if (!window.confirm("确认重新提取？这会创建一个新的 pending extraction。")) {
+      return;
+    }
+    setActionError(null);
+    setReExtractCooldown(true);
+    window.setTimeout(() => setReExtractCooldown(false), 3000);
+    setReExtracting(true);
+    try {
+      const res = await fetch(`/api/raw-posts/${extraction.raw_post_id}/extract`, { method: "POST" });
+      const body = (await res.json()) as { id?: number; detail?: string };
+      if (!res.ok || typeof body.id !== "number") {
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `Re-extract failed: ${res.status}`));
+      }
+      router.push(`/extractions/${body.id}`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Re-extract failed");
+    } finally {
+      setReExtracting(false);
+    }
+  };
 
   const approve = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -207,7 +291,7 @@ export default function ExtractionDetailPage() {
       });
       const body = (await res.json()) as { detail?: string };
       if (!res.ok) {
-        throw new Error(body.detail ?? `Approve failed: ${res.status}`);
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `Approve failed: ${res.status}`));
       }
       router.push("/extractions?msg=Approve%20success&status=pending");
     } catch (err) {
@@ -228,7 +312,7 @@ export default function ExtractionDetailPage() {
       });
       const body = (await res.json()) as { detail?: string };
       if (!res.ok) {
-        throw new Error(body.detail ?? `Reject failed: ${res.status}`);
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `Reject failed: ${res.status}`));
       }
       router.push("/extractions?msg=Reject%20success&status=pending");
     } catch (err) {
@@ -238,6 +322,20 @@ export default function ExtractionDetailPage() {
     }
   };
 
+  const missingInferenceHints = useMemo(() => {
+    if (!extraction) return [];
+    const extracted = extraction.extracted_json;
+    const hints: string[] = [];
+    const stanceMissing = typeof extracted.stance !== "string" || !VALID_STANCE.has(extracted.stance);
+    const horizonMissing = typeof extracted.horizon !== "string" || !VALID_HORIZON.has(extracted.horizon);
+    const assetMissing = !pickFirstAssetSymbol(extracted);
+
+    if (stanceMissing) hints.push("stance: 模型未判断/信息不足");
+    if (horizonMissing) hints.push("horizon: 模型未判断/信息不足");
+    if (assetMissing) hints.push("asset: 模型未判断/信息不足");
+    return hints;
+  }, [extraction]);
+
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
       <h1>Extraction #{Number.isNaN(extractionId) ? "?" : extractionId}</h1>
@@ -246,7 +344,18 @@ export default function ExtractionDetailPage() {
       </p>
 
       {loading && <p>Loading...</p>}
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
+      {error && (
+        <section style={{ border: "1px solid #f0bcbc", background: "#fff6f6", borderRadius: "8px", padding: "10px" }}>
+          <p style={{ color: "crimson", margin: 0 }}>{error}</p>
+          {errorStatus === 422 && <p style={{ marginBottom: 0 }}>请检查 extraction id 或请求参数。</p>}
+          {errorStatus === 409 && <p style={{ marginBottom: 0 }}>资源状态冲突，请返回列表刷新后重试。</p>}
+          {errorStatus && errorStatus >= 500 && <p style={{ marginBottom: 0 }}>服务暂时不可用，请稍后重试。</p>}
+          <p style={{ marginBottom: 0 }}>
+            <Link href="/extractions">返回审核列表</Link>
+          </p>
+        </section>
+      )}
+      {!loading && !error && !extraction && <p>空状态：未找到 extraction 数据。</p>}
 
       {!loading && !error && extraction && (
         <div style={{ display: "grid", gap: "12px" }}>
@@ -276,11 +385,28 @@ export default function ExtractionDetailPage() {
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
             <h2 style={{ marginTop: 0 }}>Extracted JSON</h2>
+            <div>extractor: {extraction.extractor_name}</div>
+            <div>model: {extraction.model_name}</div>
+            {extraction.last_error && <div style={{ color: "crimson" }}>last_error: {extraction.last_error}</div>}
+            {missingInferenceHints.length > 0 && (
+              <div style={{ color: "#8a5800", marginTop: "6px" }}>
+                {missingInferenceHints.join("；")}。请在下方人工补齐后再审核。
+              </div>
+            )}
             <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(extraction.extracted_json, null, 2)}</pre>
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
             <h2 style={{ marginTop: 0 }}>Approve</h2>
+            <button
+              type="button"
+              onClick={() => void reExtract()}
+              disabled={reExtracting || reExtractCooldown}
+              style={{ marginBottom: "10px" }}
+            >
+              {reExtracting ? "Re-extracting..." : "Re-extract（需确认）"}
+            </button>
+            {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
             <form onSubmit={approve} style={{ display: "grid", gap: "8px", maxWidth: "720px" }}>
               <label>
                 Asset

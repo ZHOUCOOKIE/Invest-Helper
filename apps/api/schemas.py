@@ -129,6 +129,8 @@ class PostExtractionRead(BaseModel):
     status: ExtractionStatus
     extracted_json: dict
     model_name: str
+    extractor_name: str
+    last_error: str | None
     reviewed_at: datetime | None
     reviewed_by: str | None
     review_note: str | None
@@ -186,6 +188,14 @@ class DashboardClarityRead(BaseModel):
     clarity: float
 
 
+class DashboardExtractionStatsRead(BaseModel):
+    window_hours: int
+    extraction_count: int
+    dummy_count: int
+    openai_count: int
+    error_count: int
+
+
 class DashboardRead(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -193,3 +203,10 @@ class DashboardRead(BaseModel):
     latest_pending_extractions: list[DashboardPendingExtractionRead]
     top_assets: list[DashboardTopAssetRead]
     clarity: list[DashboardClarityRead]
+    extraction_stats: DashboardExtractionStatsRead
+
+
+class ExtractorStatusRead(BaseModel):
+    mode: str
+    has_api_key: bool
+    default_model: str

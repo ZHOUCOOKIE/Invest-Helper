@@ -121,6 +121,7 @@ def _seed_pending_extraction(db: FakeAsyncSession, *, extraction_id: int = 1) ->
             "source_url": raw_post.url,
         },
         model_name="dummy-v1",
+        extractor_name="dummy",
         created_at=datetime.now(UTC),
     )
 
@@ -207,6 +208,7 @@ def test_reject_pending_success_and_reject_approved_conflict() -> None:
         status=ExtractionStatus.approved,
         extracted_json={"summary": "Already done"},
         model_name="dummy-v1",
+        extractor_name="dummy",
         reviewed_at=datetime.now(UTC),
         reviewed_by="human-review",
         applied_kol_view_id=1,

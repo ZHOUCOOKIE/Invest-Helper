@@ -209,6 +209,7 @@ def test_dashboard_returns_top_assets_and_pending_count() -> None:
             status=ExtractionStatus.pending,
             extracted_json={"summary": "pending item"},
             model_name="dummy-v1",
+            extractor_name="dummy",
             created_at=now,
         )
     )
@@ -233,6 +234,7 @@ def test_dashboard_returns_top_assets_and_pending_count() -> None:
             status=ExtractionStatus.approved,
             extracted_json={"summary": "approved item"},
             model_name="dummy-v1",
+            extractor_name="dummy",
             applied_kol_view_id=11,
             created_at=now,
         )

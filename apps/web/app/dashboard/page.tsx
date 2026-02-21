@@ -33,6 +33,13 @@ type DashboardResponse = {
   latest_pending_extractions: DashboardPendingExtraction[];
   top_assets: DashboardTopAsset[];
   clarity: DashboardClarity[];
+  extraction_stats: {
+    window_hours: number;
+    extraction_count: number;
+    dummy_count: number;
+    openai_count: number;
+    error_count: number;
+  };
 };
 
 const DEFAULT_DAYS = 7;
@@ -46,6 +53,7 @@ export default function DashboardPage() {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selectedAssetId, setSelectedAssetId] = useState<number | null>(null);
 
   const load = async (inputDays: string) => {
     setLoading(true);
@@ -109,6 +117,22 @@ export default function DashboardPage() {
       {!loading && !error && data && (
         <>
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
+            <h2 style={{ marginTop: 0 }}>Extraction Health (24h)</h2>
+            <div style={{ display: "flex", gap: "14px", flexWrap: "wrap" }}>
+              <strong>提取次数: {data.extraction_stats.extraction_count}</strong>
+              <span>dummy: {data.extraction_stats.dummy_count}</span>
+              <span>openai: {data.extraction_stats.openai_count}</span>
+              <span>错误数: {data.extraction_stats.error_count}</span>
+              <span>
+                openai 占比:{" "}
+                {data.extraction_stats.extraction_count > 0
+                  ? `${((data.extraction_stats.openai_count / data.extraction_stats.extraction_count) * 100).toFixed(0)}%`
+                  : "0%"}
+              </span>
+            </div>
+          </section>
+
+          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
             <h2 style={{ marginTop: 0 }}>Top Assets ({days}d)</h2>
             {clarityHint && (
               <p>
@@ -119,29 +143,62 @@ export default function DashboardPage() {
             {data.top_assets.length === 0 ? (
               <p>No approved views in current window.</p>
             ) : (
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>Asset</th>
+                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>views</th>
+                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>avg_conf</th>
+                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.top_assets.map((asset) => {
+                    const selected = selectedAssetId === asset.asset_id;
+                    return (
+                      <tr
+                        key={asset.asset_id}
+                        onClick={() => setSelectedAssetId(asset.asset_id)}
+                        style={{
+                          background: selected ? "#f0f6ff" : undefined,
+                          outline: selected ? "1px solid #6ba6ff" : undefined,
+                          cursor: "pointer",
+                        }}
+                      >
+                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>
+                          <strong>{asset.symbol}</strong> {asset.market ? `(${asset.market})` : ""}
+                        </td>
+                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>{asset.views_count_7d}</td>
+                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>
+                          {asset.avg_confidence_7d.toFixed(1)}
+                        </td>
+                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>
+                          <Link href={`/assets/${asset.asset_id}`}>
+                            <strong>查看详情 →</strong>
+                          </Link>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </section>
+
+          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
+            <h2 style={{ marginTop: 0 }}>Clarity</h2>
+            {data.clarity.length === 0 ? (
+              <p>No clarity data.</p>
+            ) : (
               <div style={{ display: "grid", gap: "8px" }}>
-                {data.top_assets.map((asset) => (
-                  <article
-                    key={asset.asset_id}
-                    style={{
-                      border: "1px solid #eee",
-                      borderRadius: "8px",
-                      padding: "10px",
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: "10px",
-                    }}
-                  >
+                {data.clarity.map((item) => (
+                  <div key={item.horizon} style={{ display: "grid", gap: "4px" }}>
                     <div>
-                      <Link href={`/assets/${asset.asset_id}`}>
-                        <strong>{asset.symbol}</strong>
-                      </Link>
-                      {asset.market ? <span> ({asset.market})</span> : null}
+                      {item.horizon}: {formatPct(item.clarity)} (bull={item.bull_count}, bear={item.bear_count},
+                      neutral={item.neutral_count})
                     </div>
-                    <div>
-                      views: {asset.views_count_7d} | avg_conf: {asset.avg_confidence_7d.toFixed(1)}
-                    </div>
-                  </article>
+                    <progress max={100} value={Math.round(item.clarity * 100)} style={{ width: "100%" }} />
+                  </div>
                 ))}
               </div>
             )}

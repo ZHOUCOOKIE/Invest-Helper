@@ -2,12 +2,23 @@
 
 import Link from "next/link";
 import type { FormEvent } from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type ManualIngestResponse = {
   raw_post: { id: number };
-  extraction: { id: number };
+  extraction: {
+    id: number;
+    raw_post_id: number;
+    extractor_name: string;
+    last_error: string | null;
+  };
   extraction_id: number;
+};
+
+type ExtractorStatus = {
+  mode: "auto" | "dummy" | "openai" | string;
+  has_api_key: boolean;
+  default_model: string;
 };
 
 type FormState = {
@@ -29,6 +40,24 @@ export default function IngestPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ManualIngestResponse | null>(null);
+  const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const loadStatus = async () => {
+      try {
+        const res = await fetch("/api/extractor-status", { cache: "no-store" });
+        const body = (await res.json()) as ExtractorStatus | { detail?: string };
+        if (!res.ok) {
+          throw new Error("detail" in body ? (body.detail ?? "Load extractor status failed") : "Load failed");
+        }
+        setExtractorStatus(body as ExtractorStatus);
+      } catch (err) {
+        setStatusError(err instanceof Error ? err.message : "Load extractor status failed");
+      }
+    };
+    void loadStatus();
+  }, []);
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -70,6 +99,17 @@ export default function IngestPage() {
       <p>
         标准化导入入口（仅手动输入，不接入真实 X/Reddit API）。<Link href="/dashboard">返回 Dashboard</Link>
       </p>
+      <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "760px" }}>
+        <h2 style={{ marginTop: 0 }}>Extractor Status</h2>
+        {statusError && <p style={{ color: "crimson" }}>{statusError}</p>}
+        {!statusError && !extractorStatus && <p>Loading extractor status...</p>}
+        {extractorStatus && (
+          <p style={{ margin: 0 }}>
+            EXTRACTOR_MODE: <strong>{extractorStatus.mode}</strong> | default_model: {extractorStatus.default_model} |
+            has_api_key: {extractorStatus.has_api_key ? "yes" : "no"}
+          </p>
+        )}
+      </section>
 
       <form onSubmit={onSubmit} style={{ display: "grid", gap: "8px", maxWidth: "760px" }}>
         <label>
@@ -134,10 +174,18 @@ export default function IngestPage() {
 
       {error && <p style={{ color: "crimson" }}>{error}</p>}
       {result && (
-        <p style={{ color: "green" }}>
-          ingest 成功。raw_post=#{result.raw_post.id}，extraction=#{result.extraction_id}，
-          <Link href={`/extractions/${result.extraction_id}`}>去审核该 extraction</Link>
-        </p>
+        <div style={{ border: "1px solid #96d29a", borderRadius: "8px", padding: "10px", background: "#f4fff5" }}>
+          <p style={{ margin: 0 }}>
+            提交成功。raw_post_id={result.extraction.raw_post_id}，extraction_id={result.extraction_id}，
+            extractor_name={result.extraction.extractor_name}
+          </p>
+          {result.extraction.last_error && (
+            <p style={{ color: "crimson", marginBottom: 0 }}>last_error: {result.extraction.last_error}</p>
+          )}
+          <p style={{ marginBottom: 0 }}>
+            <Link href={`/extractions/${result.extraction_id}`}>去审核该 extraction</Link>
+          </p>
+        </div>
       )}
     </main>
   );

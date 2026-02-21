@@ -156,6 +156,13 @@ class PostExtraction(Base):
     )
     extracted_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    extractor_name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="dummy",
+        server_default=text("'dummy'"),
+    )
+    last_error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     review_note: Mapped[str | None] = mapped_column(String(1024), nullable=True)

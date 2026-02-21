@@ -19,6 +19,9 @@ type ExtractorStatus = {
   mode: "auto" | "dummy" | "openai" | string;
   has_api_key: boolean;
   default_model: string;
+  base_url: string;
+  call_budget_remaining: number | null;
+  max_output_tokens: number;
 };
 
 type FormState = {
@@ -104,10 +107,19 @@ export default function IngestPage() {
         {statusError && <p style={{ color: "crimson" }}>{statusError}</p>}
         {!statusError && !extractorStatus && <p>Loading extractor status...</p>}
         {extractorStatus && (
-          <p style={{ margin: 0 }}>
-            EXTRACTOR_MODE: <strong>{extractorStatus.mode}</strong> | default_model: {extractorStatus.default_model} |
-            has_api_key: {extractorStatus.has_api_key ? "yes" : "no"}
-          </p>
+          <div style={{ display: "grid", gap: "4px" }}>
+            <p style={{ margin: 0 }}>
+              EXTRACTOR_MODE: <strong>{extractorStatus.mode}</strong> | base_url: {extractorStatus.base_url}
+            </p>
+            <p style={{ margin: 0 }}>
+              default_model: {extractorStatus.default_model} | has_api_key: {extractorStatus.has_api_key ? "yes" : "no"} |
+              call_budget_remaining: {extractorStatus.call_budget_remaining ?? "unlimited"} | max_output_tokens:{" "}
+              {extractorStatus.max_output_tokens}
+            </p>
+            {extractorStatus.call_budget_remaining === 0 && (
+              <p style={{ margin: 0, color: "#b35c00" }}>已自动降级 Dummy，避免过度消耗额度。</p>
+            )}
+          </div>
         )}
       </section>
 

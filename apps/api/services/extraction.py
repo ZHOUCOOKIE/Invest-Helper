@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import date
 import json
+from threading import Lock
 from typing import Any, Literal
 
 import httpx
@@ -14,6 +15,8 @@ from settings import Settings
 MARKET_VALUES = ["CRYPTO", "STOCK", "ETF", "FOREX", "OTHER"]
 STANCE_VALUES = ["bull", "bear", "neutral"]
 HORIZON_VALUES = ["intraday", "1w", "1m", "3m", "1y"]
+_OPENAI_CALLS_MADE = 0
+_OPENAI_CALLS_LOCK = Lock()
 
 
 class ExtractedAsset(BaseModel):
@@ -111,11 +114,24 @@ class DummyExtractor(Extractor):
 class OpenAIExtractor(Extractor):
     extractor_name = "openai_structured"
 
-    def __init__(self, *, api_key: str, model_name: str, base_url: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model_name: str,
+        base_url: str,
+        timeout_seconds: float,
+        max_output_tokens: int,
+        openrouter_site_url: str = "",
+        openrouter_app_name: str = "",
+    ) -> None:
         self.api_key = api_key
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.max_output_tokens = max(1, max_output_tokens)
+        self.openrouter_site_url = openrouter_site_url.strip()
+        self.openrouter_app_name = openrouter_app_name.strip()
 
     def extract(self, raw_post: RawPost) -> dict[str, Any]:
         response_json = self._call_openai(raw_post)
@@ -140,6 +156,7 @@ class OpenAIExtractor(Extractor):
         request_payload = {
             "model": self.model_name,
             "temperature": 0,
+            "max_tokens": self.max_output_tokens,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -153,14 +170,19 @@ class OpenAIExtractor(Extractor):
                 },
             },
         }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.openrouter_site_url:
+            headers["HTTP-Referer"] = self.openrouter_site_url
+        if self.openrouter_app_name:
+            headers["X-Title"] = self.openrouter_app_name
 
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(
                 f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=request_payload,
             )
 
@@ -203,6 +225,35 @@ def default_extracted_json(raw_post: RawPost) -> dict[str, Any]:
     return payload.model_dump(mode="json")
 
 
+def reset_openai_call_budget_counter() -> None:
+    global _OPENAI_CALLS_MADE
+    with _OPENAI_CALLS_LOCK:
+        _OPENAI_CALLS_MADE = 0
+
+
+def try_consume_openai_call_budget(settings: Settings) -> bool:
+    budget = max(0, settings.openai_call_budget)
+    if budget == 0:
+        return True
+
+    global _OPENAI_CALLS_MADE
+    with _OPENAI_CALLS_LOCK:
+        if _OPENAI_CALLS_MADE >= budget:
+            return False
+        _OPENAI_CALLS_MADE += 1
+        return True
+
+
+def get_openai_call_budget_remaining(settings: Settings) -> int | None:
+    budget = max(0, settings.openai_call_budget)
+    if budget == 0:
+        return None
+
+    with _OPENAI_CALLS_LOCK:
+        remaining = budget - _OPENAI_CALLS_MADE
+    return max(0, remaining)
+
+
 def select_extractor(settings: Settings) -> Extractor:
     mode = settings.extractor_mode.strip().lower()
     api_key = settings.openai_api_key.strip()
@@ -217,6 +268,9 @@ def select_extractor(settings: Settings) -> Extractor:
                 model_name=settings.openai_model,
                 base_url=settings.openai_base_url,
                 timeout_seconds=settings.openai_timeout_seconds,
+                max_output_tokens=settings.openai_max_output_tokens,
+                openrouter_site_url=settings.openrouter_site_url,
+                openrouter_app_name=settings.openrouter_app_name,
             )
         return DummyExtractor()
 
@@ -226,6 +280,9 @@ def select_extractor(settings: Settings) -> Extractor:
             model_name=settings.openai_model,
             base_url=settings.openai_base_url,
             timeout_seconds=settings.openai_timeout_seconds,
+            max_output_tokens=settings.openai_max_output_tokens,
+            openrouter_site_url=settings.openrouter_site_url,
+            openrouter_app_name=settings.openrouter_app_name,
         )
 
     return DummyExtractor()

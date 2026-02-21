@@ -210,3 +210,6 @@ class ExtractorStatusRead(BaseModel):
     mode: str
     has_api_key: bool
     default_model: str
+    base_url: str
+    call_budget_remaining: int | None
+    max_output_tokens: int

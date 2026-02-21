@@ -50,6 +50,15 @@ type Extraction = {
   raw_post: RawPost;
 };
 
+type ExtractorStatus = {
+  mode: "auto" | "dummy" | "openai" | string;
+  has_api_key: boolean;
+  default_model: string;
+  base_url: string;
+  call_budget_remaining: number | null;
+  max_output_tokens: number;
+};
+
 type FormState = {
   kol_id: string;
   asset_id: string;
@@ -141,6 +150,8 @@ export default function ExtractionDetailPage() {
   const [matchingAssetHint, setMatchingAssetHint] = useState<string | null>(null);
   const [reExtracting, setReExtracting] = useState(false);
   const [reExtractCooldown, setReExtractCooldown] = useState(false);
+  const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>({
     kol_id: "",
     asset_id: "",
@@ -159,6 +170,7 @@ export default function ExtractionDetailPage() {
       setError(null);
       setErrorStatus(null);
       setActionError(null);
+      setStatusError(null);
 
       if (Number.isNaN(extractionId)) {
         setError("Invalid extraction id");
@@ -167,10 +179,11 @@ export default function ExtractionDetailPage() {
       }
 
       try {
-        const [extractionRes, assetsRes, kolsRes] = await Promise.all([
+        const [extractionRes, assetsRes, kolsRes, statusRes] = await Promise.all([
           fetch(`/api/extractions/${extractionId}`, { cache: "no-store" }),
           fetch("/api/assets", { cache: "no-store" }),
           fetch("/api/kols", { cache: "no-store" }),
+          fetch("/api/extractor-status", { cache: "no-store" }),
         ]);
 
         const extractionBody = (await extractionRes.json()) as Extraction | { detail?: string };
@@ -193,6 +206,12 @@ export default function ExtractionDetailPage() {
         const kolsBody = (await kolsRes.json()) as Kol[] | { detail?: string };
         if (!kolsRes.ok) {
           throw new Error("detail" in kolsBody ? (kolsBody.detail ?? "Load kols failed") : "Load kols failed");
+        }
+        const statusBody = (await statusRes.json()) as ExtractorStatus | { detail?: string };
+        if (!statusRes.ok) {
+          setStatusError("detail" in statusBody ? (statusBody.detail ?? "Load extractor status failed") : "Load failed");
+        } else {
+          setExtractorStatus(statusBody as ExtractorStatus);
         }
 
         const extractionData = extractionBody as Extraction;
@@ -336,6 +355,14 @@ export default function ExtractionDetailPage() {
     return hints;
   }, [extraction]);
 
+  const budgetExhaustedFallback = useMemo(() => {
+    if (!extraction) return false;
+    if (extraction.last_error?.includes("budget_exhausted")) return true;
+    const meta = extraction.extracted_json["meta"];
+    if (!meta || typeof meta !== "object") return false;
+    return (meta as Record<string, unknown>)["fallback_reason"] === "budget_exhausted";
+  }, [extraction]);
+
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
       <h1>Extraction #{Number.isNaN(extractionId) ? "?" : extractionId}</h1>
@@ -387,7 +414,18 @@ export default function ExtractionDetailPage() {
             <h2 style={{ marginTop: 0 }}>Extracted JSON</h2>
             <div>extractor: {extraction.extractor_name}</div>
             <div>model: {extraction.model_name}</div>
+            {statusError && <div style={{ color: "crimson" }}>extractor_status_error: {statusError}</div>}
+            {extractorStatus && (
+              <div style={{ marginTop: "4px" }}>
+                status: mode={extractorStatus.mode}, base_url={extractorStatus.base_url}, default_model=
+                {extractorStatus.default_model}, has_api_key={extractorStatus.has_api_key ? "yes" : "no"}, budget=
+                {extractorStatus.call_budget_remaining ?? "unlimited"}
+              </div>
+            )}
             {extraction.last_error && <div style={{ color: "crimson" }}>last_error: {extraction.last_error}</div>}
+            {budgetExhaustedFallback && (
+              <div style={{ color: "#b35c00" }}>已自动降级 Dummy，避免过度消耗额度。</div>
+            )}
             {missingInferenceHints.length > 0 && (
               <div style={{ color: "#8a5800", marginTop: "6px" }}>
                 {missingInferenceHints.join("；")}。请在下方人工补齐后再审核。

@@ -40,7 +40,15 @@ from schemas import (
     RawPostCreate,
     RawPostRead,
 )
-from services.extraction import default_extracted_json, select_extractor
+from services.extraction import (
+    DummyExtractor,
+    OpenAIExtractor,
+    default_extracted_json,
+    get_openai_call_budget_remaining,
+    reset_openai_call_budget_counter,
+    select_extractor,
+    try_consume_openai_call_budget,
+)
 from settings import get_settings
 
 app = FastAPI(title="InvestPulse API")
@@ -135,6 +143,11 @@ def reset_reextract_rate_limiter() -> None:
     REEXTRACT_ATTEMPTS.clear()
 
 
+def reset_runtime_counters() -> None:
+    reset_reextract_rate_limiter()
+    reset_openai_call_budget_counter()
+
+
 def _check_reextract_rate_limit(raw_post_id: int) -> None:
     settings = get_settings()
     window = timedelta(seconds=max(1, settings.reextract_rate_limit_window_seconds))
@@ -178,10 +191,16 @@ def _build_extraction_input(raw_post: RawPost) -> tuple[RawPost | SimpleNamespac
 
 
 async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> PostExtraction:
+    settings = get_settings()
     extraction_input, truncation_meta = _build_extraction_input(raw_post)
-    extractor = select_extractor(get_settings())
+    extractor = select_extractor(settings)
     extracted_json = default_extracted_json(extraction_input)
     last_error: str | None = None
+    budget_exhausted = False
+
+    if isinstance(extractor, OpenAIExtractor) and not try_consume_openai_call_budget(settings):
+        budget_exhausted = True
+        extractor = DummyExtractor()
 
     try:
         extracted_json = extractor.extract(extraction_input)
@@ -194,6 +213,15 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         extracted_json["meta"] = {
             **safe_meta,
             **truncation_meta,
+        }
+    if budget_exhausted:
+        if not last_error:
+            last_error = "budget_exhausted: call budget reached, auto-fallback to dummy extractor"
+        base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
+        safe_meta = base_meta if isinstance(base_meta, dict) else {}
+        extracted_json["meta"] = {
+            **safe_meta,
+            "fallback_reason": "budget_exhausted",
         }
 
     extraction = PostExtraction(
@@ -383,6 +411,9 @@ def get_extractor_status():
         mode=settings.extractor_mode.strip().lower(),
         has_api_key=bool(settings.openai_api_key.strip()),
         default_model=settings.openai_model,
+        base_url=settings.openai_base_url,
+        call_budget_remaining=get_openai_call_budget_remaining(settings),
+        max_output_tokens=max(1, settings.openai_max_output_tokens),
     )
 
 

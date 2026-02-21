@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db import get_db
 from enums import ExtractionStatus
-from main import app, reset_reextract_rate_limiter
+from main import app, reset_runtime_counters
 from models import PostExtraction, RawPost
 from settings import get_settings
 
@@ -108,10 +108,10 @@ def _seed_raw_post(db: FakeAsyncSession) -> None:
 @pytest.fixture(autouse=True)
 def clear_settings_cache():
     get_settings.cache_clear()
-    reset_reextract_rate_limiter()
+    reset_runtime_counters()
     yield
     get_settings.cache_clear()
-    reset_reextract_rate_limiter()
+    reset_runtime_counters()
 
 
 def test_extract_endpoint_persists_mocked_openai_json_and_get_by_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -228,3 +228,73 @@ def test_long_content_gets_truncated_with_meta(monkeypatch: pytest.MonkeyPatch) 
     assert meta["truncated"] is True
     assert meta["original_length"] == len(long_content)
     assert meta["max_length"] == 120
+
+
+def test_openai_call_budget_falls_back_to_dummy_after_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "1")
+
+    call_count = {"n": 0}
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        call_count["n"] += 1
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 78,
+            "summary": "If support holds, short-term upside remains.",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "event_tags": ["support"],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    first = client.post("/raw-posts/1/extract")
+    second = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 201
+    first_body = first.json()
+    assert first_body["extractor_name"] == "openai_structured"
+
+    assert second.status_code == 201
+    second_body = second.json()
+    assert second_body["extractor_name"] == "dummy"
+    assert second_body["last_error"] is not None
+    assert "budget_exhausted" in second_body["last_error"]
+    assert second_body["extracted_json"]["meta"]["fallback_reason"] == "budget_exhausted"
+    assert call_count["n"] == 1
+
+
+def test_extractor_status_includes_openrouter_and_budget_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXTRACTOR_MODE", "auto")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "qwen/qwen-2.5-72b-instruct")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "3")
+    monkeypatch.setenv("OPENAI_MAX_OUTPUT_TOKENS", "888")
+
+    client = TestClient(app)
+    response = client.get("/extractor-status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "auto"
+    assert body["has_api_key"] is True
+    assert body["default_model"] == "qwen/qwen-2.5-72b-instruct"
+    assert body["base_url"] == "https://openrouter.ai/api/v1"
+    assert body["call_budget_remaining"] == 3
+    assert body["max_output_tokens"] == 888

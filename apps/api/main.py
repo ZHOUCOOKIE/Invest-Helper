@@ -1,7 +1,7 @@
 from collections import defaultdict
 from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import get_db
 from enums import HORIZON_ORDER, Stance
-from models import Asset, Kol, KolView
+from enums import ExtractionStatus
+from models import Asset, Kol, KolView, PostExtraction, RawPost
 from schemas import (
     AssetCreate,
     AssetViewsGroupRead,
@@ -20,7 +21,11 @@ from schemas import (
     KolRead,
     KolViewCreate,
     KolViewRead,
+    PostExtractionRead,
+    RawPostCreate,
+    RawPostRead,
 )
+from services.extraction import DummyExtractor
 
 app = FastAPI(title="InvestPulse API")
 
@@ -118,8 +123,11 @@ async def create_asset(payload: AssetCreate, db: AsyncSession = Depends(get_db))
 
 
 @app.get("/kols", response_model=list[KolRead])
-async def list_kols(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Kol).order_by(Kol.id.asc()))
+async def list_kols(enabled: bool | None = Query(default=None), db: AsyncSession = Depends(get_db)):
+    query = select(Kol)
+    if enabled is not None:
+        query = query.where(Kol.enabled == enabled)
+    result = await db.execute(query.order_by(Kol.id.asc()))
     return list(result.scalars().all())
 
 
@@ -162,9 +170,9 @@ async def create_kol_view(payload: KolViewCreate, db: AsyncSession = Depends(get
         stance=payload.stance,
         horizon=payload.horizon,
         confidence=payload.confidence,
-        summary=payload.summary.strip(),
-        source_url=payload.source_url.strip(),
-        as_of=payload.as_of,
+        summary=(payload.summary or "").strip(),
+        source_url=(payload.source_url or "").strip(),
+        as_of=payload.as_of or datetime.now(UTC).date(),
     )
     db.add(view)
     try:
@@ -188,3 +196,43 @@ async def get_asset_views(asset_id: int, db: AsyncSession = Depends(get_db)):
     )
     views = list(result.scalars().all())
     return build_asset_views_response(asset_id=asset_id, views=views)
+
+
+@app.post("/raw-posts", response_model=RawPostRead, status_code=status.HTTP_201_CREATED)
+async def create_raw_post(payload: RawPostCreate, db: AsyncSession = Depends(get_db)):
+    raw_post = RawPost(
+        platform=payload.platform.strip().lower(),
+        author_handle=payload.author_handle.strip(),
+        external_id=payload.external_id.strip(),
+        url=payload.url.strip(),
+        content_text=payload.content_text.strip(),
+        posted_at=payload.posted_at,
+        raw_json=payload.raw_json,
+    )
+    db.add(raw_post)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="raw post already exists")
+    await db.refresh(raw_post)
+    return raw_post
+
+
+@app.post("/raw-posts/{raw_post_id}/extract", response_model=PostExtractionRead, status_code=status.HTTP_201_CREATED)
+async def extract_raw_post(raw_post_id: int, db: AsyncSession = Depends(get_db)):
+    raw_post = await db.get(RawPost, raw_post_id)
+    if raw_post is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="raw post not found")
+
+    extractor = DummyExtractor()
+    extraction = PostExtraction(
+        raw_post_id=raw_post.id,
+        status=ExtractionStatus.pending,
+        extracted_json=extractor.extract(raw_post),
+        model_name=extractor.model_name,
+    )
+    db.add(extraction)
+    await db.commit()
+    await db.refresh(extraction)
+    return extraction

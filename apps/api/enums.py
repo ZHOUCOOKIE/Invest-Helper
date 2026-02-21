@@ -15,6 +15,12 @@ class Horizon(str, Enum):
     one_year = "1y"
 
 
+class ExtractionStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
+
 HORIZON_ORDER: list[str] = [
     Horizon.intraday.value,
     Horizon.one_week.value,

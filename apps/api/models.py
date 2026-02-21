@@ -8,13 +8,15 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from enums import Horizon, Stance
+from enums import ExtractionStatus, Horizon, Stance
 
 enum_values = lambda enum_cls: [item.value for item in enum_cls]
 
@@ -104,3 +106,57 @@ class KolView(Base):
 
     kol: Mapped["Kol"] = relationship(back_populates="views")
     asset: Mapped["Asset"] = relationship(back_populates="kol_views")
+
+
+class RawPost(Base):
+    __tablename__ = "raw_posts"
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id", name="uq_raw_posts_platform_external_id"),
+        Index("ix_raw_posts_platform_posted_at", "platform", "posted_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    author_handle: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    url: Mapped[str] = mapped_column(String(1024), nullable=False)
+    content_text: Mapped[str] = mapped_column(String(8192), nullable=False)
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    extractions: Mapped[list["PostExtraction"]] = relationship(
+        back_populates="raw_post", cascade="all, delete-orphan"
+    )
+
+
+class PostExtraction(Base):
+    __tablename__ = "post_extractions"
+    __table_args__ = (
+        Index("ix_post_extractions_raw_post_created", "raw_post_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    raw_post_id: Mapped[int] = mapped_column(ForeignKey("raw_posts.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[ExtractionStatus] = mapped_column(
+        SQLEnum(
+            ExtractionStatus,
+            name="extraction_status_enum",
+            native_enum=False,
+            validate_strings=True,
+            create_constraint=True,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+        default=ExtractionStatus.pending,
+        server_default=text("'pending'"),
+    )
+    extracted_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    raw_post: Mapped["RawPost"] = relationship(back_populates="extractions")

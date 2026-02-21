@@ -62,6 +62,7 @@ from settings import get_settings
 
 app = FastAPI(title="InvestPulse API")
 EXTRACTION_REVIEWER = "human-review"
+AUTO_EXTRACTION_REVIEWER = "auto"
 REEXTRACT_ATTEMPTS: dict[int, deque[datetime]] = defaultdict(deque)
 
 # 先放开本地前端跨域，后面再收紧
@@ -634,6 +635,13 @@ async def _auto_apply_extraction_views(
     extraction.auto_applied_count = len(created_ids)
     extraction.auto_policy = policy
     extraction.auto_applied_kol_view_ids = created_ids
+    if created_ids and extraction.status == ExtractionStatus.pending:
+        extraction.status = ExtractionStatus.approved
+        extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
+        extraction.reviewed_at = datetime.now(UTC)
+        if not extraction.review_note:
+            extraction.review_note = "auto-approved"
+        await db.flush()
     setattr(extraction, "auto_applied_asset_view_keys", applied_keys)
     setattr(extraction, "auto_applied_views", applied_views)
     print(

@@ -179,7 +179,9 @@ def test_extract_endpoint_persists_mocked_openai_json_and_get_by_id(monkeypatch:
     create_resp = client.post("/raw-posts/1/extract")
     assert create_resp.status_code == 201
     created = create_resp.json()
-    assert created["status"] == ExtractionStatus.pending.value
+    assert created["status"] == ExtractionStatus.approved.value
+    assert created["reviewed_by"] == "auto"
+    assert created["auto_applied_count"] == 1
     assert created["extractor_name"] == "openai_structured"
     assert created["extracted_json"]["assets"][0]["symbol"] == "BTC"
 
@@ -709,6 +711,8 @@ def test_auto_approve_applies_threshold_views(monkeypatch: pytest.MonkeyPatch) -
     body = response.json()
     assert body["auto_applied_count"] == 2
     assert body["auto_policy"] == "threshold"
+    assert body["status"] == ExtractionStatus.approved.value
+    assert body["reviewed_by"] == "auto"
     assert isinstance(body["auto_applied_kol_view_ids"], list)
     assert len(body["auto_applied_kol_view_ids"]) == 2
     assert len(fake_db._data[KolView]) == 2
@@ -762,9 +766,12 @@ def test_auto_approve_repeat_trigger_skips_same_key(monkeypatch: pytest.MonkeyPa
     app.dependency_overrides.clear()
 
     assert first.status_code == 201
+    first_body = first.json()
+    assert first_body["status"] == ExtractionStatus.approved.value
     assert second.status_code == 201
     second_body = second.json()
     assert second_body["auto_applied_count"] == 0
+    assert second_body["status"] == ExtractionStatus.pending.value
     assert len(fake_db._data[KolView]) == 1
     only_view = list(fake_db._data[KolView].values())[0]
     assert only_view.summary == "BTC view v1"
@@ -806,9 +813,21 @@ def test_approve_batch_on_auto_applied_same_key_does_not_duplicate(monkeypatch: 
     extract_resp = client.post("/raw-posts/1/extract")
     assert extract_resp.status_code == 201
     extraction = extract_resp.json()
+    assert extraction["status"] == ExtractionStatus.approved.value
+
+    pending_extraction = PostExtraction(
+        id=2,
+        raw_post_id=1,
+        status=ExtractionStatus.pending,
+        extracted_json={"summary": "pending review"},
+        model_name="dummy-v1",
+        extractor_name="dummy",
+        created_at=datetime.now(UTC),
+    )
+    fake_db.seed(pending_extraction)
 
     approve_resp = client.post(
-        f"/extractions/{extraction['id']}/approve-batch",
+        "/extractions/2/approve-batch",
         json={
             "kol_id": 1,
             "views": [
@@ -828,6 +847,7 @@ def test_approve_batch_on_auto_applied_same_key_does_not_duplicate(monkeypatch: 
 
     assert approve_resp.status_code == 200
     approve_body = approve_resp.json()
+    assert approve_body["status"] == ExtractionStatus.approved.value
     assert approve_body["approve_inserted_count"] == 0
     assert approve_body["approve_skipped_count"] == 1
     assert len(fake_db._data[KolView]) == 1

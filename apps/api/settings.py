@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     reextract_rate_limit_max_attempts: int = 3
     prompt_version: str = "extract_v1"
     max_assets_in_prompt: int = 50
-    auto_approve_enabled: bool = False
+    auto_approve_enabled: bool = True
     auto_approve_confidence_threshold: int = 70
     auto_approve_min_display_confidence: int = 50
     auto_approve_max_views: int = 10

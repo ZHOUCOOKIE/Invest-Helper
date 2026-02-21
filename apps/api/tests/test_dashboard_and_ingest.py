@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db import get_db
 from enums import ExtractionStatus, Horizon, Stance
 from main import app
-from models import Asset, KolView, PostExtraction, RawPost
+from models import Asset, Kol, KolView, PostExtraction, RawPost
 
 
 class FakeResult:
@@ -39,6 +39,7 @@ class FakeAsyncSession:
             RawPost: {},
             PostExtraction: {},
             Asset: {},
+            Kol: {},
             KolView: {},
         }
         self._new: list[object] = []
@@ -169,8 +170,10 @@ class FakeAsyncSession:
         self._new.clear()
 
 
-def test_manual_ingest_creates_raw_post_and_pending_extraction() -> None:
+def test_manual_ingest_creates_raw_post_and_pending_extraction(monkeypatch) -> None:  # noqa: ANN001
     fake_db = FakeAsyncSession()
+    monkeypatch.setenv("EXTRACTOR_MODE", "dummy")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
 
     async def override_get_db():
         yield fake_db

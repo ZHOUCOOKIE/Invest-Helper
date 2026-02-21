@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     extraction_max_content_chars: int = 4000
     reextract_rate_limit_window_seconds: int = 60
     reextract_rate_limit_max_attempts: int = 3
+    prompt_version: str = "extract_v1"
+    max_assets_in_prompt: int = 50
 
 
 @lru_cache

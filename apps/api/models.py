@@ -9,11 +9,13 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Text,
     String,
     UniqueConstraint,
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from enums import ExtractionStatus, Horizon, Stance
@@ -162,6 +164,19 @@ class PostExtraction(Base):
         default="dummy",
         server_default=text("'dummy'"),
     )
+    prompt_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="extract_v1",
+        server_default=text("'extract_v1'"),
+    )
+    prompt_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw_model_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parsed_model_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    model_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)

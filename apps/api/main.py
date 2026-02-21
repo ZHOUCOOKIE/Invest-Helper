@@ -1,7 +1,9 @@
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 import hashlib
+import json
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -42,6 +44,7 @@ from schemas import (
 )
 from services.extraction import (
     DummyExtractor,
+    OpenAIFallbackError,
     OpenAIExtractor,
     default_extracted_json,
     get_openai_call_budget_remaining,
@@ -49,6 +52,7 @@ from services.extraction import (
     select_extractor,
     try_consume_openai_call_budget,
 )
+from services.prompts import build_extract_prompt
 from settings import get_settings
 
 app = FastAPI(title="InvestPulse API")
@@ -190,46 +194,207 @@ def _build_extraction_input(raw_post: RawPost) -> tuple[RawPost | SimpleNamespac
     }
 
 
+def _normalize_asset_symbol(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    symbol = value.strip().upper()
+    return symbol or None
+
+
+def _infer_auto_market(raw_post: RawPost | SimpleNamespace, symbol: str) -> str:
+    if getattr(raw_post, "platform", "").strip().lower() in {"binance", "okx", "bybit"}:
+        return "CRYPTO"
+    if symbol.endswith("USD") or symbol in {"US10Y", "DXY", "VIX", "SPX", "QQQ"}:
+        return "AUTO"
+    return "AUTO"
+
+
+async def _load_assets_for_prompt(db: AsyncSession, limit: int) -> list[dict[str, str | None]]:
+    safe_limit = max(0, limit)
+    if safe_limit == 0:
+        return []
+    result = await db.execute(select(Asset).order_by(Asset.id.asc()).limit(safe_limit))
+    items = list(result.scalars().all())
+    return [{"symbol": item.symbol, "name": item.name, "market": item.market} for item in items]
+
+
+async def upsert_asset(
+    db: AsyncSession,
+    *,
+    symbol: str,
+    name: str | None = None,
+    market: str | None = None,
+) -> Asset:
+    symbol_normalized = symbol.strip().upper()
+    if not symbol_normalized:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="symbol is required")
+
+    existing_result = await db.execute(select(Asset).where(Asset.symbol == symbol_normalized))
+    existing = existing_result.scalar_one_or_none()
+    if existing is not None:
+        updated = False
+        normalized_name = (name or "").strip() or None
+        normalized_market = (market or "").strip() or None
+        if normalized_name and not existing.name:
+            existing.name = normalized_name
+            updated = True
+        if normalized_market and not existing.market:
+            existing.market = normalized_market
+            updated = True
+        if updated:
+            await db.flush()
+        return existing
+
+    asset = Asset(
+        symbol=symbol_normalized,
+        name=(name or "").strip() or None,
+        market=(market or "").strip() or None,
+    )
+    db.add(asset)
+    await db.flush()
+    return asset
+
+
+async def ensure_assets_from_extracted_json(
+    db: AsyncSession,
+    *,
+    raw_post: RawPost | SimpleNamespace,
+    extracted_json: dict[str, Any],
+) -> None:
+    assets = extracted_json.get("assets")
+    if not isinstance(assets, list) or not assets:
+        return
+
+    seen_symbols: set[str] = set()
+    for item in assets:
+        if isinstance(item, str):
+            symbol = _normalize_asset_symbol(item)
+            name = None
+            market = None
+        elif isinstance(item, dict):
+            symbol = _normalize_asset_symbol(item.get("symbol"))
+            name = item.get("name") if isinstance(item.get("name"), str) else None
+            market = item.get("market") if isinstance(item.get("market"), str) else None
+        else:
+            continue
+
+        if symbol is None or symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+        await upsert_asset(
+            db,
+            symbol=symbol,
+            name=name,
+            market=market or _infer_auto_market(raw_post, symbol),
+        )
+
+
+def _resolve_extractor_name(
+    *,
+    extractor: DummyExtractor | OpenAIExtractor,
+    settings_base_url: str,
+    extracted_json: dict[str, Any],
+) -> str:
+    if isinstance(extractor, DummyExtractor):
+        return extractor.extractor_name
+
+    meta = extracted_json.get("meta")
+    extraction_mode = meta.get("extraction_mode") if isinstance(meta, dict) else None
+    if extraction_mode == "json_mode" and "openrouter.ai" in settings_base_url.lower():
+        return "openrouter_json_mode"
+    return extractor.extractor_name
+
+
 async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> PostExtraction:
     settings = get_settings()
     extraction_input, truncation_meta = _build_extraction_input(raw_post)
     extractor = select_extractor(settings)
+    assets_for_prompt = await _load_assets_for_prompt(db, settings.max_assets_in_prompt)
+    prompt_bundle = build_extract_prompt(
+        prompt_version=settings.prompt_version,
+        platform=extraction_input.platform,
+        author_handle=extraction_input.author_handle,
+        url=extraction_input.url,
+        posted_at=extraction_input.posted_at,
+        content_text=extraction_input.content_text,
+        assets=assets_for_prompt,
+        max_assets_in_prompt=settings.max_assets_in_prompt,
+    )
+    extractor.set_prompt_bundle(prompt_bundle)
     extracted_json = default_extracted_json(extraction_input)
     last_error: str | None = None
     budget_exhausted = False
+    fallback_reason: str | None = None
 
     if isinstance(extractor, OpenAIExtractor) and not try_consume_openai_call_budget(settings):
         budget_exhausted = True
         extractor = DummyExtractor()
+        extractor.set_prompt_bundle(prompt_bundle)
+        fallback_reason = "budget_exhausted"
 
     try:
         extracted_json = extractor.extract(extraction_input)
     except Exception as exc:  # noqa: BLE001
         last_error = _build_last_error(exc)
+        if isinstance(exc, OpenAIFallbackError):
+            fallback_reason = exc.fallback_reason
+        if isinstance(extractor, OpenAIExtractor):
+            extractor = DummyExtractor()
+            extractor.set_prompt_bundle(prompt_bundle)
+            extracted_json = extractor.extract(extraction_input)
+
+    base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
+    safe_meta = base_meta if isinstance(base_meta, dict) else {}
+    if "extraction_mode" not in safe_meta:
+        safe_meta = {**safe_meta, "extraction_mode": "dummy" if isinstance(extractor, DummyExtractor) else "structured"}
+    if fallback_reason == "structured_unsupported" and "fallback_reason" not in safe_meta:
+        safe_meta = {**safe_meta, "fallback_reason": "structured_unsupported"}
+    extracted_json["meta"] = safe_meta
 
     if truncation_meta:
-        base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
-        safe_meta = base_meta if isinstance(base_meta, dict) else {}
         extracted_json["meta"] = {
-            **safe_meta,
+            **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
             **truncation_meta,
         }
     if budget_exhausted:
         if not last_error:
             last_error = "budget_exhausted: call budget reached, auto-fallback to dummy extractor"
-        base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
-        safe_meta = base_meta if isinstance(base_meta, dict) else {}
         extracted_json["meta"] = {
-            **safe_meta,
+            **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
             "fallback_reason": "budget_exhausted",
         }
+
+    audit = extractor.get_audit()
+    if audit.raw_model_output is None:
+        audit.raw_model_output = json.dumps(extracted_json, ensure_ascii=False)
+    if audit.parsed_model_output is None and isinstance(extracted_json, dict):
+        audit.parsed_model_output = extracted_json
+
+    await ensure_assets_from_extracted_json(
+        db,
+        raw_post=raw_post,
+        extracted_json=extracted_json,
+    )
+    resolved_extractor_name = _resolve_extractor_name(
+        extractor=extractor,
+        settings_base_url=settings.openai_base_url,
+        extracted_json=extracted_json,
+    )
 
     extraction = PostExtraction(
         raw_post_id=raw_post.id,
         status=ExtractionStatus.pending,
         extracted_json=extracted_json,
         model_name=extractor.model_name,
-        extractor_name=extractor.extractor_name,
+        extractor_name=resolved_extractor_name,
+        prompt_version=audit.prompt_version,
+        prompt_text=audit.prompt_text,
+        prompt_hash=audit.prompt_hash,
+        raw_model_output=audit.raw_model_output,
+        parsed_model_output=audit.parsed_model_output,
+        model_latency_ms=audit.model_latency_ms,
+        model_input_tokens=audit.model_input_tokens,
+        model_output_tokens=audit.model_output_tokens,
         last_error=last_error,
     )
     db.add(extraction)
@@ -257,6 +422,19 @@ async def create_asset(payload: AssetCreate, db: AsyncSession = Depends(get_db))
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="symbol already exists")
 
+    await db.refresh(asset)
+    return asset
+
+
+@app.post("/assets/upsert", response_model=AssetRead)
+async def upsert_asset_endpoint(payload: AssetCreate, db: AsyncSession = Depends(get_db)):
+    asset = await upsert_asset(
+        db,
+        symbol=payload.symbol,
+        name=payload.name,
+        market=payload.market,
+    )
+    await db.commit()
     await db.refresh(asset)
     return asset
 

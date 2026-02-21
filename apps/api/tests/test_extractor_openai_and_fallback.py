@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db import get_db
 from enums import ExtractionStatus
 from main import app, reset_runtime_counters
-from models import PostExtraction, RawPost
+from models import Asset, PostExtraction, RawPost
+from services.extraction import OpenAIRequestError, normalize_extracted_json
 from settings import get_settings
 
 
@@ -35,6 +36,7 @@ class FakeAsyncSession:
         self._data: dict[type[object], dict[int, object]] = {
             RawPost: {},
             PostExtraction: {},
+            Asset: {},
         }
         self._new: list[object] = []
 
@@ -105,6 +107,29 @@ def _seed_raw_post(db: FakeAsyncSession) -> None:
     )
 
 
+def _seed_chinese_raw_post(db: FakeAsyncSession) -> None:
+    db.seed(
+        RawPost(
+            id=2,
+            platform="x",
+            author_handle="cn_view",
+            external_id="post-cn-1",
+            url="https://x.com/cn_view/status/post-cn-1",
+            content_text=(
+                "金融市场目前，避险与通胀是今晚的主题，地缘风险隐蔽风险下，黄金、原油价格走高，"
+                "今晚的GDP数据与PCE影响之下，通胀预期+久期风险推高了长债收益率。\n\n"
+                "目前流动性主要流向避险资产以及债市，短期虽然美股依旧上涨，但是VIX指数仅仅跌破20附近，"
+                "并未有继续下跌的迹象，且风险偏好走弱，美股目前只能算是稳定不能说是乐观。\n\n"
+                "当前阶段，市场流动性并不青睐新兴资产，具体说就是不青睐加密市场，"
+                "所以今晚只能算是一个美股稳定保持谨慎乐观的阶段。"
+            ),
+            posted_at=datetime(2026, 2, 21, 10, 0, tzinfo=UTC),
+            fetched_at=datetime.now(UTC),
+            raw_json=None,
+        )
+    )
+
+
 @pytest.fixture(autouse=True)
 def clear_settings_cache():
     get_settings.cache_clear()
@@ -164,7 +189,7 @@ def test_auto_mode_without_api_key_falls_back_to_dummy_extractor(
     fake_db = FakeAsyncSession()
     _seed_raw_post(fake_db)
     monkeypatch.setenv("EXTRACTOR_MODE", "auto")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "")
 
     async def override_get_db():
         yield fake_db
@@ -298,3 +323,288 @@ def test_extractor_status_includes_openrouter_and_budget_fields(monkeypatch: pyt
     assert body["base_url"] == "https://openrouter.ai/api/v1"
     assert body["call_budget_remaining"] == 3
     assert body["max_output_tokens"] == 888
+
+
+def test_structured_unsupported_retries_once_with_json_mode_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+
+    calls = {"n": 0}
+
+    def fake_call_openai(self, raw_post: RawPost, *, response_mode: str):  # noqa: ANN001
+        calls["n"] += 1
+        if response_mode == "structured":
+            raise OpenAIRequestError(
+                status_code=400,
+                body_preview="model does not support feature: structured-outputs",
+            )
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "summary": "strict json mode fallback",
+            "source_url": raw_post.url,
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor._call_openai", fake_call_openai)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    response = client.post("/raw-posts/1/extract")
+    status_resp = client.get("/extractor-status")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extractor_name"] == "openrouter_json_mode"
+    assert body["last_error"] is None
+    assert body["extracted_json"]["meta"]["extraction_mode"] == "json_mode"
+    assert body["extracted_json"]["meta"]["fallback_reason"] == "structured_unsupported"
+    assert calls["n"] == 2
+    assert status_resp.status_code == 200
+    assert status_resp.json()["call_budget_remaining"] == 0
+
+
+def test_structured_unsupported_and_json_mode_fail_falls_back_to_dummy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+
+    calls = {"n": 0}
+
+    def fake_call_openai(self, raw_post: RawPost, *, response_mode: str):  # noqa: ANN001
+        calls["n"] += 1
+        if response_mode == "structured":
+            raise OpenAIRequestError(
+                status_code=400,
+                body_preview="qwen does not support feature: structured-outputs",
+            )
+        raise RuntimeError("json mode failed")
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor._call_openai", fake_call_openai)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extractor_name"] == "dummy"
+    assert body["last_error"] is not None
+    assert "structured unsupported" in body["last_error"].lower()
+    assert body["extracted_json"]["meta"]["extraction_mode"] == "dummy"
+    assert body["extracted_json"]["meta"]["fallback_reason"] == "structured_unsupported"
+    assert calls["n"] == 2
+
+
+def test_chinese_post_json_mode_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    _seed_chinese_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+
+    calls = {"n": 0}
+
+    def fake_call_openai(self, raw_post: RawPost, *, response_mode: str):  # noqa: ANN001
+        calls["n"] += 1
+        if response_mode == "structured":
+            raise OpenAIRequestError(
+                status_code=400,
+                body_preview="qwen structured-outputs unsupported for this model",
+            )
+        return {
+            "assets": {"symbol": "SPY", "name": "SPDR S&P 500 ETF", "market": "ETF", "unknown": "drop-me"},
+            "stance": "谨慎乐观",
+            "horizon": "今晚",
+            "confidence": 0.78,
+            "summary": "市场偏避险，短期美股稳定但风险偏好走弱。",
+            "event_tags": None,
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "platform": raw_post.platform,
+            "url": raw_post.url,
+            "posted_at": raw_post.posted_at.isoformat(),
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor._call_openai", fake_call_openai)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    response = client.post("/raw-posts/2/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    extracted = body["extracted_json"]
+    assert body["extractor_name"] == "openrouter_json_mode"
+    assert body["last_error"] is None
+    assert extracted["meta"]["extraction_mode"] == "json_mode"
+    assert extracted["meta"]["fallback_reason"] == "structured_unsupported"
+    assert extracted["horizon"] == "intraday"
+    assert extracted["stance"] == "neutral"
+    assert extracted["confidence"] == 78
+    assert extracted["event_tags"] == []
+    assert extracted["assets"] == [{"symbol": "SPY", "name": "SPDR S&P 500 ETF", "market": "ETF"}]
+    assert "platform" not in extracted
+    assert "url" not in extracted
+    assert "posted_at" not in extracted
+    assert extracted["meta"]["extraction_mode"] != "dummy"
+    assert calls["n"] == 2
+
+
+def test_json_mode_assets_auto_create_missing_asset(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+
+    def fake_call_openai(self, raw_post: RawPost, *, response_mode: str):  # noqa: ANN001
+        if response_mode == "structured":
+            raise OpenAIRequestError(
+                status_code=400,
+                body_preview="structured-outputs unsupported",
+            )
+        return {
+            "assets": ["VIX"],
+            "stance": "看空",
+            "horizon": "今晚",
+            "confidence": "88",
+            "reasoning": "风险偏好下降，波动率上行。",
+            "summary": "短线偏防御",
+            "event_tags": ["vix", "risk_off"],
+            "platform": raw_post.platform,
+            "author_handle": raw_post.author_handle,
+            "url": raw_post.url,
+            "posted_at": raw_post.posted_at.isoformat(),
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor._call_openai", fake_call_openai)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extractor_name"] == "openrouter_json_mode"
+    assert body["extracted_json"]["assets"] == [{"symbol": "VIX", "name": None, "market": "AUTO"}]
+    assert body["extracted_json"]["as_of"] == "2026-02-21"
+    assert body["extracted_json"]["meta"]["extraction_mode"] == "json_mode"
+    assert body["last_error"] is None
+    created_assets = list(fake_db._data[Asset].values())
+    assert len(created_assets) == 1
+    assert created_assets[0].symbol == "VIX"
+    assert created_assets[0].market == "AUTO"
+
+
+def test_json_mode_allows_auto_market_after_structured_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    fake_db.seed(
+        Asset(
+            id=99,
+            symbol="VIX",
+            name="CBOE Volatility Index",
+            market="AUTO",
+            created_at=datetime.now(UTC),
+        )
+    )
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+
+    def fake_call_openai(self, raw_post: RawPost, *, response_mode: str):  # noqa: ANN001
+        if response_mode == "structured":
+            raise OpenAIRequestError(
+                status_code=400,
+                body_preview="structured-outputs unsupported",
+            )
+        return {
+            "assets": [{"symbol": "VIX", "name": "CBOE Volatility Index", "market": "AUTO"}],
+            "summary": "volatility risk remains",
+            "source_url": raw_post.url,
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor._call_openai", fake_call_openai)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extractor_name"] == "openrouter_json_mode"
+    assert body["last_error"] is None
+    assert body["extracted_json"]["meta"]["extraction_mode"] == "json_mode"
+    assert body["extracted_json"]["assets"][0]["market"] == "AUTO"
+
+
+def test_normalize_as_of_datetime_to_date_only() -> None:
+    normalized = normalize_extracted_json(
+        {
+            "assets": [{"symbol": "GC=F", "market": "AUTO"}],
+            "as_of": "2026-02-21T10:30:45+00:00",
+            "posted_at": "2026-02-21T10:00:00+00:00",
+        }
+    )
+
+    assert normalized["as_of"] == "2026-02-21"
+
+
+def test_dummy_extractor_persists_prompt_and_raw_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "dummy")
+    monkeypatch.setenv("PROMPT_VERSION", "extract_v1")
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["extractor_name"] == "dummy"
+    assert body["prompt_version"] == "extract_v1"
+    assert isinstance(body["prompt_text"], str) and "Post Content:" in body["prompt_text"]
+    assert isinstance(body["prompt_hash"], str) and len(body["prompt_hash"]) == 64
+    assert isinstance(body["raw_model_output"], str) and "\"horizon\": \"1w\"" in body["raw_model_output"]

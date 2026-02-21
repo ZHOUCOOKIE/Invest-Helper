@@ -41,6 +41,14 @@ type Extraction = {
   extracted_json: Record<string, unknown>;
   model_name: string;
   extractor_name: string;
+  prompt_version: string | null;
+  prompt_text: string | null;
+  prompt_hash: string | null;
+  raw_model_output: string | null;
+  parsed_model_output: Record<string, unknown> | null;
+  model_latency_ms: number | null;
+  model_input_tokens: number | null;
+  model_output_tokens: number | null;
   last_error: string | null;
   reviewed_at: string | null;
   reviewed_by: string | null;
@@ -111,16 +119,19 @@ function pickDefaults(extracted: Record<string, unknown>, rawPostUrl: string): P
   return result;
 }
 
-function pickFirstAssetSymbol(extracted: Record<string, unknown>): string | null {
+function pickAssetSymbols(extracted: Record<string, unknown>): string[] {
   const assets = extracted.assets;
   if (!Array.isArray(assets) || assets.length === 0) {
-    return null;
+    return [];
   }
-  const first = assets[0] as Record<string, unknown>;
-  if (typeof first.symbol !== "string" || !first.symbol.trim()) {
-    return null;
+  const symbols: string[] = [];
+  for (const item of assets) {
+    const asset = item as Record<string, unknown>;
+    if (typeof asset.symbol === "string" && asset.symbol.trim()) {
+      symbols.push(asset.symbol.trim().toUpperCase());
+    }
   }
-  return first.symbol.trim().toUpperCase();
+  return symbols;
 }
 
 function todayIsoDate(): string {
@@ -163,6 +174,7 @@ export default function ExtractionDetailPage() {
     as_of: todayIsoDate(),
   });
   const [rejectReason, setRejectReason] = useState("");
+  const [copyMessage, setCopyMessage] = useState<string | null>(null);
 
   useEffect(() => {
     const load = async () => {
@@ -223,20 +235,23 @@ export default function ExtractionDetailPage() {
         setKols(kolList);
 
         const defaults = pickDefaults(extractionData.extracted_json, extractionData.raw_post.url);
-        const extractedSymbol = pickFirstAssetSymbol(extractionData.extracted_json);
-        const matchedAsset = extractedSymbol
-          ? assetList.find((asset) => asset.symbol.toUpperCase() === extractedSymbol)
-          : null;
+        const extractedSymbols = pickAssetSymbols(extractionData.extracted_json);
+        const uniqueSymbols = Array.from(new Set(extractedSymbols));
+        const matchedAssets = uniqueSymbols
+          .map((symbol) => assetList.find((asset) => asset.symbol.toUpperCase() === symbol))
+          .filter((asset): asset is Asset => Boolean(asset));
 
-        if (extractedSymbol && !matchedAsset) {
-          setMatchingAssetHint(`提取到资产 ${extractedSymbol}，未匹配资产，请手动选择/先创建资产。`);
+        if (uniqueSymbols.length > 1) {
+          setMatchingAssetHint(`提取到多个资产(${uniqueSymbols.join(", ")})，请手动选择目标资产。`);
+        } else if (uniqueSymbols.length === 1 && matchedAssets.length === 0) {
+          setMatchingAssetHint(`提取到资产 ${uniqueSymbols[0]}，未匹配资产，请手动选择/先创建资产。`);
         } else {
           setMatchingAssetHint(null);
         }
 
         setForm({
           kol_id: kolList[0] ? String(kolList[0].id) : "",
-          asset_id: matchedAsset ? String(matchedAsset.id) : assetList[0] ? String(assetList[0].id) : "",
+          asset_id: uniqueSymbols.length === 1 && matchedAssets[0] ? String(matchedAssets[0].id) : "",
           stance: "neutral",
           horizon: "1w",
           confidence: "50",
@@ -347,7 +362,7 @@ export default function ExtractionDetailPage() {
     const hints: string[] = [];
     const stanceMissing = typeof extracted.stance !== "string" || !VALID_STANCE.has(extracted.stance);
     const horizonMissing = typeof extracted.horizon !== "string" || !VALID_HORIZON.has(extracted.horizon);
-    const assetMissing = !pickFirstAssetSymbol(extracted);
+    const assetMissing = pickAssetSymbols(extracted).length === 0;
 
     if (stanceMissing) hints.push("stance: 模型未判断/信息不足");
     if (horizonMissing) hints.push("horizon: 模型未判断/信息不足");
@@ -362,6 +377,20 @@ export default function ExtractionDetailPage() {
     if (!meta || typeof meta !== "object") return false;
     return (meta as Record<string, unknown>)["fallback_reason"] === "budget_exhausted";
   }, [extraction]);
+
+  const copyRawOutput = async () => {
+    if (!extraction?.raw_model_output) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(extraction.raw_model_output);
+      setCopyMessage("已复制 raw output");
+      window.setTimeout(() => setCopyMessage(null), 1200);
+    } catch {
+      setCopyMessage("复制失败");
+      window.setTimeout(() => setCopyMessage(null), 1200);
+    }
+  };
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
@@ -432,6 +461,57 @@ export default function ExtractionDetailPage() {
               </div>
             )}
             <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(extraction.extracted_json, null, 2)}</pre>
+          </section>
+
+          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
+            <details>
+              <summary style={{ cursor: "pointer", fontWeight: 700 }}>Debug / 模型输出</summary>
+              <div style={{ marginTop: "10px", display: "grid", gap: "6px" }}>
+                <div>prompt_version: {extraction.prompt_version || "(none)"}</div>
+                <div>prompt_hash: {extraction.prompt_hash || "(none)"}</div>
+                <div>model_name: {extraction.model_name}</div>
+                <div>extractor_name: {extraction.extractor_name}</div>
+                <div>latency_ms: {extraction.model_latency_ms ?? "(none)"}</div>
+                <div>
+                  tokens: in={extraction.model_input_tokens ?? "(none)"} / out=
+                  {extraction.model_output_tokens ?? "(none)"}
+                </div>
+                <div>
+                  <button type="button" onClick={() => void copyRawOutput()} disabled={!extraction.raw_model_output}>
+                    Copy raw output
+                  </button>
+                  {copyMessage && <span style={{ marginLeft: "8px" }}>{copyMessage}</span>}
+                </div>
+                <div>raw_model_output:</div>
+                <pre
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    maxHeight: "280px",
+                    overflow: "auto",
+                    border: "1px solid #eee",
+                    borderRadius: "6px",
+                    padding: "8px",
+                    margin: 0,
+                  }}
+                >
+                  {extraction.raw_model_output || "(empty)"}
+                </pre>
+                <div>parsed_model_output:</div>
+                <pre
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    maxHeight: "280px",
+                    overflow: "auto",
+                    border: "1px solid #eee",
+                    borderRadius: "6px",
+                    padding: "8px",
+                    margin: 0,
+                  }}
+                >
+                  {extraction.parsed_model_output ? JSON.stringify(extraction.parsed_model_output, null, 2) : "(none)"}
+                </pre>
+              </div>
+            </details>
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>

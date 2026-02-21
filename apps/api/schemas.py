@@ -130,6 +130,14 @@ class PostExtractionRead(BaseModel):
     extracted_json: dict
     model_name: str
     extractor_name: str
+    prompt_version: str | None
+    prompt_text: str | None
+    prompt_hash: str | None
+    raw_model_output: str | None
+    parsed_model_output: dict | None
+    model_latency_ms: int | None
+    model_input_tokens: int | None
+    model_output_tokens: int | None
     last_error: str | None
     reviewed_at: datetime | None
     reviewed_by: str | None

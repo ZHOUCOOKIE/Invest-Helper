@@ -29,6 +29,9 @@ class FakeResult:
     def all(self) -> list[object]:
         return self._items
 
+    def scalar_one_or_none(self) -> object | None:
+        return self._items[0] if self._items else None
+
 
 class FakeAsyncSession:
     def __init__(self) -> None:
@@ -94,7 +97,16 @@ class FakeAsyncSession:
 
             return FakeResult(items=items)
 
-        return FakeResult(items=[])
+        items = list(self._data.get(entity, {}).values())
+        for criterion in getattr(query, "_where_criteria", ()):
+            key = criterion.left.key
+            value = criterion.right.value
+            if key == "symbol" and isinstance(value, str):
+                items = [item for item in items if getattr(item, key).upper() == value.upper()]
+            else:
+                items = [item for item in items if getattr(item, key) == value]
+        return FakeResult(items=items)
+
 
     def _approved_views(self) -> list[KolView]:
         views_by_id = self._data[KolView]

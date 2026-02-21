@@ -97,6 +97,16 @@ class RawPostCreate(BaseModel):
     raw_json: dict | None = None
 
 
+class ManualIngestCreate(BaseModel):
+    platform: str = Field(min_length=1, max_length=32)
+    author_handle: str = Field(min_length=1, max_length=128)
+    url: str = Field(min_length=1, max_length=1024)
+    external_id: str | None = Field(default=None, max_length=128)
+    content_text: str = Field(min_length=1, max_length=8192)
+    posted_at: datetime | None = None
+    raw_json: dict | None = None
+
+
 class RawPostRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -119,4 +129,67 @@ class PostExtractionRead(BaseModel):
     status: ExtractionStatus
     extracted_json: dict
     model_name: str
+    reviewed_at: datetime | None
+    reviewed_by: str | None
+    review_note: str | None
+    applied_kol_view_id: int | None
     created_at: datetime
+
+
+class ExtractionApproveRequest(BaseModel):
+    kol_id: int
+    asset_id: int
+    stance: Stance
+    horizon: Horizon
+    confidence: int = Field(ge=0, le=100)
+    summary: str = Field(min_length=1, max_length=1024)
+    source_url: str = Field(min_length=1, max_length=1024)
+    as_of: date
+
+
+class ExtractionRejectRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1024)
+
+
+class PostExtractionWithRawPostRead(PostExtractionRead):
+    raw_post: RawPostRead
+
+
+class ManualIngestRead(BaseModel):
+    raw_post: RawPostRead
+    extraction: PostExtractionRead
+    extraction_id: int
+
+
+class DashboardPendingExtractionRead(BaseModel):
+    id: int
+    platform: str
+    author_handle: str
+    url: str
+    posted_at: datetime
+    created_at: datetime
+
+
+class DashboardTopAssetRead(BaseModel):
+    asset_id: int
+    symbol: str
+    market: str | None
+    views_count_7d: int
+    avg_confidence_7d: float
+
+
+class DashboardClarityRead(BaseModel):
+    horizon: Horizon
+    bull_count: int
+    bear_count: int
+    neutral_count: int
+    clarity: float
+
+
+class DashboardRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    pending_extractions_count: int
+    latest_pending_extractions: list[DashboardPendingExtractionRead]
+    top_assets: list[DashboardTopAssetRead]
+    clarity: list[DashboardClarityRead]

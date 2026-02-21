@@ -1,11 +1,14 @@
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import hashlib
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from db import get_db
 from enums import HORIZON_ORDER, Stance
@@ -17,17 +20,27 @@ from schemas import (
     AssetViewsMetaRead,
     AssetRead,
     AssetViewsRead,
+    DashboardClarityRead,
+    DashboardPendingExtractionRead,
+    DashboardRead,
+    DashboardTopAssetRead,
+    ExtractionApproveRequest,
+    ExtractionRejectRequest,
     KolCreate,
     KolRead,
     KolViewCreate,
     KolViewRead,
+    ManualIngestCreate,
+    ManualIngestRead,
     PostExtractionRead,
+    PostExtractionWithRawPostRead,
     RawPostCreate,
     RawPostRead,
 )
 from services.extraction import DummyExtractor
 
 app = FastAPI(title="InvestPulse API")
+EXTRACTION_REVIEWER = "human-review"
 
 # 先放开本地前端跨域，后面再收紧
 app.add_middleware(
@@ -95,6 +108,18 @@ def build_asset_views_response(asset_id: int, views: list[KolView]) -> AssetView
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+def build_external_id(url: str) -> str:
+    url = url.strip()
+    if not url:
+        return uuid4().hex
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+
+
+def calc_clarity(bull_count: int, bear_count: int) -> float:
+    total = bull_count + bear_count
+    return abs(bull_count - bear_count) / max(1, total)
 
 
 @app.get("/assets", response_model=list[AssetRead])
@@ -219,6 +244,46 @@ async def create_raw_post(payload: RawPostCreate, db: AsyncSession = Depends(get
     return raw_post
 
 
+@app.post("/ingest/manual", response_model=ManualIngestRead, status_code=status.HTTP_201_CREATED)
+async def ingest_manual(payload: ManualIngestCreate, db: AsyncSession = Depends(get_db)):
+    platform = payload.platform.strip().lower()
+    author_handle = payload.author_handle.strip()
+    url = payload.url.strip()
+    content_text = payload.content_text.strip()
+    external_id = (payload.external_id or "").strip() or build_external_id(url)
+    posted_at = payload.posted_at or datetime.now(UTC)
+
+    raw_post = RawPost(
+        platform=platform,
+        author_handle=author_handle,
+        external_id=external_id,
+        url=url,
+        content_text=content_text,
+        posted_at=posted_at,
+        raw_json=payload.raw_json,
+    )
+    db.add(raw_post)
+
+    try:
+        await db.flush()
+        extractor = DummyExtractor()
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json=extractor.extract(raw_post),
+            model_name=extractor.model_name,
+        )
+        db.add(extraction)
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="raw post already exists")
+
+    await db.refresh(raw_post)
+    await db.refresh(extraction)
+    return ManualIngestRead(raw_post=raw_post, extraction=extraction, extraction_id=extraction.id)
+
+
 @app.post("/raw-posts/{raw_post_id}/extract", response_model=PostExtractionRead, status_code=status.HTTP_201_CREATED)
 async def extract_raw_post(raw_post_id: int, db: AsyncSession = Depends(get_db)):
     raw_post = await db.get(RawPost, raw_post_id)
@@ -233,6 +298,224 @@ async def extract_raw_post(raw_post_id: int, db: AsyncSession = Depends(get_db))
         model_name=extractor.model_name,
     )
     db.add(extraction)
+    await db.commit()
+    await db.refresh(extraction)
+    return extraction
+
+
+@app.get("/dashboard", response_model=DashboardRead)
+async def get_dashboard(
+    days: int = Query(default=7, ge=1, le=90),
+    db: AsyncSession = Depends(get_db),
+):
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+
+    pending_count_result = await db.execute(
+        select(func.count(PostExtraction.id)).where(PostExtraction.status == ExtractionStatus.pending)
+    )
+    pending_extractions_count = pending_count_result.scalar() or 0
+
+    latest_pending_result = await db.execute(
+        select(PostExtraction)
+        .options(selectinload(PostExtraction.raw_post))
+        .where(PostExtraction.status == ExtractionStatus.pending)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(20)
+    )
+    latest_pending = list(latest_pending_result.scalars().all())
+    latest_pending_extractions = [
+        DashboardPendingExtractionRead(
+            id=item.id,
+            platform=item.raw_post.platform,
+            author_handle=item.raw_post.author_handle,
+            url=item.raw_post.url,
+            posted_at=item.raw_post.posted_at,
+            created_at=item.created_at,
+        )
+        for item in latest_pending
+        if item.raw_post is not None
+    ]
+
+    top_assets_result = await db.execute(
+        select(
+            Asset.id.label("asset_id"),
+            Asset.symbol.label("symbol"),
+            Asset.market.label("market"),
+            func.count(KolView.id).label("views_count"),
+            func.avg(KolView.confidence).label("avg_confidence"),
+        )
+        .join(KolView, KolView.asset_id == Asset.id)
+        .join(PostExtraction, PostExtraction.applied_kol_view_id == KolView.id)
+        .where(
+            PostExtraction.status == ExtractionStatus.approved,
+            KolView.created_at >= cutoff,
+        )
+        .group_by(Asset.id, Asset.symbol, Asset.market)
+        .order_by(func.count(KolView.id).desc(), func.avg(KolView.confidence).desc(), Asset.id.asc())
+        .limit(20)
+    )
+    top_asset_rows = top_assets_result.all()
+    top_assets = [
+        DashboardTopAssetRead(
+            asset_id=row.asset_id,
+            symbol=row.symbol,
+            market=row.market,
+            views_count_7d=int(row.views_count),
+            avg_confidence_7d=float(row.avg_confidence or 0),
+        )
+        for row in top_asset_rows
+    ]
+
+    clarity: list[DashboardClarityRead] = []
+    top_asset_ids = [item.asset_id for item in top_assets]
+    if top_asset_ids:
+        stance_counts_result = await db.execute(
+            select(
+                KolView.horizon.label("horizon"),
+                KolView.stance.label("stance"),
+                func.count(KolView.id).label("count"),
+            )
+            .join(PostExtraction, PostExtraction.applied_kol_view_id == KolView.id)
+            .where(
+                PostExtraction.status == ExtractionStatus.approved,
+                KolView.created_at >= cutoff,
+                KolView.asset_id.in_(top_asset_ids),
+            )
+            .group_by(KolView.horizon, KolView.stance)
+        )
+
+        grouped_counts: dict[str, dict[Stance, int]] = defaultdict(
+            lambda: {Stance.bull: 0, Stance.bear: 0, Stance.neutral: 0}
+        )
+        for row in stance_counts_result.all():
+            grouped_counts[row.horizon.value][row.stance] = int(row.count)
+
+        order_index = {value: idx for idx, value in enumerate(HORIZON_ORDER)}
+        for horizon in sorted(grouped_counts.keys(), key=lambda value: order_index.get(value, 999)):
+            counts = grouped_counts[horizon]
+            bull_count = counts[Stance.bull]
+            bear_count = counts[Stance.bear]
+            neutral_count = counts[Stance.neutral]
+            clarity.append(
+                DashboardClarityRead(
+                    horizon=horizon,
+                    bull_count=bull_count,
+                    bear_count=bear_count,
+                    neutral_count=neutral_count,
+                    clarity=calc_clarity(bull_count=bull_count, bear_count=bear_count),
+                )
+            )
+
+    return DashboardRead(
+        pending_extractions_count=int(pending_extractions_count),
+        latest_pending_extractions=latest_pending_extractions,
+        top_assets=top_assets,
+        clarity=clarity,
+    )
+
+
+@app.get("/extractions", response_model=list[PostExtractionWithRawPostRead])
+async def list_extractions(
+    status: ExtractionStatus = Query(default=ExtractionStatus.pending),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(PostExtraction)
+        .options(selectinload(PostExtraction.raw_post))
+        .where(PostExtraction.status == status)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+@app.get("/extractions/{extraction_id}", response_model=PostExtractionWithRawPostRead)
+async def get_extraction(extraction_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(PostExtraction)
+        .options(selectinload(PostExtraction.raw_post))
+        .where(PostExtraction.id == extraction_id)
+    )
+    extraction = result.scalar_one_or_none()
+    if extraction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+    return extraction
+
+
+@app.post("/extractions/{extraction_id}/approve", response_model=PostExtractionRead)
+async def approve_extraction(
+    extraction_id: int,
+    payload: ExtractionApproveRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    extraction = await db.get(PostExtraction, extraction_id)
+    if extraction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+    if extraction.status != ExtractionStatus.pending:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"extraction already {extraction.status.value}",
+        )
+
+    kol = await db.get(Kol, payload.kol_id)
+    if kol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol not found")
+    asset = await db.get(Asset, payload.asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    view = KolView(
+        kol_id=payload.kol_id,
+        asset_id=payload.asset_id,
+        stance=payload.stance,
+        horizon=payload.horizon,
+        confidence=payload.confidence,
+        summary=payload.summary.strip(),
+        source_url=payload.source_url.strip(),
+        as_of=payload.as_of,
+    )
+    db.add(view)
+
+    extraction.status = ExtractionStatus.approved
+    extraction.reviewed_at = datetime.now(UTC)
+    extraction.reviewed_by = EXTRACTION_REVIEWER
+    extraction.review_note = None
+
+    try:
+        await db.flush()
+        extraction.applied_kol_view_id = view.id
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate kol view")
+
+    await db.refresh(extraction)
+    return extraction
+
+
+@app.post("/extractions/{extraction_id}/reject", response_model=PostExtractionRead)
+async def reject_extraction(
+    extraction_id: int,
+    payload: ExtractionRejectRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    extraction = await db.get(PostExtraction, extraction_id)
+    if extraction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+    if extraction.status != ExtractionStatus.pending:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"extraction already {extraction.status.value}",
+        )
+
+    extraction.status = ExtractionStatus.rejected
+    extraction.reviewed_at = datetime.now(UTC)
+    extraction.reviewed_by = EXTRACTION_REVIEWER
+    extraction.review_note = (payload.reason or "").strip() or None
+    extraction.applied_kol_view_id = None
     await db.commit()
     await db.refresh(extraction)
     return extraction

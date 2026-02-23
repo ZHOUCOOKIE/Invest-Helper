@@ -8,6 +8,8 @@ import { useEffect, useMemo, useState } from "react";
 type KolView = {
   id: number;
   kol_id: number;
+  kol_display_name?: string | null;
+  kol_handle?: string | null;
   asset_id: number;
   stance: "bull" | "bear" | "neutral" | string;
   horizon: string;
@@ -31,6 +33,16 @@ type AssetViewsResponse = {
     generated_at: string;
     version_policy: string;
   };
+};
+
+type AssetViewsFeedResponse = {
+  asset_id: number;
+  horizon: "intraday" | "1w" | "1m" | "3m" | "1y" | null;
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  items: KolView[];
 };
 
 type Kol = {
@@ -57,6 +69,7 @@ const stanceStyle: Record<string, { color: string; borderColor: string; backgrou
   bear: { color: "#b42318", borderColor: "#b42318", backgroundColor: "#fdecec" },
   neutral: { color: "#6b7280", borderColor: "#6b7280", backgroundColor: "#f4f4f5" },
 };
+const FEED_PAGE_SIZE = 10;
 
 export default function AssetDetailPage() {
   const params = useParams<{ id: string }>();
@@ -68,6 +81,11 @@ export default function AssetDetailPage() {
   const [submitting, setSubmitting] = useState(false);
   const [submitMessage, setSubmitMessage] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [feed, setFeed] = useState<AssetViewsFeedResponse | null>(null);
+  const [feedLoading, setFeedLoading] = useState(false);
+  const [feedError, setFeedError] = useState<string | null>(null);
+  const [feedHorizon, setFeedHorizon] = useState<"all" | "intraday" | "1w" | "1m" | "3m" | "1y">("all");
+  const [feedOffset, setFeedOffset] = useState(0);
   const [form, setForm] = useState<FormState>({
     kol_id: "",
     stance: "bull",
@@ -85,6 +103,36 @@ export default function AssetDetailPage() {
       throw new Error("detail" in body ? (body.detail ?? "Request failed") : `Request failed ${res.status}`);
     }
     setData(body as AssetViewsResponse);
+  };
+
+  const loadFeed = async (nextOffset: number, nextHorizon: typeof feedHorizon) => {
+    setFeedLoading(true);
+    setFeedError(null);
+    try {
+      const horizonParam = nextHorizon === "all" ? "" : `&horizon=${nextHorizon}`;
+      const res = await fetch(
+        `/api/assets/${assetId}/views/feed?limit=${FEED_PAGE_SIZE}&offset=${nextOffset}${horizonParam}`,
+        { cache: "no-store" },
+      );
+      const body = (await res.json()) as AssetViewsFeedResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error("detail" in body ? (body.detail ?? "Load feed failed") : "Load feed failed");
+      }
+      const payload = body as AssetViewsFeedResponse;
+      setFeed((prev) => {
+        if (nextOffset === 0 || !prev) {
+          return payload;
+        }
+        return {
+          ...payload,
+          items: [...prev.items, ...payload.items],
+        };
+      });
+    } catch (err) {
+      setFeedError(err instanceof Error ? err.message : "Load feed failed");
+    } finally {
+      setFeedLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -133,6 +181,11 @@ export default function AssetDetailPage() {
     void load();
   }, [assetId]);
 
+  useEffect(() => {
+    if (Number.isNaN(assetId)) return;
+    void loadFeed(feedOffset, feedHorizon);
+  }, [assetId, feedOffset, feedHorizon]);
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSubmitMessage(null);
@@ -172,6 +225,7 @@ export default function AssetDetailPage() {
       }
 
       await loadViews();
+      setFeedOffset(0);
       setSubmitMessage("观点创建成功，列表已刷新。");
       setForm((prev) => ({ ...prev, summary: "", source_url: "", as_of: "" }));
     } catch (err) {
@@ -291,6 +345,86 @@ export default function AssetDetailPage() {
             {kols.length === 0 && <p style={{ color: "#666" }}>暂无可用 KOL，请先在 KOL 页面创建并启用。</p>}
             {submitMessage && <p style={{ color: "green" }}>{submitMessage}</p>}
             {submitError && <p style={{ color: "crimson" }}>{submitError}</p>}
+          </section>
+          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
+            <h2 style={{ marginTop: 0 }}>观点时间线</h2>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+              <label>
+                horizon
+                <select
+                  value={feedHorizon}
+                  onChange={(event) => {
+                    setFeedHorizon(event.target.value as typeof feedHorizon);
+                    setFeedOffset(0);
+                  }}
+                  style={{ marginLeft: "8px" }}
+                >
+                  <option value="all">all</option>
+                  <option value="intraday">intraday</option>
+                  <option value="1w">1w</option>
+                  <option value="1m">1m</option>
+                  <option value="3m">3m</option>
+                  <option value="1y">1y</option>
+                </select>
+              </label>
+              <button type="button" onClick={() => setFeedOffset(0)} disabled={feedLoading}>
+                {feedLoading ? "Loading..." : "Refresh"}
+              </button>
+              <small style={{ color: "#666" }}>total: {feed?.total ?? 0}</small>
+            </div>
+            {feedError && <p style={{ color: "crimson" }}>{feedError}</p>}
+            {!feedLoading && !feedError && feed && feed.items.length === 0 && <p>暂无观点。</p>}
+            {feed && feed.items.length > 0 && (
+              <div style={{ display: "grid", gap: "8px", marginTop: "10px" }}>
+                {feed.items.map((view) => {
+                  const badge = stanceStyle[view.stance] ?? stanceStyle.neutral;
+                  return (
+                    <article key={`feed-${view.id}`} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
+                      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                        <span
+                          style={{
+                            border: `1px solid ${badge.borderColor}`,
+                            backgroundColor: badge.backgroundColor,
+                            color: badge.color,
+                            borderRadius: "999px",
+                            padding: "2px 8px",
+                            fontWeight: 700,
+                            textTransform: "uppercase",
+                            fontSize: "12px",
+                          }}
+                        >
+                          {view.stance}
+                        </span>
+                        <span>{view.horizon}</span>
+                        <span>confidence: {view.confidence}</span>
+                        <span>as_of: {view.as_of}</span>
+                        <span>KOL: {view.kol_display_name || view.kol_handle || view.kol_id}</span>
+                      </div>
+                      <div style={{ marginTop: "6px" }}>{view.summary || "暂无摘要"}</div>
+                      <div style={{ marginTop: "4px" }}>
+                        source:{" "}
+                        {view.source_url ? (
+                          <a href={view.source_url} target="_blank" rel="noreferrer">
+                            {view.source_url}
+                          </a>
+                        ) : (
+                          <span>N/A</span>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setFeedOffset((prev) => prev + FEED_PAGE_SIZE)}
+                    disabled={!feed.has_more || feedLoading}
+                  >
+                    Load More
+                  </button>
+                </div>
+              </div>
+            )}
           </section>
           {data.groups.length === 0 ? (
             <p>No KOL views yet.</p>

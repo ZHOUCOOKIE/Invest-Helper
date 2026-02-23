@@ -72,6 +72,19 @@ class FakeAsyncSession:
         self._data.get(model, {}).pop(obj_id, None)
 
     async def execute(self, query) -> FakeResult:  # noqa: ANN001
+        sql = str(query).lower()
+        if "from asset_aliases join assets" in sql:
+            alias_items = list(self._data[AssetAlias].values())
+            for criterion in getattr(query, "_where_criteria", ()):
+                key = criterion.left.key
+                value = criterion.right.value
+                alias_items = [item for item in alias_items if getattr(item, key) == value]
+            alias_items.sort(key=lambda item: item.id)
+            assets = self._data[Asset]
+            if "asset_aliases.alias, assets.symbol" in sql:
+                return FakeResult([(item.alias, assets[item.asset_id].symbol) for item in alias_items])
+            return FakeResult([(item, assets[item.asset_id].symbol) for item in alias_items])
+
         entity = query.column_descriptions[0]["entity"]
         items = list(self._data.get(entity, {}).values())
 
@@ -97,6 +110,8 @@ class FakeAsyncSession:
                 setattr(obj, "id", next_id)
             if hasattr(obj, "created_at") and getattr(obj, "created_at") is None:
                 setattr(obj, "created_at", now)
+            if hasattr(obj, "fetched_at") and getattr(obj, "fetched_at") is None:
+                setattr(obj, "fetched_at", now)
             bucket[getattr(obj, "id")] = obj
         self._new.clear()
 
@@ -622,6 +637,159 @@ def test_dummy_extractor_persists_prompt_and_raw_output(monkeypatch: pytest.Monk
     assert isinstance(body["prompt_text"], str) and "Post Content:" in body["prompt_text"]
     assert isinstance(body["prompt_hash"], str) and len(body["prompt_hash"]) == 64
     assert isinstance(body["raw_model_output"], str) and "\"horizon\": \"1w\"" in body["raw_model_output"]
+
+
+def test_asset_alias_upsert_normalizes_case_and_spaces() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(Asset(id=1, symbol="XAUUSD", name="Gold", market="FOREX", created_at=now))
+    fake_db.seed(Asset(id=2, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    first = client.post("/assets/1/aliases", json={"alias": "  Gold  "})
+    second = client.post("/assets/1/aliases", json={"alias": "gold"})
+    third = client.post("/assets/2/aliases", json={"alias": " GOLD "})
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert third.status_code == 201
+    assert len(first.json()) == 1
+    assert len(second.json()) == 1
+    assert len(third.json()) == 1
+    assert third.json()[0]["asset_id"] == 2
+    assert third.json()[0]["alias"] == "GOLD"
+
+
+def test_prompt_includes_alias_map_from_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    now = datetime.now(UTC)
+    fake_db.seed(Asset(id=1, symbol="XAUUSD", name="Gold", market="FOREX", created_at=now))
+    fake_db.seed(AssetAlias(id=1, asset_id=1, alias="黄金", created_at=now))
+    monkeypatch.setenv("EXTRACTOR_MODE", "dummy")
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert "Alias -> Symbol Map" in body["prompt_text"]
+    assert "- 黄金 -> XAUUSD" in body["prompt_text"]
+
+
+def test_normalize_corrects_symbol_by_alias_text_match() -> None:
+    normalized = normalize_extracted_json(
+        {
+            "assets": [],
+            "asset_views": [
+                {
+                    "symbol": "UNKNOWN",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 82,
+                    "summary": "黄金走强，风险偏好下降。",
+                    "reasoning": "避险资金回流黄金。",
+                    "drivers": ["黄金突破关键阻力"],
+                }
+            ],
+        },
+        posted_at="2026-02-21T08:00:00+00:00",
+        include_meta=True,
+        alias_to_symbol={"黄金": "XAUUSD"},
+        known_symbols={"BTC", "SPX", "XAUUSD"},
+    )
+
+    assert normalized["asset_views"][0]["symbol"] == "XAUUSD"
+    assert normalized["meta"]["alias_corrections"] == [
+        {"from": "UNKNOWN", "to": "XAUUSD", "reason": "alias_match"}
+    ]
+
+
+def test_manual_ingest_alias_corrections_hit_expected_symbols_and_auto_approve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    for asset_id, symbol, name, market in [
+        (1, "XAUUSD", "Gold", "FOREX"),
+        (2, "CL=F", "WTI Crude", "OTHER"),
+        (3, "US10Y", "US 10Y Yield", "OTHER"),
+        (4, "VIX", "CBOE VIX", "OTHER"),
+        (5, "BTC", "Bitcoin", "CRYPTO"),
+        (6, "SPX", "S&P 500", "INDEX"),
+    ]:
+        fake_db.seed(Asset(id=asset_id, symbol=symbol, name=name, market=market, created_at=now))
+    for alias_id, asset_id, alias in [
+        (1, 1, "黄金"),
+        (2, 2, "原油"),
+        (3, 3, "长债收益率"),
+        (4, 4, "波动率"),
+        (5, 4, "VIX"),
+        (6, 5, "加密"),
+        (7, 6, "美股"),
+    ]:
+        fake_db.seed(AssetAlias(id=alias_id, asset_id=asset_id, alias=alias, created_at=now))
+
+    monkeypatch.setenv("EXTRACTOR_MODE", "dummy")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.setenv("AUTO_APPROVE_CONFIDENCE_THRESHOLD", "70")
+    monkeypatch.setenv("AUTO_APPROVE_MIN_DISPLAY_CONFIDENCE", "50")
+
+    def fake_dummy_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {"symbol": "黄金", "stance": "bull", "horizon": "1w", "confidence": 88, "summary": "黄金偏强"},
+                {"symbol": "原油", "stance": "bull", "horizon": "1w", "confidence": 82, "summary": "原油受供给冲击"},
+                {
+                    "symbol": "US10YEAR",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 79,
+                    "summary": "长债收益率继续上行",
+                },
+                {"symbol": "VIX", "stance": "bear", "horizon": "1w", "confidence": 76, "summary": "波动率回落"},
+                {"symbol": "", "stance": "bull", "horizon": "1w", "confidence": 77, "summary": "加密资金回流"},
+                {"symbol": "UNKNOWN", "stance": "neutral", "horizon": "1w", "confidence": 74, "summary": "美股震荡"},
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.DummyExtractor.extract", fake_dummy_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post(
+        "/ingest/manual",
+        json={
+            "platform": "x",
+            "author_handle": "alias_tester",
+            "url": "https://x.com/alias_tester/status/1",
+            "content_text": "黄金、原油、长债收益率、VIX、加密和美股都在波动。",
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    extraction = response.json()["extraction"]
+    symbols = {item["symbol"] for item in extraction["extracted_json"]["asset_views"]}
+    assert {"XAUUSD", "CL=F", "US10Y", "VIX", "BTC", "SPX"}.issubset(symbols)
+    assert extraction["auto_applied_count"] >= 6
+    assert extraction["status"] == ExtractionStatus.approved.value
 
 
 def test_normalize_derives_asset_views_from_global_payload() -> None:

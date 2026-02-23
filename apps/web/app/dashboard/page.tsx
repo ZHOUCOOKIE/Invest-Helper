@@ -3,64 +3,73 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
-type DashboardPendingExtraction = {
-  id: number;
-  platform: string;
-  author_handle: string;
-  url: string;
-  posted_at: string;
-  created_at: string;
-};
-
-type DashboardTopAsset = {
-  asset_id: number;
-  symbol: string;
-  market: string | null;
-  views_count_7d: number;
-  avg_confidence_7d: number;
-};
-
-type DashboardClarity = {
+type DashboardAssetLatestView = {
+  kol_view_id: number;
   horizon: "intraday" | "1w" | "1m" | "3m" | "1y" | string;
-  bull_count: number;
-  bear_count: number;
-  neutral_count: number;
-  clarity: number;
+  stance: "bull" | "bear" | "neutral" | string;
+  confidence: number;
+  summary: string;
+  as_of: string;
+  created_at: string;
+  kol_id: number;
+  kol_display_name: string | null;
+  kol_handle: string | null;
+};
+
+type DashboardAsset = {
+  id: number;
+  symbol: string;
+  name: string | null;
+  market: string | null;
+  new_views_24h: number;
+  new_views_7d: number;
+  latest_views_by_horizon: DashboardAssetLatestView[];
+};
+
+type DashboardActiveKol = {
+  kol_id: number;
+  display_name: string | null;
+  handle: string;
+  platform: string;
+  views_count_7d: number;
+  top_assets: Array<{
+    asset_id: number;
+    symbol: string;
+    views_count: number;
+  }>;
 };
 
 type DashboardResponse = {
   pending_extractions_count: number;
-  latest_pending_extractions: DashboardPendingExtraction[];
-  top_assets: DashboardTopAsset[];
-  clarity: DashboardClarity[];
-  extraction_stats: {
-    window_hours: number;
-    extraction_count: number;
-    dummy_count: number;
-    openai_count: number;
-    error_count: number;
-  };
+  new_views_24h: number;
+  new_views_7d: number;
+  assets: DashboardAsset[];
+  active_kols_7d: DashboardActiveKol[];
 };
 
-const DEFAULT_DAYS = 7;
+type WindowKey = "24h" | "7d";
 
-function formatPct(value: number): string {
-  return `${(value * 100).toFixed(0)}%`;
+const horizonOrder: Array<DashboardAssetLatestView["horizon"]> = ["intraday", "1w", "1m", "3m", "1y"];
+
+function cmpByWindow(a: DashboardAsset, b: DashboardAsset, windowKey: WindowKey): number {
+  const delta =
+    windowKey === "24h" ? b.new_views_24h - a.new_views_24h : b.new_views_7d - a.new_views_7d;
+  if (delta !== 0) return delta;
+  return a.symbol.localeCompare(b.symbol);
 }
 
 export default function DashboardPage() {
-  const [days, setDays] = useState(String(DEFAULT_DAYS));
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selectedAssetId, setSelectedAssetId] = useState<number | null>(null);
+  const [query, setQuery] = useState("");
+  const [windowKey, setWindowKey] = useState<WindowKey>("24h");
 
-  const load = async (inputDays: string) => {
+  const load = async () => {
     setLoading(true);
     setError(null);
     try {
-      const safeDays = Math.max(1, Number(inputDays) || DEFAULT_DAYS);
-      const res = await fetch(`/api/dashboard?days=${safeDays}`, { cache: "no-store" });
+      const res = await fetch("/api/dashboard?days=7", { cache: "no-store" });
       const body = (await res.json()) as DashboardResponse | { detail?: string };
       if (!res.ok) {
         throw new Error("detail" in body ? (body.detail ?? "Load failed") : "Load failed");
@@ -74,157 +83,111 @@ export default function DashboardPage() {
   };
 
   useEffect(() => {
-    void load(days);
-  }, [days]);
+    void load();
+  }, []);
 
-  const clarityHint = useMemo(() => {
-    if (!data || data.clarity.length === 0) return null;
-    const ordered = [...data.clarity].sort((a, b) => b.clarity - a.clarity);
-    return {
-      highest: ordered[0],
-      lowest: ordered[ordered.length - 1],
-    };
-  }, [data]);
+  const visibleAssets = useMemo(() => {
+    const assets = data?.assets ?? [];
+    const keyword = query.trim().toLowerCase();
+    const filtered = keyword
+      ? assets.filter((asset) => {
+          const symbol = asset.symbol.toLowerCase();
+          const name = (asset.name || "").toLowerCase();
+          return symbol.includes(keyword) || name.includes(keyword);
+        })
+      : assets;
+    return [...filtered].sort((a, b) => cmpByWindow(a, b, windowKey));
+  }, [data, query, windowKey]);
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace", display: "grid", gap: "14px" }}>
-      <h1>Daily Dashboard</h1>
+      <h1>Portfolio Dashboard</h1>
 
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
         <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap" }}>
-          <strong>Pending Extractions: {data?.pending_extractions_count ?? "-"}</strong>
-          <Link href="/extractions">去审核列表</Link>
-          <Link href="/ingest">去手动导入</Link>
-          <label>
-            days
-            <input
-              type="number"
-              min={1}
-              max={90}
-              value={days}
-              onChange={(event) => setDays(event.target.value)}
-              style={{ marginLeft: "8px", width: "72px" }}
-            />
-          </label>
-          <button type="button" onClick={() => void load(days)} disabled={loading}>
+          <strong>新增观点: {windowKey === "24h" ? (data?.new_views_24h ?? "-") : (data?.new_views_7d ?? "-")}</strong>
+          <span>pending extractions: {data?.pending_extractions_count ?? "-"}</span>
+          <button type="button" onClick={() => setWindowKey("24h")} disabled={windowKey === "24h"}>
+            24h
+          </button>
+          <button type="button" onClick={() => setWindowKey("7d")} disabled={windowKey === "7d"}>
+            7d
+          </button>
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="按 symbol/name 搜索"
+            style={{ minWidth: "240px" }}
+          />
+          <button type="button" onClick={() => void load()} disabled={loading}>
             {loading ? "Loading..." : "Refresh"}
           </button>
+          <Link href="/ingest">手动导入</Link>
+          <Link href="/extractions">审核队列</Link>
         </div>
       </section>
 
       {error && <p style={{ color: "crimson" }}>{error}</p>}
 
-      {!loading && !error && data && (
+      {!loading && !error && (
         <>
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
-            <h2 style={{ marginTop: 0 }}>Extraction Health (24h)</h2>
-            <div style={{ display: "flex", gap: "14px", flexWrap: "wrap" }}>
-              <strong>提取次数: {data.extraction_stats.extraction_count}</strong>
-              <span>dummy: {data.extraction_stats.dummy_count}</span>
-              <span>openai: {data.extraction_stats.openai_count}</span>
-              <span>错误数: {data.extraction_stats.error_count}</span>
-              <span>
-                openai 占比:{" "}
-                {data.extraction_stats.extraction_count > 0
-                  ? `${((data.extraction_stats.openai_count / data.extraction_stats.extraction_count) * 100).toFixed(0)}%`
-                  : "0%"}
-              </span>
-            </div>
-          </section>
-
-          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
-            <h2 style={{ marginTop: 0 }}>Top Assets ({days}d)</h2>
-            {clarityHint && (
-              <p>
-                clarity highest: {clarityHint.highest.horizon} {formatPct(clarityHint.highest.clarity)} | lowest:{" "}
-                {clarityHint.lowest.horizon} {formatPct(clarityHint.lowest.clarity)}
-              </p>
-            )}
-            {data.top_assets.length === 0 ? (
-              <p>No approved views in current window.</p>
+            <h2 style={{ marginTop: 0 }}>资产列表</h2>
+            {visibleAssets.length === 0 ? (
+              <p>暂无资产或未命中搜索条件。</p>
             ) : (
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>Asset</th>
-                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>views</th>
-                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>avg_conf</th>
-                    <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "6px" }}>action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.top_assets.map((asset) => {
-                    const selected = selectedAssetId === asset.asset_id;
-                    return (
-                      <tr
-                        key={asset.asset_id}
-                        onClick={() => setSelectedAssetId(asset.asset_id)}
-                        style={{
-                          background: selected ? "#f0f6ff" : undefined,
-                          outline: selected ? "1px solid #6ba6ff" : undefined,
-                          cursor: "pointer",
-                        }}
-                      >
-                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>
-                          <strong>{asset.symbol}</strong> {asset.market ? `(${asset.market})` : ""}
-                        </td>
-                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>{asset.views_count_7d}</td>
-                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>
-                          {asset.avg_confidence_7d.toFixed(1)}
-                        </td>
-                        <td style={{ padding: "8px", borderBottom: "1px solid #f5f5f5" }}>
-                          <Link href={`/assets/${asset.asset_id}`}>
-                            <strong>查看详情 →</strong>
-                          </Link>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-          </section>
-
-          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
-            <h2 style={{ marginTop: 0 }}>Clarity</h2>
-            {data.clarity.length === 0 ? (
-              <p>No clarity data.</p>
-            ) : (
-              <div style={{ display: "grid", gap: "8px" }}>
-                {data.clarity.map((item) => (
-                  <div key={item.horizon} style={{ display: "grid", gap: "4px" }}>
-                    <div>
-                      {item.horizon}: {formatPct(item.clarity)} (bull={item.bull_count}, bear={item.bear_count},
-                      neutral={item.neutral_count})
+              <div style={{ display: "grid", gap: "10px" }}>
+                {visibleAssets.map((asset) => (
+                  <article key={asset.id} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", alignItems: "center" }}>
+                      <div>
+                        <strong>{asset.symbol}</strong> {asset.name ? `- ${asset.name}` : ""}{" "}
+                        {asset.market ? `(${asset.market})` : ""}
+                      </div>
+                      <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+                        <span>24h: {asset.new_views_24h}</span>
+                        <span>7d: {asset.new_views_7d}</span>
+                        <Link href={`/assets/${asset.id}`}>查看详情</Link>
+                      </div>
                     </div>
-                    <progress max={100} value={Math.round(item.clarity * 100)} style={{ width: "100%" }} />
-                  </div>
+                    <div style={{ marginTop: "8px", display: "grid", gap: "6px" }}>
+                      {horizonOrder
+                        .map((horizon) =>
+                          asset.latest_views_by_horizon.find((item) => item.horizon === horizon),
+                        )
+                        .filter((item): item is DashboardAssetLatestView => Boolean(item))
+                        .map((item) => (
+                          <div key={item.kol_view_id} style={{ background: "#fafafa", borderRadius: "6px", padding: "6px 8px" }}>
+                            <strong>{item.horizon}</strong> [{item.stance}/{item.confidence}] {item.summary || "暂无摘要"}
+                            {" · "}
+                            {item.kol_display_name || item.kol_handle || `KOL#${item.kol_id}`}
+                          </div>
+                        ))}
+                      {asset.latest_views_by_horizon.length === 0 && <small style={{ color: "#666" }}>暂无观点</small>}
+                    </div>
+                  </article>
                 ))}
               </div>
             )}
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
-            <h2 style={{ marginTop: 0 }}>Latest Pending Extractions</h2>
-            {data.latest_pending_extractions.length === 0 ? (
-              <p>No pending extractions.</p>
-            ) : (
+            <h2 style={{ marginTop: 0 }}>活跃 KOL（7d）</h2>
+            {(!data?.active_kols_7d || data.active_kols_7d.length === 0) && <p>暂无 KOL 聚合数据。</p>}
+            {data?.active_kols_7d && data.active_kols_7d.length > 0 && (
               <div style={{ display: "grid", gap: "8px" }}>
-                {data.latest_pending_extractions.map((item) => (
-                  <article key={item.id} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: "8px" }}>
-                      <strong>
-                        <Link href={`/extractions/${item.id}`}>Extraction #{item.id}</Link>
-                      </strong>
-                      <small>created_at: {item.created_at}</small>
-                    </div>
+                {data.active_kols_7d.map((kol) => (
+                  <article key={kol.kol_id} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
                     <div>
-                      {item.platform} / @{item.author_handle}
+                      <strong>{kol.display_name || kol.handle}</strong> ({kol.platform}/@{kol.handle}) · views:{" "}
+                      {kol.views_count_7d}
                     </div>
-                    <div>posted_at: {item.posted_at}</div>
-                    <a href={item.url} target="_blank" rel="noreferrer">
-                      {item.url}
-                    </a>
+                    <small>
+                      主要资产:{" "}
+                      {kol.top_assets.length > 0
+                        ? kol.top_assets.map((item) => `${item.symbol}(${item.views_count})`).join(", ")
+                        : "暂无"}
+                    </small>
                   </article>
                 ))}
               </div>

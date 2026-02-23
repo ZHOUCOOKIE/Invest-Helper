@@ -14,18 +14,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from db import get_db
-from enums import HORIZON_ORDER, Stance
+from enums import HORIZON_ORDER, Horizon, Stance
 from enums import ExtractionStatus
 from models import Asset, AssetAlias, Kol, KolView, PostExtraction, RawPost
 from schemas import (
     AssetCreate,
     AssetAliasCreate,
+    AssetAliasMapRead,
     AssetAliasRead,
+    AssetViewFeedItemRead,
     AssetViewsGroupRead,
+    AssetViewsFeedRead,
     AssetViewsMetaRead,
     AssetRead,
     AssetViewsRead,
     AutoAppliedViewRead,
+    DashboardActiveKolAssetRead,
+    DashboardActiveKolRead,
+    DashboardAssetLatestViewRead,
+    DashboardAssetRead,
     DashboardClarityRead,
     DashboardExtractionStatsRead,
     DashboardPendingExtractionRead,
@@ -240,6 +247,16 @@ async def _load_aliases_for_prompt(db: AsyncSession) -> list[dict[str, str]]:
     return aliases
 
 
+async def _load_known_asset_symbols(db: AsyncSession) -> set[str]:
+    result = await db.execute(select(Asset).order_by(Asset.id.asc()))
+    symbols: set[str] = set()
+    for asset in result.scalars().all():
+        symbol = getattr(asset, "symbol", None)
+        if isinstance(symbol, str) and symbol.strip():
+            symbols.add(symbol.strip().upper())
+    return symbols
+
+
 def _normalize_alias_key(value: str) -> str:
     return value.strip().lower()
 
@@ -252,31 +269,6 @@ def _build_alias_to_symbol_map(aliases: list[dict[str, str]]) -> dict[str, str]:
         if alias and symbol:
             mapping[alias] = symbol
     return mapping
-
-
-def _apply_alias_symbol_mapping(extracted_json: dict[str, Any], alias_to_symbol: dict[str, str]) -> None:
-    if not alias_to_symbol:
-        return
-
-    for asset in extracted_json.get("assets", []):
-        if not isinstance(asset, dict):
-            continue
-        symbol = asset.get("symbol")
-        if not isinstance(symbol, str):
-            continue
-        mapped = alias_to_symbol.get(_normalize_alias_key(symbol))
-        if mapped:
-            asset["symbol"] = mapped
-
-    for view in extracted_json.get("asset_views", []):
-        if not isinstance(view, dict):
-            continue
-        symbol = view.get("symbol")
-        if not isinstance(symbol, str):
-            continue
-        mapped = alias_to_symbol.get(_normalize_alias_key(symbol))
-        if mapped:
-            view["symbol"] = mapped
 
 
 async def upsert_asset(
@@ -716,6 +708,8 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         aliases_for_prompt = await _load_aliases_for_prompt(db)
     except Exception:  # noqa: BLE001
         aliases_for_prompt = []
+    alias_to_symbol = _build_alias_to_symbol_map(aliases_for_prompt)
+    known_symbols = await _load_known_asset_symbols(db)
     prompt_bundle = build_extract_prompt(
         prompt_version=settings.prompt_version,
         platform=extraction_input.platform,
@@ -758,8 +752,9 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         extracted_json,
         posted_at=extraction_input.posted_at,
         include_meta=True,
+        alias_to_symbol=alias_to_symbol,
+        known_symbols=known_symbols,
     )
-    _apply_alias_symbol_mapping(extracted_json, _build_alias_to_symbol_map(aliases_for_prompt))
 
     base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
     safe_meta = base_meta if isinstance(base_meta, dict) else {}
@@ -832,6 +827,19 @@ async def list_assets(db: AsyncSession = Depends(get_db)):
     return list(result.scalars().all())
 
 
+@app.get("/assets/aliases", response_model=list[AssetAliasMapRead])
+async def list_alias_symbol_map(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(AssetAlias.alias, Asset.symbol)
+        .join(Asset, Asset.id == AssetAlias.asset_id)
+        .order_by(AssetAlias.id.asc())
+    )
+    rows: list[AssetAliasMapRead] = []
+    for alias, symbol in result.all():
+        rows.append(AssetAliasMapRead(alias=alias, symbol=symbol))
+    return rows
+
+
 @app.post("/assets", response_model=AssetRead, status_code=status.HTTP_201_CREATED)
 async def create_asset(payload: AssetCreate, db: AsyncSession = Depends(get_db)):
     symbol = payload.symbol.strip().upper()
@@ -883,14 +891,19 @@ async def create_asset_alias(asset_id: int, payload: AssetAliasCreate, db: Async
     alias = payload.alias.strip()
     if not alias:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="alias is required")
+    alias_key = _normalize_alias_key(alias)
 
-    alias_row = AssetAlias(asset_id=asset_id, alias=alias)
-    db.add(alias_row)
-    try:
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="alias already exists")
+    existing_result = await db.execute(select(AssetAlias).order_by(AssetAlias.id.asc()))
+    existing_aliases = list(existing_result.scalars().all())
+    matched = next((item for item in existing_aliases if _normalize_alias_key(item.alias) == alias_key), None)
+    if matched is None:
+        db.add(AssetAlias(asset_id=asset_id, alias=alias))
+    else:
+        matched.asset_id = asset_id
+        matched.alias = alias
+        await db.flush()
+
+    await db.commit()
     result = await db.execute(
         select(AssetAlias).where(AssetAlias.asset_id == asset_id).order_by(AssetAlias.id.asc())
     )
@@ -971,6 +984,58 @@ async def get_asset_views(asset_id: int, db: AsyncSession = Depends(get_db)):
     )
     views = list(result.scalars().all())
     return build_asset_views_response(asset_id=asset_id, views=views)
+
+
+@app.get("/assets/{asset_id}/views/feed", response_model=AssetViewsFeedRead)
+async def get_asset_views_feed(
+    asset_id: int,
+    horizon: Horizon | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    asset = await db.get(Asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    query = select(KolView).where(KolView.asset_id == asset_id).order_by(KolView.created_at.desc(), KolView.id.desc())
+    if horizon is not None:
+        query = query.where(KolView.horizon == horizon)
+    result = await db.execute(query)
+    all_views = list(result.scalars().all())
+    total = len(all_views)
+    page = all_views[offset : offset + limit]
+
+    kol_result = await db.execute(select(Kol))
+    kol_map = {item.id: item for item in kol_result.scalars().all()}
+    items: list[AssetViewFeedItemRead] = []
+    for view in page:
+        kol = kol_map.get(view.kol_id)
+        items.append(
+            AssetViewFeedItemRead(
+                id=view.id,
+                kol_id=view.kol_id,
+                kol_display_name=kol.display_name if kol is not None else None,
+                kol_handle=kol.handle if kol is not None else None,
+                stance=view.stance,
+                horizon=view.horizon,
+                confidence=view.confidence,
+                summary=view.summary,
+                source_url=view.source_url,
+                as_of=view.as_of,
+                created_at=view.created_at,
+            )
+        )
+
+    return AssetViewsFeedRead(
+        asset_id=asset_id,
+        horizon=horizon,
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=(offset + len(items)) < total,
+        items=items,
+    )
 
 
 @app.post("/raw-posts", response_model=RawPostRead, status_code=status.HTTP_201_CREATED)
@@ -1058,8 +1123,11 @@ async def get_dashboard(
     days: int = Query(default=7, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
 ):
-    cutoff = datetime.now(UTC) - timedelta(days=days)
-    stats_cutoff = datetime.now(UTC) - timedelta(hours=24)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=days)
+    stats_cutoff = now - timedelta(hours=24)
+    views_cutoff_24h = now - timedelta(hours=24)
+    views_cutoff_7d = now - timedelta(days=7)
 
     pending_count_result = await db.execute(
         select(func.count(PostExtraction.id)).where(PostExtraction.status == ExtractionStatus.pending)
@@ -1087,61 +1155,153 @@ async def get_dashboard(
         if item.raw_post is not None
     ]
 
-    top_assets_result = await db.execute(
-        select(
-            Asset.id.label("asset_id"),
-            Asset.symbol.label("symbol"),
-            Asset.market.label("market"),
-            func.count(KolView.id).label("views_count"),
-            func.avg(KolView.confidence).label("avg_confidence"),
+    assets_result = await db.execute(select(Asset).order_by(Asset.id.asc()))
+    assets = list(assets_result.scalars().all())
+    asset_map = {item.id: item for item in assets}
+
+    kols_result = await db.execute(select(Kol).order_by(Kol.id.asc()))
+    kols = list(kols_result.scalars().all())
+    kol_map = {item.id: item for item in kols}
+
+    views_result = await db.execute(select(KolView).order_by(KolView.created_at.desc(), KolView.id.desc()))
+    all_views = list(views_result.scalars().all())
+
+    asset_counts_24h: dict[int, int] = defaultdict(int)
+    asset_counts_7d: dict[int, int] = defaultdict(int)
+    latest_by_asset_horizon: dict[tuple[int, str], KolView] = {}
+    kol_counts_7d: dict[int, int] = defaultdict(int)
+    kol_asset_counts_7d: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+    for view in all_views:
+        view_created = view.created_at
+        if view_created is None:
+            continue
+        horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
+        latest_key = (view.asset_id, horizon_value)
+        current_latest = latest_by_asset_horizon.get(latest_key)
+        if current_latest is None or is_newer_view(view, current_latest):
+            latest_by_asset_horizon[latest_key] = view
+        if view_created >= views_cutoff_24h:
+            asset_counts_24h[view.asset_id] += 1
+        if view_created >= views_cutoff_7d:
+            asset_counts_7d[view.asset_id] += 1
+            kol_counts_7d[view.kol_id] += 1
+            kol_asset_counts_7d[view.kol_id][view.asset_id] += 1
+
+    dashboard_assets: list[DashboardAssetRead] = []
+    order_index = {value: idx for idx, value in enumerate(HORIZON_ORDER)}
+    for asset in assets:
+        latest_views: list[DashboardAssetLatestViewRead] = []
+        for horizon in HORIZON_ORDER:
+            key = (asset.id, horizon)
+            view = latest_by_asset_horizon.get(key)
+            if view is None:
+                continue
+            kol = kol_map.get(view.kol_id)
+            latest_views.append(
+                DashboardAssetLatestViewRead(
+                    kol_view_id=view.id,
+                    horizon=view.horizon,
+                    stance=view.stance,
+                    confidence=view.confidence,
+                    summary=view.summary,
+                    as_of=view.as_of,
+                    created_at=view.created_at,
+                    kol_id=view.kol_id,
+                    kol_display_name=kol.display_name if kol is not None else None,
+                    kol_handle=kol.handle if kol is not None else None,
+                )
+            )
+        latest_views.sort(key=lambda item: order_index.get(item.horizon, 999))
+        dashboard_assets.append(
+            DashboardAssetRead(
+                id=asset.id,
+                symbol=asset.symbol,
+                name=asset.name,
+                market=asset.market,
+                new_views_24h=asset_counts_24h.get(asset.id, 0),
+                new_views_7d=asset_counts_7d.get(asset.id, 0),
+                latest_views_by_horizon=latest_views,
+            )
         )
-        .join(KolView, KolView.asset_id == Asset.id)
-        .join(PostExtraction, PostExtraction.applied_kol_view_id == KolView.id)
-        .where(
-            PostExtraction.status == ExtractionStatus.approved,
-            KolView.created_at >= cutoff,
+
+    active_kols_7d: list[DashboardActiveKolRead] = []
+    for kol_id, count in sorted(kol_counts_7d.items(), key=lambda item: (-item[1], item[0]))[:10]:
+        kol = kol_map.get(kol_id)
+        if kol is None:
+            continue
+        top_assets = sorted(
+            kol_asset_counts_7d[kol_id].items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:5]
+        active_kols_7d.append(
+            DashboardActiveKolRead(
+                kol_id=kol.id,
+                display_name=kol.display_name,
+                handle=kol.handle,
+                platform=kol.platform,
+                views_count_7d=count,
+                top_assets=[
+                    DashboardActiveKolAssetRead(
+                        asset_id=asset_id,
+                        symbol=asset_map[asset_id].symbol if asset_id in asset_map else str(asset_id),
+                        views_count=asset_count,
+                    )
+                    for asset_id, asset_count in top_assets
+                ],
+            )
         )
-        .group_by(Asset.id, Asset.symbol, Asset.market)
-        .order_by(func.count(KolView.id).desc(), func.avg(KolView.confidence).desc(), Asset.id.asc())
-        .limit(20)
+
+    stats_result = await db.execute(
+        select(PostExtraction)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(5000)
     )
-    top_asset_rows = top_assets_result.all()
-    top_assets = [
-        DashboardTopAssetRead(
-            asset_id=row.asset_id,
-            symbol=row.symbol,
-            market=row.market,
-            views_count_7d=int(row.views_count),
-            avg_confidence_7d=float(row.avg_confidence or 0),
-        )
-        for row in top_asset_rows
+    all_recent = list(stats_result.scalars().all())
+    window_items = [item for item in all_recent if item.created_at and item.created_at >= stats_cutoff]
+    dummy_count = sum(1 for item in window_items if item.extractor_name == "dummy")
+    openai_count = sum(1 for item in window_items if item.extractor_name.startswith("openai"))
+    error_count = sum(1 for item in window_items if item.last_error is not None)
+
+    approved_view_ids: set[int] = {
+        item.applied_kol_view_id
+        for item in all_recent
+        if item.status == ExtractionStatus.approved and item.applied_kol_view_id is not None
+    }
+    approved_views_in_window = [
+        view
+        for view in all_views
+        if view.id in approved_view_ids and view.created_at is not None and view.created_at >= cutoff
     ]
 
-    clarity: list[DashboardClarityRead] = []
-    top_asset_ids = [item.asset_id for item in top_assets]
-    if top_asset_ids:
-        stance_counts_result = await db.execute(
-            select(
-                KolView.horizon.label("horizon"),
-                KolView.stance.label("stance"),
-                func.count(KolView.id).label("count"),
-            )
-            .join(PostExtraction, PostExtraction.applied_kol_view_id == KolView.id)
-            .where(
-                PostExtraction.status == ExtractionStatus.approved,
-                KolView.created_at >= cutoff,
-                KolView.asset_id.in_(top_asset_ids),
-            )
-            .group_by(KolView.horizon, KolView.stance)
+    top_asset_stats: dict[int, list[int]] = defaultdict(list)
+    for view in approved_views_in_window:
+        top_asset_stats[view.asset_id].append(view.confidence)
+    top_assets = [
+        DashboardTopAssetRead(
+            asset_id=asset_id,
+            symbol=asset_map[asset_id].symbol if asset_id in asset_map else str(asset_id),
+            market=asset_map[asset_id].market if asset_id in asset_map else None,
+            views_count_7d=len(confidences),
+            avg_confidence_7d=(sum(confidences) / len(confidences)) if confidences else 0,
         )
+        for asset_id, confidences in top_asset_stats.items()
+    ]
+    top_assets.sort(key=lambda item: (-item.views_count_7d, -item.avg_confidence_7d, item.asset_id))
+    top_assets = top_assets[:20]
 
+    clarity: list[DashboardClarityRead] = []
+    top_asset_ids = {item.asset_id for item in top_assets}
+    if top_asset_ids:
         grouped_counts: dict[str, dict[Stance, int]] = defaultdict(
             lambda: {Stance.bull: 0, Stance.bear: 0, Stance.neutral: 0}
         )
-        for row in stance_counts_result.all():
-            grouped_counts[row.horizon.value][row.stance] = int(row.count)
+        for view in approved_views_in_window:
+            if view.asset_id not in top_asset_ids:
+                continue
+            horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
+            grouped_counts[horizon_value][view.stance] += 1
 
-        order_index = {value: idx for idx, value in enumerate(HORIZON_ORDER)}
         for horizon in sorted(grouped_counts.keys(), key=lambda value: order_index.get(value, 999)):
             counts = grouped_counts[horizon]
             bull_count = counts[Stance.bull]
@@ -1157,17 +1317,8 @@ async def get_dashboard(
                 )
             )
 
-    stats_result = await db.execute(
-        select(PostExtraction)
-        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
-        .limit(5000)
-    )
-    all_recent = list(stats_result.scalars().all())
-    window_items = [item for item in all_recent if item.created_at and item.created_at >= stats_cutoff]
-    dummy_count = sum(1 for item in window_items if item.extractor_name == "dummy")
-    openai_count = sum(1 for item in window_items if item.extractor_name.startswith("openai"))
-    error_count = sum(1 for item in window_items if item.last_error is not None)
-
+    new_views_24h = sum(asset_counts_24h.values())
+    new_views_7d = sum(asset_counts_7d.values())
     return DashboardRead(
         pending_extractions_count=int(pending_extractions_count),
         latest_pending_extractions=latest_pending_extractions,
@@ -1180,6 +1331,10 @@ async def get_dashboard(
             openai_count=openai_count,
             error_count=error_count,
         ),
+        new_views_24h=new_views_24h,
+        new_views_7d=new_views_7d,
+        assets=dashboard_assets,
+        active_kols_7d=active_kols_7d,
     )
 
 

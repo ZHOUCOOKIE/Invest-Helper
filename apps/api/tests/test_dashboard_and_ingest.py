@@ -6,13 +6,26 @@ import sys
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db import get_db
 from enums import ExtractionStatus, Horizon, Stance
-from main import app
+from main import app, reset_runtime_counters
 from models import Asset, Kol, KolView, PostExtraction, RawPost
+from settings import get_settings
+
+
+
+
+@pytest.fixture(autouse=True)
+def clear_settings_cache():
+    get_settings.cache_clear()
+    reset_runtime_counters()
+    yield
+    get_settings.cache_clear()
+    reset_runtime_counters()
 
 
 class FakeResult:
@@ -50,6 +63,9 @@ class FakeAsyncSession:
 
     def add(self, obj: object) -> None:
         self._new.append(obj)
+
+    async def get(self, model: type[object], obj_id: int) -> object | None:
+        return self._data.get(model, {}).get(obj_id)
 
     async def flush(self) -> None:
         self._persist_new()
@@ -204,6 +220,7 @@ def test_dashboard_returns_top_assets_and_pending_count() -> None:
     now = datetime.now(UTC)
 
     fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
     fake_db.seed(
         RawPost(
             id=1,
@@ -268,3 +285,62 @@ def test_dashboard_returns_top_assets_and_pending_count() -> None:
     assert body["pending_extractions_count"] == 1
     assert isinstance(body["top_assets"], list)
     assert body["top_assets"][0]["symbol"] == "BTC"
+    assert body["new_views_24h"] == 1
+    assert body["new_views_7d"] == 1
+    assert body["assets"][0]["symbol"] == "BTC"
+    assert body["assets"][0]["new_views_7d"] == 1
+    assert body["assets"][0]["latest_views_by_horizon"][0]["horizon"] == "1w"
+    assert body["active_kols_7d"][0]["handle"] == "alice"
+
+
+def test_asset_views_feed_supports_horizon_and_pagination() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+
+    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        KolView(
+            id=101,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=70,
+            summary="week view",
+            source_url="https://x.com/alice/status/101",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=102,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bear,
+            horizon=Horizon.one_month,
+            confidence=65,
+            summary="month view",
+            source_url="https://x.com/alice/status/102",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/assets/1/views/feed?horizon=1w&limit=1&offset=0")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["asset_id"] == 1
+    assert body["horizon"] == "1w"
+    assert body["total"] == 1
+    assert len(body["items"]) == 1
+    assert body["items"][0]["horizon"] == "1w"
+    assert body["items"][0]["kol_handle"] == "alice"

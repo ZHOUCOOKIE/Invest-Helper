@@ -6,7 +6,7 @@ from datetime import date, datetime
 import json
 from threading import Lock
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -254,6 +254,8 @@ def normalize_extracted_json(
     *,
     posted_at: datetime | date | str | None = None,
     include_meta: bool = False,
+    alias_to_symbol: Mapping[str, str] | None = None,
+    known_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
     normalized = {k: v for k, v in extracted_json.items() if k in _EXTRACTION_TOP_LEVEL_KEYS}
     normalized_meta: dict[str, Any] = {}
@@ -275,8 +277,23 @@ def normalize_extracted_json(
     assets_raw = normalized.get("assets")
     normalized["assets"] = _normalize_assets(assets_raw)
 
+    alias_map = _normalize_alias_symbol_mapping(alias_to_symbol or {})
+    known_symbol_set = _normalize_known_symbols(known_symbols)
+
     asset_views_raw = normalized.get("asset_views")
-    normalized["asset_views"] = _normalize_asset_views(asset_views_raw)
+    normalized["asset_views"] = _normalize_asset_views(
+        asset_views_raw,
+        allow_missing_symbol=bool(alias_map),
+    )
+    if alias_map and normalized["asset_views"]:
+        corrections = _apply_alias_symbol_corrections(
+            normalized["asset_views"],
+            alias_to_symbol=alias_map,
+            known_symbols=known_symbol_set,
+        )
+        if corrections:
+            normalized_meta["alias_corrections"] = corrections
+    normalized["asset_views"] = [item for item in normalized["asset_views"] if item.get("symbol")]
     if not normalized["asset_views"] and normalized["assets"]:
         normalized["asset_views"] = _derive_asset_views_from_global(normalized)
         if normalized["asset_views"]:
@@ -416,7 +433,7 @@ def _normalize_assets(value: Any) -> list[dict[str, Any]]:
     return normalized_assets
 
 
-def _normalize_asset_views(value: Any) -> list[dict[str, Any]]:
+def _normalize_asset_views(value: Any, *, allow_missing_symbol: bool = False) -> list[dict[str, Any]]:
     if value is None:
         return []
     if isinstance(value, dict):
@@ -428,29 +445,108 @@ def _normalize_asset_views(value: Any) -> list[dict[str, Any]]:
 
     normalized_views: list[dict[str, Any]] = []
     for candidate in candidates:
-        normalized_view = _normalize_asset_view_item(candidate)
+        normalized_view = _normalize_asset_view_item(candidate, allow_missing_symbol=allow_missing_symbol)
         if normalized_view is not None:
             normalized_views.append(normalized_view)
     return normalized_views
 
 
-def _normalize_asset_view_item(value: Any) -> dict[str, Any] | None:
+def _normalize_asset_view_item(value: Any, *, allow_missing_symbol: bool = False) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     normalized = {k: v for k, v in value.items() if k in _ASSET_VIEW_KEYS}
     symbol_raw = normalized.get("symbol")
     if not isinstance(symbol_raw, str) or not symbol_raw.strip():
+        if not allow_missing_symbol:
+            return None
+        normalized["symbol"] = ""
+    else:
+        normalized["symbol"] = symbol_raw.strip().upper()
+
+    if not allow_missing_symbol and not normalized["symbol"]:
         return None
 
     drivers_raw = normalized.get("drivers")
     normalized["drivers"] = _normalize_drivers(drivers_raw)
-    normalized["symbol"] = symbol_raw.strip().upper()
     normalized["stance"] = _normalize_stance(normalized.get("stance")) or "neutral"
     normalized["horizon"] = _normalize_horizon(normalized.get("horizon"))
     normalized["confidence"] = _normalize_confidence(normalized.get("confidence"))
     normalized["reasoning"] = _normalize_reasoning(normalized.get("reasoning"))
     normalized["summary"] = _normalize_reasoning(normalized.get("summary"))
     return normalized
+
+
+def _normalize_alias_symbol_mapping(value: Mapping[str, str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for alias, symbol in value.items():
+        normalized_alias = alias.strip().lower()
+        normalized_symbol = symbol.strip().upper()
+        if normalized_alias and normalized_symbol:
+            mapping[normalized_alias] = normalized_symbol
+    return mapping
+
+
+def _normalize_known_symbols(value: set[str] | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip().upper() for item in value if isinstance(item, str) and item.strip()}
+
+
+def _apply_alias_symbol_corrections(
+    asset_views: list[dict[str, Any]],
+    *,
+    alias_to_symbol: dict[str, str],
+    known_symbols: set[str],
+) -> list[dict[str, str]]:
+    corrections: list[dict[str, str]] = []
+    alias_items = sorted(alias_to_symbol.items(), key=lambda item: len(item[0]), reverse=True)
+
+    for view in asset_views:
+        symbol_raw = view.get("symbol")
+        current_symbol = symbol_raw.strip().upper() if isinstance(symbol_raw, str) else ""
+        corrected_symbol: str | None = None
+
+        direct_alias_target = alias_to_symbol.get(current_symbol.lower()) if current_symbol else None
+        if direct_alias_target:
+            corrected_symbol = direct_alias_target
+
+        needs_text_match = not current_symbol or (bool(known_symbols) and current_symbol not in known_symbols)
+        if corrected_symbol is None and needs_text_match:
+            matched = _find_alias_match_for_view(view, alias_items)
+            if matched is not None:
+                _, matched_symbol = matched
+                corrected_symbol = matched_symbol
+
+        if corrected_symbol and corrected_symbol != current_symbol:
+            view["symbol"] = corrected_symbol
+            corrections.append({"from": current_symbol, "to": corrected_symbol, "reason": "alias_match"})
+
+    return corrections
+
+
+def _find_alias_match_for_view(
+    view: dict[str, Any],
+    alias_items: list[tuple[str, str]],
+) -> tuple[str, str] | None:
+    text_fields: list[str] = []
+    summary = view.get("summary")
+    reasoning = view.get("reasoning")
+    drivers = view.get("drivers")
+    if isinstance(summary, str) and summary.strip():
+        text_fields.append(summary.strip())
+    if isinstance(reasoning, str) and reasoning.strip():
+        text_fields.append(reasoning.strip())
+    if isinstance(drivers, list):
+        for item in drivers:
+            if isinstance(item, str) and item.strip():
+                text_fields.append(item.strip())
+
+    for text in text_fields:
+        text_norm = text.lower()
+        for alias, symbol in alias_items:
+            if alias in text_norm:
+                return alias, symbol
+    return None
 
 
 def _derive_asset_views_from_global(normalized: dict[str, Any]) -> list[dict[str, Any]]:

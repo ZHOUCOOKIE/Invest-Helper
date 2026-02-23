@@ -34,6 +34,11 @@ class AssetAliasRead(BaseModel):
     created_at: datetime
 
 
+class AssetAliasMapRead(BaseModel):
+    alias: str
+    symbol: str
+
+
 class KolCreate(BaseModel):
     platform: str = Field(min_length=1, max_length=32)
     handle: str = Field(min_length=1, max_length=64)
@@ -251,6 +256,46 @@ class DashboardExtractionStatsRead(BaseModel):
     error_count: int
 
 
+class DashboardAssetLatestViewRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    kol_view_id: int
+    horizon: Horizon
+    stance: Stance
+    confidence: int
+    summary: str
+    as_of: date
+    created_at: datetime
+    kol_id: int
+    kol_display_name: str | None
+    kol_handle: str | None
+
+
+class DashboardAssetRead(BaseModel):
+    id: int
+    symbol: str
+    name: str | None
+    market: str | None
+    new_views_24h: int
+    new_views_7d: int
+    latest_views_by_horizon: list[DashboardAssetLatestViewRead]
+
+
+class DashboardActiveKolAssetRead(BaseModel):
+    asset_id: int
+    symbol: str
+    views_count: int
+
+
+class DashboardActiveKolRead(BaseModel):
+    kol_id: int
+    display_name: str | None
+    handle: str
+    platform: str
+    views_count_7d: int
+    top_assets: list[DashboardActiveKolAssetRead]
+
+
 class DashboardRead(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
@@ -259,6 +304,38 @@ class DashboardRead(BaseModel):
     top_assets: list[DashboardTopAssetRead]
     clarity: list[DashboardClarityRead]
     extraction_stats: DashboardExtractionStatsRead
+    new_views_24h: int
+    new_views_7d: int
+    assets: list[DashboardAssetRead]
+    active_kols_7d: list[DashboardActiveKolRead]
+
+
+class AssetViewFeedItemRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id: int
+    kol_id: int
+    kol_display_name: str | None
+    kol_handle: str | None
+    stance: Stance
+    horizon: Horizon
+    confidence: int
+    summary: str
+    source_url: str
+    as_of: date
+    created_at: datetime
+
+
+class AssetViewsFeedRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    asset_id: int
+    horizon: Horizon | None
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+    items: list[AssetViewFeedItemRead]
 
 
 class ExtractorStatusRead(BaseModel):

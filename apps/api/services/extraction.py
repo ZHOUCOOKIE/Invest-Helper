@@ -924,8 +924,8 @@ def reset_openai_call_budget_counter() -> None:
         _OPENAI_CALLS_MADE = 0
 
 
-def try_consume_openai_call_budget(settings: Settings) -> bool:
-    budget = max(0, settings.openai_call_budget)
+def try_consume_openai_call_budget(settings: Settings, *, budget_total: int | None = None) -> bool:
+    budget = max(0, settings.openai_call_budget if budget_total is None else budget_total)
     if budget == 0:
         return True
 
@@ -937,8 +937,8 @@ def try_consume_openai_call_budget(settings: Settings) -> bool:
         return True
 
 
-def get_openai_call_budget_remaining(settings: Settings) -> int | None:
-    budget = max(0, settings.openai_call_budget)
+def get_openai_call_budget_remaining(settings: Settings, *, budget_total: int | None = None) -> int | None:
+    budget = max(0, settings.openai_call_budget if budget_total is None else budget_total)
     if budget == 0:
         return None
 

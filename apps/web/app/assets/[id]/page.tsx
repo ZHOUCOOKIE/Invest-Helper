@@ -342,7 +342,7 @@ export default function AssetDetailPage() {
                 {submitting ? "Submitting..." : "提交观点"}
               </button>
             </form>
-            {kols.length === 0 && <p style={{ color: "#666" }}>暂无可用 KOL，请先在 KOL 页面创建并启用。</p>}
+            {kols.length === 0 && <p style={{ color: "#666" }}>暂无可用KOL，请先在KOL页面创建并启用。</p>}
             {submitMessage && <p style={{ color: "green" }}>{submitMessage}</p>}
             {submitError && <p style={{ color: "crimson" }}>{submitError}</p>}
           </section>

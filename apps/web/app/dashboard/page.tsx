@@ -64,6 +64,7 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [windowKey, setWindowKey] = useState<WindowKey>("24h");
+  const todayDigestDate = new Date().toISOString().slice(0, 10);
 
   const load = async () => {
     setLoading(true);
@@ -123,7 +124,10 @@ export default function DashboardPage() {
             {loading ? "Loading..." : "Refresh"}
           </button>
           <Link href="/ingest">手动导入</Link>
+          <Link href="/kols">KOL管理</Link>
           <Link href="/extractions">审核队列</Link>
+          <Link href="/profile">Profile 设置</Link>
+          <Link href={`/digests/${todayDigestDate}`}>今日日报</Link>
         </div>
       </section>
 

@@ -1,22 +1,26 @@
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
+import random
+import time
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from db import get_db
-from enums import HORIZON_ORDER, Horizon, Stance
+from db import AsyncSessionLocal, get_db
+from enums import HORIZON_ORDER, Horizon, ReviewStatus, Stance
 from enums import ExtractionStatus
-from models import Asset, AssetAlias, Kol, KolView, PostExtraction, RawPost
+from models import Asset, AssetAlias, DailyDigest, Kol, KolView, PostExtraction, ProfileKolWeight, RawPost
 from schemas import (
     AssetCreate,
     AssetAliasCreate,
@@ -27,6 +31,8 @@ from schemas import (
     AssetViewsFeedRead,
     AssetViewsMetaRead,
     AssetRead,
+    AdminDeletePendingExtractionsRead,
+    AdminHardDeleteRead,
     AssetViewsRead,
     AutoAppliedViewRead,
     DashboardActiveKolAssetRead,
@@ -38,6 +44,7 @@ from schemas import (
     DashboardPendingExtractionRead,
     DashboardRead,
     DashboardTopAssetRead,
+    DailyDigestRead,
     ExtractorStatusRead,
     ExtractionApproveRequest,
     ExtractionApproveBatchRequest,
@@ -50,8 +57,32 @@ from schemas import (
     ManualIngestRead,
     PostExtractionRead,
     PostExtractionWithRawPostRead,
+    ProfileKolsUpdateRequest,
+    ProfileMarketsUpdateRequest,
+    ProfileRead,
+    ProfileSummaryRead,
+    RawPostsExtractBatchRead,
+    RawPostsExtractBatchRequest,
     RawPostCreate,
     RawPostRead,
+    RuntimeCallBudgetUpdateRequest,
+    RuntimeBurstUpdateRequest,
+    RuntimeThrottleUpdateRequest,
+    RuntimeSettingsRead,
+    XImportItemCreate,
+    XConvertResponseRead,
+    XConvertErrorRead,
+    XIngestProgressRead,
+    XRetryFailedRead,
+    XImportStatsRead,
+    XImportedByHandleRead,
+    XCreatedKolRead,
+    XHandleSummaryRead,
+    XSkippedNotFollowedRead,
+    XImportTemplateRead,
+    XFollowingImportErrorRead,
+    XFollowingImportKolRead,
+    XFollowingImportStatsRead,
 )
 from services.extraction import (
     DummyExtractor,
@@ -64,13 +95,37 @@ from services.extraction import (
     select_extractor,
     try_consume_openai_call_budget,
 )
+from services.digests import (
+    generate_daily_digest as generate_daily_digest_service,
+    get_daily_digest_by_date as get_daily_digest_by_date_service,
+    get_daily_digest_by_id as get_daily_digest_by_id_service,
+    list_daily_digest_dates as list_daily_digest_dates_service,
+)
+from services.profiles import (
+    get_profile as get_profile_service,
+    list_profiles as list_profiles_service,
+    update_profile_kols as update_profile_kols_service,
+    update_profile_markets as update_profile_markets_service,
+)
 from services.prompts import build_extract_prompt
+from scripts.x_import_converter import convert_records, load_records_from_bytes
 from settings import get_settings
 
 app = FastAPI(title="InvestPulse API")
 EXTRACTION_REVIEWER = "human-review"
 AUTO_EXTRACTION_REVIEWER = "auto"
 REEXTRACT_ATTEMPTS: dict[int, deque[datetime]] = defaultdict(deque)
+RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE: int | None = None
+UNLIMITED_SAFE_BURST_BUDGET = 100000
+RUNTIME_BURST_STATE: dict[str, Any] = {
+    "enabled": False,
+    "mode": None,
+    "call_budget": None,
+    "expires_at": None,
+}
+RUNTIME_THROTTLE_OVERRIDE: dict[str, int] = {}
+RUNTIME_BUDGET_WINDOW_START: datetime | None = None
+RUNTIME_BUDGET_WINDOW_END: datetime | None = None
 
 # 先放开本地前端跨域，后面再收紧
 app.add_middleware(
@@ -160,13 +215,393 @@ def _build_last_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _is_failed_extraction(extraction: PostExtraction | None) -> bool:
+    if extraction is None:
+        return False
+    return bool((extraction.last_error or "").strip())
+
+
+def _is_active_extraction(extraction: PostExtraction | None) -> bool:
+    if extraction is None:
+        return False
+    return extraction.status == ExtractionStatus.pending and not _is_failed_extraction(extraction)
+
+
+def _is_successful_extraction(extraction: PostExtraction | None) -> bool:
+    if extraction is None:
+        return False
+    if _is_failed_extraction(extraction):
+        return False
+    return extraction.status in {ExtractionStatus.pending, ExtractionStatus.approved}
+
+
+def _extraction_status_key(extraction: PostExtraction) -> str:
+    status_value = extraction.status.value if hasattr(extraction.status, "value") else str(extraction.status)
+    return status_value.strip().lower()
+
+
+def _review_status_key(raw_post: RawPost) -> str:
+    value = getattr(raw_post, "review_status", None)
+    if hasattr(value, "value"):
+        value = value.value
+    status_key = str(value or "").strip().lower()
+    return status_key or ReviewStatus.unreviewed.value
+
+
+def _terminal_review_skip_kind(
+    *,
+    raw_post: RawPost,
+    latest_extraction: PostExtraction | None,
+) -> str | None:
+    review_status = _review_status_key(raw_post)
+    if review_status == ReviewStatus.rejected.value:
+        return "skipped_already_rejected"
+    if review_status == ReviewStatus.approved.value:
+        return "skipped_already_approved"
+
+    latest_status = _extraction_status_key(latest_extraction) if latest_extraction is not None else None
+    if latest_status == ExtractionStatus.rejected.value:
+        return "skipped_already_rejected"
+    if latest_status == ExtractionStatus.approved.value:
+        return "skipped_already_approved"
+    return None
+
+
+def _classify_last_error(last_error: str | None) -> str:
+    message = (last_error or "").lower()
+    if "status=429" in message or " 429" in message or "rate_limit" in message:
+        return "rate_limited"
+    if "timeout" in message:
+        return "timeout"
+    if "status=503" in message or " 503" in message:
+        return "service_unavailable"
+    return "other"
+
+
+def _normalize_handle(value: str) -> str:
+    return value.strip().lower()
+
+
+def _normalize_author_handle(value: str) -> str:
+    return value.strip().lstrip("@").lower()
+
+
+def _coerce_row_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _raw_snippet(value: Any, *, max_chars: int = 240) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:  # noqa: BLE001
+        text = repr(value)
+    return text[:max_chars]
+
+
+def _detect_x_export_kind(rows: list[Any]) -> str:
+    if not rows:
+        return "unknown"
+    sampled = 0
+    following_hits = 0
+    timeline_hits = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sampled += 1
+        has_following = "following" in row
+        has_screen_name = isinstance(row.get("screen_name"), str) and bool(row.get("screen_name").strip())
+        has_name = isinstance(row.get("name"), str)
+        has_timeline_id = row.get("id") is not None
+        has_created = row.get("created_at") is not None
+        has_text = row.get("full_text") is not None or row.get("text") is not None
+        if has_following and has_screen_name and has_name:
+            following_hits += 1
+        if has_timeline_id and has_screen_name and has_created and has_text:
+            timeline_hits += 1
+        if sampled >= 25:
+            break
+    if following_hits > 0 and following_hits >= timeline_hits:
+        return "following"
+    if timeline_hits > 0:
+        return "timeline"
+    return "generic"
+
+
+async def _enabled_x_kol_maps(db: AsyncSession) -> tuple[dict[int, Kol], dict[str, Kol]]:
+    result = await db.execute(select(Kol).where(Kol.platform == "x"))
+    enabled = [item for item in result.scalars().all() if bool(item.enabled)]
+    return (
+        {item.id: item for item in enabled},
+        {_normalize_author_handle(item.handle): item for item in enabled},
+    )
+
+
+async def _raw_post_matches_enabled_x_kol(db: AsyncSession, raw_post: RawPost) -> bool:
+    if raw_post.platform.strip().lower() != "x":
+        return True
+    enabled_by_id, enabled_by_handle = await _enabled_x_kol_maps(db)
+    if raw_post.kol_id is not None and raw_post.kol_id in enabled_by_id:
+        return True
+    handle_key = _normalize_author_handle(raw_post.author_handle or "")
+    if not handle_key:
+        return False
+    return handle_key in enabled_by_handle
+
+
+def _is_destructive_admin_enabled() -> bool:
+    settings = get_settings()
+    env_key = (settings.env or "").strip().lower()
+    return env_key in {"local", "dev", "development"} or bool(settings.debug)
+
+
+def _require_destructive_admin_guard(*, confirm: str) -> None:
+    if not _is_destructive_admin_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="forbidden: destructive endpoint enabled only when ENV in {local,dev} or DEBUG=true",
+        )
+    if confirm != "YES":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="destructive operation: set query confirm=YES to continue",
+        )
+
+
+def _require_raw_delete_cascade_guard(*, also_delete_raw_posts: bool, enable_cascade: bool) -> None:
+    if also_delete_raw_posts and not enable_cascade:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="raw_posts deletion requires enable_cascade=true and confirm=YES",
+        )
+
+
+def _admin_delete_counts_template() -> dict[str, int]:
+    return {
+        "kols": 0,
+        "assets": 0,
+        "asset_aliases": 0,
+        "raw_posts": 0,
+        "post_extractions": 0,
+        "kol_views": 0,
+        "daily_digests": 0,
+        "profile_kol_weights": 0,
+    }
+
+
+def _digest_mentions_kol(content: dict | None, *, kol_id: int) -> bool:
+    if not isinstance(content, dict):
+        return False
+    per_asset_summary = content.get("per_asset_summary")
+    if not isinstance(per_asset_summary, list):
+        return False
+    for item in per_asset_summary:
+        if not isinstance(item, dict):
+            continue
+        for stance_key in ("top_views_bull", "top_views_bear", "top_views_neutral"):
+            top_views = item.get(stance_key)
+            if not isinstance(top_views, list):
+                continue
+            for view in top_views:
+                if isinstance(view, dict) and view.get("kol_id") == kol_id:
+                    return True
+    return False
+
+
+def _digest_mentions_asset(content: dict | None, *, asset_id: int) -> bool:
+    if not isinstance(content, dict):
+        return False
+    top_assets = content.get("top_assets")
+    if isinstance(top_assets, list):
+        for item in top_assets:
+            if isinstance(item, dict) and item.get("asset_id") == asset_id:
+                return True
+    per_asset_summary = content.get("per_asset_summary")
+    if isinstance(per_asset_summary, list):
+        for item in per_asset_summary:
+            if isinstance(item, dict) and item.get("asset_id") == asset_id:
+                return True
+    return False
+
+
+def _build_fk_conflict_detail(*, action: str, hint: str) -> str:
+    return f"delete conflict during {action}: {hint}. Please delete dependent records first and retry."
+
+
+def _format_retry_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return f"http_{exc.status_code}:{detail}"
+    return type(exc).__name__
+
+
 def reset_reextract_rate_limiter() -> None:
     REEXTRACT_ATTEMPTS.clear()
 
 
 def reset_runtime_counters() -> None:
+    global RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE, RUNTIME_BUDGET_WINDOW_START, RUNTIME_BUDGET_WINDOW_END
+    RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE = None
+    RUNTIME_BURST_STATE["enabled"] = False
+    RUNTIME_BURST_STATE["mode"] = None
+    RUNTIME_BURST_STATE["call_budget"] = None
+    RUNTIME_BURST_STATE["expires_at"] = None
+    RUNTIME_THROTTLE_OVERRIDE.clear()
+    RUNTIME_BUDGET_WINDOW_START = None
+    RUNTIME_BUDGET_WINDOW_END = None
     reset_reextract_rate_limiter()
     reset_openai_call_budget_counter()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _get_default_call_budget_total(settings) -> int:
+    fields_set = getattr(settings, "model_fields_set", set())
+    if "call_budget_per_hour" in fields_set:
+        return max(0, settings.call_budget_per_hour)
+    if settings.openai_call_budget is not None:
+        return max(0, settings.openai_call_budget)
+    return max(0, settings.call_budget_per_hour)
+
+
+def _window_for(now: datetime, minutes: int) -> tuple[datetime, datetime]:
+    safe_minutes = max(1, minutes)
+    window_seconds = safe_minutes * 60
+    timestamp = int(now.timestamp())
+    start_epoch = (timestamp // window_seconds) * window_seconds
+    start = datetime.fromtimestamp(start_epoch, tz=UTC)
+    end = start + timedelta(seconds=window_seconds)
+    return start, end
+
+
+def _refresh_runtime_budget_state(settings) -> None:
+    global RUNTIME_BUDGET_WINDOW_START, RUNTIME_BUDGET_WINDOW_END
+    now = _utc_now()
+    burst_enabled = bool(RUNTIME_BURST_STATE.get("enabled"))
+    expires_at = RUNTIME_BURST_STATE.get("expires_at")
+    if burst_enabled and isinstance(expires_at, datetime) and now >= expires_at:
+        RUNTIME_BURST_STATE["enabled"] = False
+        RUNTIME_BURST_STATE["mode"] = None
+        RUNTIME_BURST_STATE["call_budget"] = None
+        RUNTIME_BURST_STATE["expires_at"] = None
+        RUNTIME_BUDGET_WINDOW_START = None
+        RUNTIME_BUDGET_WINDOW_END = None
+        reset_openai_call_budget_counter()
+
+    if RUNTIME_BUDGET_WINDOW_START is None or RUNTIME_BUDGET_WINDOW_END is None:
+        start, end = _window_for(now, settings.call_budget_window_minutes)
+        RUNTIME_BUDGET_WINDOW_START = start
+        RUNTIME_BUDGET_WINDOW_END = end
+        reset_openai_call_budget_counter()
+        return
+
+    if now >= RUNTIME_BUDGET_WINDOW_END:
+        start, end = _window_for(now, settings.call_budget_window_minutes)
+        RUNTIME_BUDGET_WINDOW_START = start
+        RUNTIME_BUDGET_WINDOW_END = end
+        reset_openai_call_budget_counter()
+
+
+def _get_runtime_openai_call_budget_total(settings) -> int:
+    _refresh_runtime_budget_state(settings)
+    if RUNTIME_BURST_STATE["enabled"] and isinstance(RUNTIME_BURST_STATE["call_budget"], int):
+        return max(0, RUNTIME_BURST_STATE["call_budget"])
+    if RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE is not None:
+        return max(0, RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE)
+    return _get_default_call_budget_total(settings)
+
+
+def _set_runtime_openai_call_budget_total(call_budget: int) -> None:
+    global RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE
+    normalized = max(0, call_budget)
+    RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE = normalized
+    _refresh_runtime_budget_state(get_settings())
+    reset_openai_call_budget_counter()
+
+
+def _clear_runtime_openai_call_budget_override() -> None:
+    global RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE
+    RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE = None
+    _refresh_runtime_budget_state(get_settings())
+    reset_openai_call_budget_counter()
+
+
+def _set_runtime_burst(*, enabled: bool, mode: str, call_budget: int, duration_minutes: int) -> None:
+    settings = get_settings()
+    _refresh_runtime_budget_state(settings)
+    if not enabled:
+        RUNTIME_BURST_STATE["enabled"] = False
+        RUNTIME_BURST_STATE["mode"] = None
+        RUNTIME_BURST_STATE["call_budget"] = None
+        RUNTIME_BURST_STATE["expires_at"] = None
+        reset_openai_call_budget_counter()
+        return
+    now = _utc_now()
+    resolved_mode = "unlimited_safe" if mode == "unlimited_safe" else "normal"
+    resolved_budget = UNLIMITED_SAFE_BURST_BUDGET if resolved_mode == "unlimited_safe" else max(0, int(call_budget))
+    RUNTIME_BURST_STATE["enabled"] = True
+    RUNTIME_BURST_STATE["mode"] = resolved_mode
+    RUNTIME_BURST_STATE["call_budget"] = resolved_budget
+    RUNTIME_BURST_STATE["expires_at"] = now + timedelta(minutes=max(1, int(duration_minutes)))
+    reset_openai_call_budget_counter()
+
+
+def _runtime_throttle_limits(settings) -> tuple[int, int, int, int]:
+    return (
+        max(1, settings.extract_max_concurrency_max),
+        max(1, settings.extract_max_rpm_max),
+        max(1, settings.extract_batch_size_max),
+        max(1, settings.extract_batch_sleep_ms_min),
+    )
+
+
+def _clamp_runtime_throttle(settings, *, max_concurrency: int, max_rpm: int, batch_size: int, batch_sleep_ms: int) -> dict[str, int]:
+    c_max, rpm_max, batch_max, sleep_min = _runtime_throttle_limits(settings)
+    return {
+        "max_concurrency": max(1, min(int(max_concurrency), c_max)),
+        "max_rpm": max(1, min(int(max_rpm), rpm_max)),
+        "batch_size": max(1, min(int(batch_size), batch_max)),
+        "batch_sleep_ms": max(sleep_min, int(batch_sleep_ms)),
+    }
+
+
+def _get_runtime_throttle(settings) -> dict[str, int]:
+    defaults = _clamp_runtime_throttle(
+        settings,
+        max_concurrency=settings.extract_max_concurrency_default,
+        max_rpm=settings.extract_max_rpm_default,
+        batch_size=settings.extract_batch_size_default,
+        batch_sleep_ms=settings.extract_batch_sleep_ms_default,
+    )
+    if not RUNTIME_THROTTLE_OVERRIDE:
+        return defaults
+    return _clamp_runtime_throttle(
+        settings,
+        max_concurrency=RUNTIME_THROTTLE_OVERRIDE.get("max_concurrency", defaults["max_concurrency"]),
+        max_rpm=RUNTIME_THROTTLE_OVERRIDE.get("max_rpm", defaults["max_rpm"]),
+        batch_size=RUNTIME_THROTTLE_OVERRIDE.get("batch_size", defaults["batch_size"]),
+        batch_sleep_ms=RUNTIME_THROTTLE_OVERRIDE.get("batch_sleep_ms", defaults["batch_sleep_ms"]),
+    )
+
+
+def _set_runtime_throttle(settings, *, max_concurrency: int, max_rpm: int, batch_size: int, batch_sleep_ms: int) -> dict[str, int]:
+    clamped = _clamp_runtime_throttle(
+        settings,
+        max_concurrency=max_concurrency,
+        max_rpm=max_rpm,
+        batch_size=batch_size,
+        batch_sleep_ms=batch_sleep_ms,
+    )
+    RUNTIME_THROTTLE_OVERRIDE.clear()
+    RUNTIME_THROTTLE_OVERRIDE.update(clamped)
+    return clamped
 
 
 def _check_reextract_rate_limit(raw_post_id: int) -> None:
@@ -186,6 +621,42 @@ def _check_reextract_rate_limit(raw_post_id: int) -> None:
         )
 
     attempts.append(now)
+
+
+class _RpmLimiter:
+    def __init__(self, max_rpm: int) -> None:
+        self.interval_seconds = 60.0 / max(1, max_rpm)
+        self._next_allowed = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self.interval_seconds
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+
+
+def _is_retryable_extraction_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPException):
+        return exc.status_code in {429, 503}
+    if isinstance(exc, OpenAIFallbackError):
+        return False
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code in {429, 503}:
+        return True
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    message = str(exc).lower()
+    return "timeout" in message and "http_" not in message
+
+
+def _build_retry_backoff_seconds(*, attempt: int, base_ms: int, cap_ms: int) -> float:
+    exp = max(0, attempt - 1)
+    raw_ms = min(cap_ms, base_ms * (2**exp))
+    jitter_multiplier = random.uniform(0.8, 1.2)
+    return max(0.0, (raw_ms * jitter_multiplier) / 1000.0)
 
 
 def _build_extraction_input(raw_post: RawPost) -> tuple[RawPost | SimpleNamespace, dict | None]:
@@ -633,6 +1104,9 @@ async def _auto_apply_extraction_views(
         extraction.reviewed_at = datetime.now(UTC)
         if not extraction.review_note:
             extraction.review_note = "auto-approved"
+        raw_post.review_status = ReviewStatus.approved
+        raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
+        raw_post.reviewed_at = extraction.reviewed_at
         await db.flush()
     setattr(extraction, "auto_applied_asset_view_keys", applied_keys)
     setattr(extraction, "auto_applied_views", applied_views)
@@ -699,8 +1173,48 @@ def _attach_extraction_auto_approve_settings(extraction: PostExtraction) -> None
     setattr(extraction, "auto_approve_min_display_confidence", settings.auto_approve_min_display_confidence)
 
 
-async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> PostExtraction:
+async def create_pending_extraction(
+    db: AsyncSession,
+    raw_post: RawPost,
+    *,
+    allow_budget_fallback: bool = True,
+    raise_retryable_errors: bool = False,
+    force_reextract: bool = False,
+    force_reextract_triggered_by: str | None = None,
+    source_extraction_id: int | None = None,
+) -> PostExtraction:
+    if not force_reextract:
+        if isinstance(db, AsyncSession):
+            await db.execute(select(RawPost.id).where(RawPost.id == raw_post.id).with_for_update())
+        result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post.id))
+        existing_rows = list(result.scalars().all())
+        existing_rows.sort(
+            key=lambda item: (
+                item.created_at or datetime.min.replace(tzinfo=UTC),
+                item.id or 0,
+            ),
+            reverse=True,
+        )
+        active = next((item for item in existing_rows if _is_active_extraction(item)), None)
+        if active is not None:
+            _attach_extraction_auto_approve_settings(active)
+            return active
+        latest = existing_rows[0] if existing_rows else None
+        terminal_skip_kind = _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=latest)
+        if terminal_skip_kind is not None:
+            if latest is not None:
+                _attach_extraction_auto_approve_settings(latest)
+                return latest
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"raw post already {terminal_skip_kind.replace('skipped_already_', '')}",
+            )
+        if latest is not None and _is_successful_extraction(latest):
+            _attach_extraction_auto_approve_settings(latest)
+            return latest
+
     settings = get_settings()
+    _refresh_runtime_budget_state(settings)
     extraction_input, truncation_meta = _build_extraction_input(raw_post)
     extractor = select_extractor(settings)
     assets_for_prompt = await _load_assets_for_prompt(db, settings.max_assets_in_prompt)
@@ -727,7 +1241,16 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
     budget_exhausted = False
     fallback_reason: str | None = None
 
-    if isinstance(extractor, OpenAIExtractor) and not try_consume_openai_call_budget(settings):
+    runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
+    if isinstance(extractor, OpenAIExtractor) and not try_consume_openai_call_budget(
+        settings,
+        budget_total=runtime_budget_total,
+    ):
+        if not allow_budget_fallback:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="openai call budget exhausted for current process; increase runtime call budget and retry",
+            )
         budget_exhausted = True
         extractor = DummyExtractor()
         extractor.set_prompt_bundle(prompt_bundle)
@@ -736,6 +1259,8 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
     try:
         extracted_json = extractor.extract(extraction_input)
     except Exception as exc:  # noqa: BLE001
+        if raise_retryable_errors and isinstance(extractor, OpenAIExtractor) and _is_retryable_extraction_error(exc):
+            raise
         last_error = _build_last_error(exc)
         if isinstance(exc, OpenAIFallbackError):
             fallback_reason = exc.fallback_reason
@@ -775,6 +1300,13 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         extracted_json["meta"] = {
             **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
             "fallback_reason": "budget_exhausted",
+        }
+    if force_reextract:
+        extracted_json["meta"] = {
+            **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
+            "force_reextract": True,
+            "force_reextract_triggered_by": (force_reextract_triggered_by or EXTRACTION_REVIEWER),
+            "source_extraction_id": source_extraction_id,
         }
 
     audit = extractor.get_audit()
@@ -819,6 +1351,173 @@ async def create_pending_extraction(db: AsyncSession, raw_post: RawPost) -> Post
         extraction.last_error = auto_error if not extraction.last_error else f"{extraction.last_error}; auto_apply={auto_error}"
     _attach_extraction_auto_approve_settings(extraction)
     return extraction
+
+
+async def _list_x_raw_posts(
+    db: AsyncSession,
+    *,
+    author_handle: str | None = None,
+) -> list[RawPost]:
+    result = await db.execute(select(RawPost).where(RawPost.platform == "x"))
+    posts = list(result.scalars().all())
+    if author_handle is None:
+        return posts
+    handle_key = _normalize_handle(author_handle)
+    return [item for item in posts if _normalize_handle(item.author_handle) == handle_key]
+
+
+async def _latest_extractions_by_raw_post_id(
+    db: AsyncSession,
+    *,
+    raw_post_ids: set[int],
+) -> dict[int, PostExtraction]:
+    if not raw_post_ids:
+        return {}
+    result = await db.execute(select(PostExtraction))
+    rows = [item for item in result.scalars().all() if item.raw_post_id in raw_post_ids]
+    rows.sort(
+        key=lambda item: (
+            item.created_at or datetime.min.replace(tzinfo=UTC),
+            item.id or 0,
+        ),
+        reverse=True,
+    )
+    latest: dict[int, PostExtraction] = {}
+    for row in rows:
+        if row.raw_post_id in latest:
+            continue
+        latest[row.raw_post_id] = row
+    return latest
+
+
+async def _raw_post_ids_with_successful_extractions(
+    db: AsyncSession,
+    *,
+    raw_post_ids: set[int],
+) -> set[int]:
+    if not raw_post_ids:
+        return set()
+    result = await db.execute(select(PostExtraction))
+    successful_ids: set[int] = set()
+    for extraction in result.scalars().all():
+        if extraction.raw_post_id not in raw_post_ids:
+            continue
+        if _is_successful_extraction(extraction):
+            successful_ids.add(extraction.raw_post_id)
+    return successful_ids
+
+
+async def _has_successful_extraction(
+    db: AsyncSession,
+    *,
+    raw_post_id: int,
+) -> bool:
+    result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
+    for extraction in result.scalars().all():
+        if _is_successful_extraction(extraction):
+            return True
+    return False
+
+
+async def _latest_extraction_for_raw_post(
+    db: AsyncSession,
+    *,
+    raw_post_id: int,
+) -> PostExtraction | None:
+    result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
+    rows = list(result.scalars().all())
+    if not rows:
+        return None
+    rows.sort(
+        key=lambda item: (
+            item.created_at or datetime.min.replace(tzinfo=UTC),
+            item.id or 0,
+        ),
+        reverse=True,
+    )
+    return rows[0]
+
+
+async def _failed_batch_retry_count(
+    db: AsyncSession,
+    *,
+    raw_post_id: int,
+) -> int:
+    result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
+    total = 0
+    for extraction in result.scalars().all():
+        if not (extraction.last_error or "").strip():
+            continue
+        meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json, dict) else None
+        if isinstance(meta, dict) and meta.get("retry_source") == "extract_batch":
+            total += 1
+    return total
+
+
+async def _resolve_import_author_handle(
+    *,
+    item: XImportItemCreate,
+    db: AsyncSession,
+    x_kols_by_id: dict[int, Kol],
+    x_kols_by_handle_key: dict[str, Kol],
+    enabled_x_kols_by_handle_key: dict[str, Kol],
+    only_followed: bool,
+    allow_unknown_handles: bool,
+) -> tuple[str | None, int | None, str | None, Kol | None]:
+    if item.kol_id is not None:
+        kol = x_kols_by_id.get(item.kol_id)
+        if kol is None:
+            return (
+                None,
+                None,
+                f"kol_id={item.kol_id} not found on platform=x, external_id={item.external_id}",
+                None,
+            )
+        if only_followed and not kol.enabled:
+            return (
+                None,
+                None,
+                f"kol_id={item.kol_id} is disabled; skipped by only_followed=true, external_id={item.external_id}",
+                None,
+            )
+        return kol.handle, kol.id, None, None
+
+    handle_key = _normalize_author_handle(item.resolved_author_handle or item.author_handle)
+    if not handle_key:
+        return None, None, f"missing author_handle, external_id={item.external_id}", None
+    kol = enabled_x_kols_by_handle_key.get(handle_key) if only_followed else x_kols_by_handle_key.get(handle_key)
+    if kol is not None:
+        return kol.handle, kol.id, None, None
+
+    if only_followed or not allow_unknown_handles:
+        return (
+            None,
+            None,
+            f"not_followed handle={handle_key}, external_id={item.external_id}",
+            None,
+        )
+
+    created = await _upsert_kol_by_author(db, platform="x", handle=handle_key)
+    x_kols_by_id[created.id] = created
+    x_kols_by_handle_key[_normalize_author_handle(created.handle)] = created
+    if created.enabled:
+        enabled_x_kols_by_handle_key[_normalize_author_handle(created.handle)] = created
+    return created.handle, created.id, None, created
+
+
+def _detect_single_handle_from_items(items: list[XImportItemCreate]) -> tuple[str | None, list[str]]:
+    handles = sorted(
+        {
+            _normalize_author_handle(item.author_handle)
+            for item in items
+            if isinstance(item.author_handle, str) and _normalize_author_handle(item.author_handle)
+        }
+    )
+    if not handles:
+        return None, []
+    if len(handles) > 1:
+        return None, handles
+    return handles[0], handles
 
 
 @app.get("/assets", response_model=list[AssetRead])
@@ -940,6 +1639,34 @@ async def create_kol(payload: KolCreate, db: AsyncSession = Depends(get_db)):
 
     await db.refresh(kol)
     return kol
+
+
+@app.get("/profiles", response_model=list[ProfileSummaryRead])
+async def list_profiles(db: AsyncSession = Depends(get_db)):
+    return await list_profiles_service(db)
+
+
+@app.get("/profiles/{profile_id}", response_model=ProfileRead)
+async def get_profile(profile_id: int = Path(ge=1), db: AsyncSession = Depends(get_db)):
+    return await get_profile_service(db, profile_id=profile_id)
+
+
+@app.put("/profiles/{profile_id}/kols", response_model=ProfileRead)
+async def update_profile_kols(
+    payload: ProfileKolsUpdateRequest,
+    profile_id: int = Path(ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    return await update_profile_kols_service(db, profile_id=profile_id, payload=payload)
+
+
+@app.put("/profiles/{profile_id}/markets", response_model=ProfileRead)
+async def update_profile_markets(
+    payload: ProfileMarketsUpdateRequest,
+    profile_id: int = Path(ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    return await update_profile_markets_service(db, profile_id=profile_id, payload=payload)
 
 
 @app.post("/kol-views", response_model=KolViewRead, status_code=status.HTTP_201_CREATED)
@@ -1092,14 +1819,1321 @@ async def ingest_manual(payload: ManualIngestCreate, db: AsyncSession = Depends(
     return ManualIngestRead(raw_post=raw_post, extraction=extraction, extraction_id=extraction.id)
 
 
+@app.get("/ingest/x/import/template", response_model=XImportTemplateRead)
+def get_x_import_template():
+    return XImportTemplateRead(
+        required_fields=[
+            "external_id",
+            "author_handle",
+            "url",
+            "posted_at",
+            "content_text",
+        ],
+        optional_fields=["kol_id", "raw_json"],
+        notes=[
+            "posted_at must be ISO-8601 datetime, for example: 2026-02-23T12:30:00Z",
+            "external_id should be a stable tweet id or any stable unique id per post",
+            "The endpoint always stores platform as 'x'",
+            "When kol_id is provided, raw_post.author_handle is normalized to the matched kol.handle",
+        ],
+        example=[
+            XImportItemCreate(
+                kol_id=1,
+                external_id="1893772190012345678",
+                author_handle="some_kol",
+                url="https://x.com/some_kol/status/1893772190012345678",
+                posted_at=datetime(2026, 2, 20, 12, 30, tzinfo=UTC),
+                content_text="BTC structure still constructive above 60k.",
+                raw_json={"lang": "en"},
+            ),
+            XImportItemCreate(
+                external_id="1893772190012345679",
+                author_handle="some_kol",
+                url="https://x.com/some_kol/status/1893772190012345679",
+                posted_at=datetime(2026, 2, 20, 14, 0, tzinfo=UTC),
+                content_text="Watching NVDA earnings reaction for AI supply chain read-through.",
+                raw_json={"lang": "en"},
+            ),
+        ],
+    )
+
+
+@app.post("/ingest/x/following/import", response_model=XFollowingImportStatsRead)
+async def import_x_following_to_kols(
+    payload: Any = Body(...),
+    filename: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    if isinstance(payload, (dict, list)):
+        content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    elif isinstance(payload, str):
+        content = payload.encode("utf-8")
+    elif isinstance(payload, (bytes, bytearray)):
+        content = bytes(payload)
+    else:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported request body")
+    if not content:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="empty file")
+
+    try:
+        rows = load_records_from_bytes(content, filename=filename)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"invalid file content: {exc}")
+
+    following_true_rows = 0
+    skipped_count = 0
+    errors: list[XFollowingImportErrorRead] = []
+    candidate_name_by_handle: dict[str, str | None] = {}
+    for idx, row_any in enumerate(rows, start=1):
+        if not isinstance(row_any, dict):
+            skipped_count += 1
+            errors.append(
+                XFollowingImportErrorRead(
+                    row_index=idx,
+                    reason=f"row is not an object (type={type(row_any).__name__})",
+                    raw_snippet=_raw_snippet(row_any),
+                )
+            )
+            continue
+        if not _coerce_row_bool(row_any.get("following")):
+            skipped_count += 1
+            continue
+        following_true_rows += 1
+        handle_value = row_any.get("screen_name")
+        handle = _normalize_author_handle(str(handle_value or ""))
+        if not handle:
+            skipped_count += 1
+            errors.append(
+                XFollowingImportErrorRead(
+                    row_index=idx,
+                    reason="missing screen_name for following=true row",
+                    raw_snippet=_raw_snippet(row_any),
+                )
+            )
+            continue
+        if handle in candidate_name_by_handle:
+            skipped_count += 1
+            continue
+        name_value = row_any.get("name")
+        name = str(name_value).strip() if isinstance(name_value, str) else None
+        candidate_name_by_handle[handle] = name or None
+
+    kols_result = await db.execute(select(Kol).where(Kol.platform == "x"))
+    x_kols_by_handle = {_normalize_author_handle(item.handle): item for item in kols_result.scalars().all()}
+    created_kols: list[Kol] = []
+    updated_kols: list[Kol] = []
+    for handle, display_name in sorted(candidate_name_by_handle.items()):
+        existing = x_kols_by_handle.get(handle)
+        if existing is None:
+            kol = Kol(
+                platform="x",
+                handle=handle,
+                display_name=display_name,
+                enabled=True,
+            )
+            db.add(kol)
+            await db.flush()
+            created_kols.append(kol)
+            x_kols_by_handle[handle] = kol
+            continue
+        if not existing.enabled:
+            existing.enabled = True
+        if display_name:
+            existing.display_name = display_name
+        await db.flush()
+        updated_kols.append(existing)
+
+    await db.commit()
+    return XFollowingImportStatsRead(
+        received_rows=len(rows),
+        following_true_rows=following_true_rows,
+        created_kols_count=len(created_kols),
+        updated_kols_count=len(updated_kols),
+        skipped_count=skipped_count,
+        created_kols=[XFollowingImportKolRead(id=item.id, handle=item.handle) for item in created_kols],
+        updated_kols=[XFollowingImportKolRead(id=item.id, handle=item.handle) for item in updated_kols],
+        errors=errors,
+    )
+
+
+@app.post("/ingest/x/convert", response_model=XConvertResponseRead)
+async def convert_x_import_file(
+    payload: Any = Body(...),
+    filename: str | None = Query(default=None),
+    author_handle: str | None = Query(default=None),
+    kol_id: int | None = Query(default=None, ge=1),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    include_raw_json: bool = Query(default=True),
+    only_followed: bool = Query(default=True),
+    allow_unknown_handles: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="start_date must be <= end_date")
+
+    if isinstance(payload, (dict, list)):
+        content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    elif isinstance(payload, str):
+        content = payload.encode("utf-8")
+    elif isinstance(payload, (bytes, bytearray)):
+        content = bytes(payload)
+    else:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported request body")
+
+    if not content:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="empty file")
+
+    try:
+        rows = load_records_from_bytes(content, filename=filename)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"invalid file content: {exc}")
+
+    export_kind = _detect_x_export_kind(rows)
+    rows_for_convert = rows
+    skipped_not_followed_count = 0
+    skipped_not_followed_samples: list[XSkippedNotFollowedRead] = []
+    if export_kind == "timeline" and (only_followed or not allow_unknown_handles):
+        enabled_handles: set[str] = set()
+        try:
+            _, enabled_by_handle = await _enabled_x_kol_maps(db)
+            enabled_handles = set(enabled_by_handle.keys())
+        except Exception:  # noqa: BLE001
+            enabled_handles = set()
+        if enabled_handles:
+            kept_rows: list[Any] = []
+            for idx, row_any in enumerate(rows, start=1):
+                if not isinstance(row_any, dict):
+                    kept_rows.append(row_any)
+                    continue
+                handle_key = _normalize_author_handle(str(row_any.get("screen_name") or row_any.get("author_handle") or ""))
+                if not handle_key:
+                    kept_rows.append(row_any)
+                    continue
+                if handle_key in enabled_handles:
+                    kept_rows.append(row_any)
+                    continue
+                skipped_not_followed_count += 1
+                if len(skipped_not_followed_samples) < 20:
+                    external_id_value = row_any.get("id")
+                    external_id = str(external_id_value).strip() if external_id_value is not None else None
+                    skipped_not_followed_samples.append(
+                        XSkippedNotFollowedRead(
+                            row_index=idx,
+                            author_handle=handle_key,
+                            external_id=external_id or None,
+                            reason="not_followed",
+                        )
+                    )
+            rows_for_convert = kept_rows
+
+    converted, stats = convert_records(
+        rows_for_convert,
+        author_handle=author_handle,
+        kol_id=kol_id,
+        start_date=start_date,
+        end_date=end_date,
+        include_raw_json=include_raw_json,
+    )
+    converted_models = [XImportItemCreate.model_validate(item) for item in converted]
+    for item in converted_models:
+        normalized = _normalize_author_handle(item.author_handle)
+        item.author_handle = normalized
+        item.resolved_author_handle = normalized
+
+    x_kols_by_handle_key: dict[str, Kol] = {}
+    try:
+        kols_result = await db.execute(select(Kol).where(Kol.platform == "x"))
+        x_kols_by_handle_key = {
+            _normalize_author_handle(item.handle): item
+            for item in kols_result.scalars().all()
+        }
+    except Exception:  # noqa: BLE001
+        x_kols_by_handle_key = {}
+
+    by_handle: dict[str, dict[str, Any]] = {}
+    for item in converted_models:
+        handle = item.resolved_author_handle or _normalize_author_handle(item.author_handle)
+        if not handle:
+            continue
+        bucket = by_handle.get(handle)
+        if bucket is None:
+            bucket = {
+                "count": 0,
+                "earliest_posted_at": item.posted_at,
+                "latest_posted_at": item.posted_at,
+            }
+            by_handle[handle] = bucket
+        bucket["count"] += 1
+        if bucket["earliest_posted_at"] is None or item.posted_at < bucket["earliest_posted_at"]:
+            bucket["earliest_posted_at"] = item.posted_at
+        if bucket["latest_posted_at"] is None or item.posted_at > bucket["latest_posted_at"]:
+            bucket["latest_posted_at"] = item.posted_at
+
+    handles_summary: list[XHandleSummaryRead] = []
+    for handle in sorted(by_handle.keys()):
+        summary = by_handle[handle]
+        will_create_kol = (
+            (handle not in x_kols_by_handle_key) and kol_id is None and (not only_followed) and allow_unknown_handles
+        )
+        handles_summary.append(
+            XHandleSummaryRead(
+                author_handle=handle,
+                count=int(summary["count"]),
+                earliest_posted_at=summary["earliest_posted_at"],
+                latest_posted_at=summary["latest_posted_at"],
+                will_create_kol=will_create_kol,
+            )
+        )
+
+    resolved_author_handle: str | None = None
+    resolved_kol_id: int | None = None
+    if kol_id is None and not (author_handle or "").strip():
+        resolved_author_handle, handles = _detect_single_handle_from_items(converted_models)
+        if resolved_author_handle and len(handles) == 1:
+            matched = x_kols_by_handle_key.get(resolved_author_handle)
+            if matched is not None:
+                resolved_kol_id = matched.id
+
+    return XConvertResponseRead(
+        converted_rows=len(rows),
+        converted_ok=stats.output_count,
+        converted_failed=stats.failed_count,
+        errors=[
+            XConvertErrorRead(
+                row_index=item.row_index,
+                external_id=item.external_id,
+                url=item.url,
+                reason=item.reason,
+            )
+            for item in (stats.errors or [])
+        ],
+        items=converted_models,
+        handles_summary=handles_summary,
+        resolved_author_handle=resolved_author_handle,
+        resolved_kol_id=resolved_kol_id,
+        kol_created=False,
+        skipped_not_followed_count=skipped_not_followed_count,
+        skipped_not_followed_samples=skipped_not_followed_samples,
+    )
+
+
+@app.post("/ingest/x/import", response_model=XImportStatsRead)
+async def import_x_posts(
+    payload: list[XImportItemCreate],
+    trigger_extraction: bool = Query(default=False),
+    author_handle_override: str | None = Query(default=None),
+    only_followed: bool = Query(default=True),
+    allow_unknown_handles: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    inserted_raw_posts: list[RawPost] = []
+    inserted_raw_post_ids: list[int] = []
+    dedup_existing_raw_post_ids: list[int] = []
+    dedup_skipped_count = 0
+    warnings: list[str] = []
+    imported_by_handle: defaultdict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "received": 0,
+            "inserted": 0,
+            "dedup": 0,
+            "warnings": 0,
+            "raw_post_ids": [],
+            "extract_success": 0,
+            "extract_failed": 0,
+            "skipped_already_extracted": 0,
+        }
+    )
+    created_kols_by_handle: dict[str, Kol] = {}
+    raw_post_handle_by_id: dict[int, str] = {}
+    skipped_not_followed_count = 0
+    skipped_not_followed_samples: list[XSkippedNotFollowedRead] = []
+
+    kols_result = await db.execute(select(Kol).where(Kol.platform == "x"))
+    x_kols = list(kols_result.scalars().all())
+    x_kols_by_id = {item.id: item for item in x_kols}
+    x_kols_by_handle_key = {_normalize_author_handle(item.handle): item for item in x_kols}
+    enabled_x_kols_by_handle_key = {_normalize_author_handle(item.handle): item for item in x_kols if item.enabled}
+
+    normalized_override = _normalize_author_handle(author_handle_override or "")
+    resolved_author_handle: str | None = None
+    resolved_kol_id: int | None = None
+    kol_created = False
+
+    for row_index, item in enumerate(payload, start=1):
+        original_handle = _normalize_author_handle(item.resolved_author_handle or item.author_handle)
+        if normalized_override and item.kol_id is None:
+            item.resolved_author_handle = normalized_override
+            item.author_handle = normalized_override
+            original_handle = normalized_override
+        if original_handle:
+            imported_by_handle[original_handle]["received"] += 1
+
+        author_handle, row_kol_id, warning, created_kol = await _resolve_import_author_handle(
+            item=item,
+            db=db,
+            x_kols_by_id=x_kols_by_id,
+            x_kols_by_handle_key=x_kols_by_handle_key,
+            enabled_x_kols_by_handle_key=enabled_x_kols_by_handle_key,
+            only_followed=only_followed,
+            allow_unknown_handles=allow_unknown_handles,
+        )
+        if created_kol is not None:
+            kol_created = True
+            created_kols_by_handle[_normalize_author_handle(created_kol.handle)] = created_kol
+        if warning is not None:
+            warnings.append(warning)
+            if original_handle:
+                imported_by_handle[original_handle]["warnings"] += 1
+            if "not_followed" in warning:
+                skipped_not_followed_count += 1
+                if len(skipped_not_followed_samples) < 20:
+                    skipped_not_followed_samples.append(
+                        XSkippedNotFollowedRead(
+                            row_index=row_index,
+                            author_handle=original_handle or None,
+                            external_id=item.external_id,
+                            reason="not_followed",
+                        )
+                    )
+        if author_handle is None:
+            continue
+
+        external_id = item.external_id.strip()
+        existing_result = await db.execute(
+            select(RawPost).where(
+                RawPost.platform == "x",
+                RawPost.external_id == external_id,
+            )
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing is not None:
+            dedup_skipped_count += 1
+            dedup_existing_raw_post_ids.append(existing.id)
+            handle_key = _normalize_author_handle(existing.author_handle or author_handle)
+            imported_by_handle[handle_key]["dedup"] += 1
+            if existing.id not in imported_by_handle[handle_key]["raw_post_ids"]:
+                imported_by_handle[handle_key]["raw_post_ids"].append(existing.id)
+            raw_post_handle_by_id[existing.id] = handle_key
+            continue
+
+        raw_post = RawPost(
+            platform="x",
+            kol_id=row_kol_id,
+            author_handle=author_handle,
+            external_id=external_id,
+            url=item.url.strip(),
+            content_text=item.content_text.strip(),
+            posted_at=item.posted_at,
+            raw_json=item.raw_json,
+        )
+        db.add(raw_post)
+        inserted_raw_posts.append(raw_post)
+        handle_key = _normalize_author_handle(author_handle)
+        imported_by_handle[handle_key]["inserted"] += 1
+
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate raw post in payload")
+
+    for item in inserted_raw_posts:
+        if item.id is None:
+            continue
+        handle_key = _normalize_author_handle(item.author_handle)
+        raw_post_handle_by_id[item.id] = handle_key
+        imported_by_handle[handle_key]["raw_post_ids"].append(item.id)
+
+    extract_success_count = 0
+    extract_failed_count = 0
+    skipped_already_extracted_count = 0
+    if trigger_extraction:
+        extraction_target_ids = list(
+            dict.fromkeys(
+                [
+                    *[item.id for item in inserted_raw_posts if item.id is not None],
+                    *dedup_existing_raw_post_ids,
+                ]
+            )
+        )
+        latest_map = await _latest_extractions_by_raw_post_id(db, raw_post_ids=set(extraction_target_ids))
+        for raw_post_id in extraction_target_ids:
+            handle_key = raw_post_handle_by_id.get(raw_post_id)
+            raw_post = await db.get(RawPost, raw_post_id)
+            if raw_post is None:
+                continue
+            if not await _raw_post_matches_enabled_x_kol(db, raw_post):
+                skipped_not_followed_count += 1
+                if len(skipped_not_followed_samples) < 20:
+                    skipped_not_followed_samples.append(
+                        XSkippedNotFollowedRead(
+                            row_index=0,
+                            author_handle=_normalize_author_handle(raw_post.author_handle),
+                            external_id=raw_post.external_id,
+                            reason="not_followed",
+                        )
+                    )
+                continue
+            latest_extraction = latest_map.get(raw_post_id)
+            if _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=latest_extraction) is not None:
+                skipped_already_extracted_count += 1
+                if handle_key:
+                    imported_by_handle[handle_key]["skipped_already_extracted"] += 1
+                continue
+            if _is_active_extraction(latest_extraction) or _is_successful_extraction(latest_extraction):
+                skipped_already_extracted_count += 1
+                if handle_key:
+                    imported_by_handle[handle_key]["skipped_already_extracted"] += 1
+                continue
+            try:
+                _check_reextract_rate_limit(raw_post.id)
+                await create_pending_extraction(db, raw_post)
+                extract_success_count += 1
+                if handle_key:
+                    imported_by_handle[handle_key]["extract_success"] += 1
+            except Exception:  # noqa: BLE001
+                extract_failed_count += 1
+                if handle_key:
+                    imported_by_handle[handle_key]["extract_failed"] += 1
+
+    inserted_raw_post_ids = [item.id for item in inserted_raw_posts]
+    payload_handles = {
+        _normalize_author_handle(item.resolved_author_handle or item.author_handle)
+        for item in payload
+        if _normalize_author_handle(item.resolved_author_handle or item.author_handle)
+    }
+    if len(payload_handles) == 1:
+        resolved_author_handle = next(iter(payload_handles))
+        resolved = x_kols_by_handle_key.get(resolved_author_handle)
+        if resolved is not None:
+            resolved_kol_id = resolved.id
+
+    await db.commit()
+    return XImportStatsRead(
+        received_count=len(payload),
+        inserted_raw_posts_count=len(inserted_raw_posts),
+        inserted_raw_post_ids=inserted_raw_post_ids,
+        dedup_existing_raw_post_ids=list(dict.fromkeys(dedup_existing_raw_post_ids)),
+        dedup_skipped_count=dedup_skipped_count,
+        extract_success_count=extract_success_count,
+        extract_failed_count=extract_failed_count,
+        skipped_already_extracted_count=skipped_already_extracted_count,
+        warnings_count=len(warnings),
+        warnings=warnings[:50],
+        imported_by_handle={
+            handle: XImportedByHandleRead.model_validate(stats)
+            for handle, stats in sorted(imported_by_handle.items())
+        },
+        created_kols=[
+            XCreatedKolRead(
+                id=item.id,
+                handle=item.handle,
+                name=item.display_name,
+            )
+            for _, item in sorted(created_kols_by_handle.items(), key=lambda pair: pair[0])
+        ],
+        resolved_author_handle=resolved_author_handle,
+        resolved_kol_id=resolved_kol_id,
+        kol_created=kol_created,
+        skipped_not_followed_count=skipped_not_followed_count,
+        skipped_not_followed_samples=skipped_not_followed_samples,
+    )
+
+
+@app.post("/raw-posts/extract-batch", response_model=RawPostsExtractBatchRead)
+async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: AsyncSession = Depends(get_db)):
+    requested_ids = list(dict.fromkeys(payload.raw_post_ids))
+    success_count = 0
+    skipped_count = 0
+    skipped_already_extracted_count = 0
+    skipped_already_pending_count = 0
+    skipped_already_success_count = 0
+    skipped_already_rejected_count = 0
+    skipped_already_approved_count = 0
+    failed_count = 0
+    resumed_requested_count = 0
+    resumed_success = 0
+    resumed_failed = 0
+    resumed_skipped = 0
+
+    settings = get_settings()
+    throttle = _get_runtime_throttle(settings)
+    retry_max = max(0, settings.extract_retry_max)
+    max_resume_retries = max(1, retry_max)
+    backoff_base_ms = max(1, settings.extract_retry_backoff_base_ms)
+    backoff_cap_ms = max(backoff_base_ms, settings.extract_retry_backoff_max_ms)
+    limiter = _RpmLimiter(throttle["max_rpm"])
+    semaphore = asyncio.Semaphore(max(1, throttle["max_concurrency"]))
+    failed_errors: dict[int, tuple[str, str, int]] = {}
+    chunk_size = max(1, throttle["batch_size"])
+    batch_sleep_seconds = max(0.0, throttle["batch_sleep_ms"] / 1000.0)
+
+    async def _process_one(raw_post_id: int, local_db: AsyncSession) -> tuple[str, str | None, bool]:
+        async with semaphore:
+            raw_post = await local_db.get(RawPost, raw_post_id)
+            if raw_post is None:
+                return ("skipped", None, False)
+            if not await _raw_post_matches_enabled_x_kol(local_db, raw_post):
+                return ("skipped_not_followed", None, False)
+
+            latest_extraction = await _latest_extraction_for_raw_post(local_db, raw_post_id=raw_post_id)
+            resume_candidate = payload.mode == "pending_or_failed" and (
+                latest_extraction is None or _is_failed_extraction(latest_extraction)
+            )
+            if payload.mode in {"pending_only", "pending_or_failed"}:
+                terminal_skip_kind = _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=latest_extraction)
+                if terminal_skip_kind is not None:
+                    return (terminal_skip_kind, None, resume_candidate)
+            if payload.mode in {"pending_only", "pending_or_failed"} and _is_active_extraction(latest_extraction):
+                return ("skipped_already_pending", None, resume_candidate)
+
+            if payload.mode in {"pending_only", "pending_or_failed"} and _is_successful_extraction(latest_extraction):
+                return ("skipped_already_success", None, resume_candidate)
+
+            if payload.mode == "pending_only" and latest_extraction is not None:
+                return ("skipped", None, resume_candidate)
+
+            if payload.mode == "pending_or_failed" and _is_failed_extraction(latest_extraction):
+                failed_retries = await _failed_batch_retry_count(local_db, raw_post_id=raw_post_id)
+                if failed_retries >= max_resume_retries:
+                    return ("skipped_retry_limited", None, resume_candidate)
+
+            _check_reextract_rate_limit(raw_post.id)
+            for attempt in range(1, retry_max + 2):
+                try:
+                    await limiter.acquire()
+                    await create_pending_extraction(
+                        local_db,
+                        raw_post,
+                        raise_retryable_errors=True,
+                        force_reextract=payload.mode == "force",
+                    )
+                    await local_db.commit()
+                    return ("success", None, resume_candidate)
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_retryable_extraction_error(exc) or attempt > retry_max:
+                        await local_db.rollback()
+                        return ("failed", _build_last_error(exc), resume_candidate)
+                    await local_db.rollback()
+                    await asyncio.sleep(
+                        _build_retry_backoff_seconds(
+                            attempt=attempt,
+                            base_ms=backoff_base_ms,
+                            cap_ms=backoff_cap_ms,
+                        )
+                    )
+            return ("failed", "retry_exhausted", resume_candidate)
+
+    for offset in range(0, len(requested_ids), chunk_size):
+        chunk = requested_ids[offset : offset + chunk_size]
+        if isinstance(db, AsyncSession):
+            async def _run_with_task_db(raw_post_id: int) -> tuple[str, str | None]:
+                async with AsyncSessionLocal() as task_db:
+                    return await _process_one(raw_post_id, task_db)
+
+            results = await asyncio.gather(*[_run_with_task_db(raw_post_id) for raw_post_id in chunk], return_exceptions=False)
+        else:
+            results = []
+            for raw_post_id in chunk:
+                result = await _process_one(raw_post_id, db)
+                results.append(result)
+        for idx, result in enumerate(results):
+            kind, last_error, resume_candidate = result
+            raw_post_id = chunk[idx]
+            if payload.mode == "pending_or_failed" and resume_candidate:
+                resumed_requested_count += 1
+            if kind == "success":
+                success_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_success += 1
+            elif kind == "skipped_already_pending":
+                skipped_already_pending_count += 1
+                skipped_already_extracted_count += 1
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            elif kind == "skipped_already_success":
+                skipped_already_success_count += 1
+                skipped_already_extracted_count += 1
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            elif kind == "skipped_already_rejected":
+                skipped_already_rejected_count += 1
+                skipped_already_extracted_count += 1
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            elif kind == "skipped_already_approved":
+                skipped_already_approved_count += 1
+                skipped_already_extracted_count += 1
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            elif kind == "skipped_retry_limited":
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            elif kind == "skipped_not_followed":
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            elif kind == "skipped":
+                skipped_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_skipped += 1
+            else:
+                failed_count += 1
+                if payload.mode == "pending_or_failed" and resume_candidate:
+                    resumed_failed += 1
+                if last_error:
+                    error_category = _classify_last_error(last_error)
+                    if isinstance(db, AsyncSession):
+                        async with AsyncSessionLocal() as task_db:
+                            batch_retry_count = (await _failed_batch_retry_count(task_db, raw_post_id=raw_post_id)) + 1
+                    else:
+                        batch_retry_count = (await _failed_batch_retry_count(db, raw_post_id=raw_post_id)) + 1
+                    failed_errors[raw_post_id] = (last_error, error_category, batch_retry_count)
+        if offset + chunk_size < len(requested_ids):
+            await asyncio.sleep(batch_sleep_seconds)
+
+    for raw_post_id, (last_error, error_category, batch_retry_count) in failed_errors.items():
+        if isinstance(db, AsyncSession):
+            async with AsyncSessionLocal() as task_db:
+                raw_post = await task_db.get(RawPost, raw_post_id)
+                if raw_post is None:
+                    continue
+                await _create_failed_extraction(
+                    task_db,
+                    raw_post=raw_post,
+                    last_error=last_error,
+                    error_category=error_category,
+                    batch_retry_count=batch_retry_count,
+                )
+                await task_db.commit()
+        else:
+            raw_post = await db.get(RawPost, raw_post_id)
+            if raw_post is None:
+                continue
+            await _create_failed_extraction(
+                db,
+                raw_post=raw_post,
+                last_error=last_error,
+                error_category=error_category,
+                batch_retry_count=batch_retry_count,
+            )
+
+    if not isinstance(db, AsyncSession):
+        await db.commit()
+    resume_mode = payload.mode == "pending_or_failed"
+    return RawPostsExtractBatchRead(
+        requested_count=len(requested_ids),
+        success_count=success_count,
+        skipped_count=skipped_count,
+        skipped_already_extracted_count=skipped_already_extracted_count,
+        skipped_already_pending_count=skipped_already_pending_count,
+        skipped_already_success_count=skipped_already_success_count,
+        skipped_already_rejected_count=skipped_already_rejected_count,
+        skipped_already_approved_count=skipped_already_approved_count,
+        failed_count=failed_count,
+        resumed_requested_count=resumed_requested_count if resume_mode else 0,
+        resumed_success=resumed_success if resume_mode else 0,
+        resumed_failed=resumed_failed if resume_mode else 0,
+        resumed_skipped=resumed_skipped if resume_mode else 0,
+    )
+
+
+@app.get("/ingest/x/progress", response_model=XIngestProgressRead)
+async def get_x_ingest_progress(
+    author_handle: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    posts = await _list_x_raw_posts(db, author_handle=author_handle)
+    post_ids = {item.id for item in posts}
+    latest_map = await _latest_extractions_by_raw_post_id(db, raw_post_ids=post_ids)
+
+    extracted_success_count = 0
+    pending_count = 0
+    failed_count = 0
+    latest_error_summary: str | None = None
+    latest_error_at: datetime | None = None
+    latest_extraction_at: datetime | None = None
+
+    for post in posts:
+        latest = latest_map.get(post.id)
+        if latest is None:
+            continue
+        if latest_extraction_at is None or (
+            latest.created_at is not None and latest.created_at > latest_extraction_at
+        ):
+            latest_extraction_at = latest.created_at
+
+        has_error = bool((latest.last_error or "").strip())
+        if has_error:
+            failed_count += 1
+            if latest_error_at is None or (latest.created_at is not None and latest.created_at > latest_error_at):
+                latest_error_at = latest.created_at
+                latest_error_summary = (latest.last_error or "").strip()[:240]
+            continue
+
+        extracted_success_count += 1
+        if latest.status == ExtractionStatus.pending:
+            pending_count += 1
+
+    no_extraction_count = len(posts) - len(latest_map)
+    return XIngestProgressRead(
+        scope="author" if author_handle else "global",
+        author_handle=author_handle,
+        total_raw_posts=len(posts),
+        extracted_success_count=extracted_success_count,
+        pending_count=pending_count,
+        failed_count=failed_count,
+        no_extraction_count=no_extraction_count,
+        latest_error_summary=latest_error_summary,
+        latest_extraction_at=latest_extraction_at,
+    )
+
+
+@app.post("/ingest/x/retry-failed", response_model=XRetryFailedRead)
+async def retry_failed_x_extractions(
+    author_handle: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    posts = await _list_x_raw_posts(db, author_handle=author_handle)
+    post_map = {item.id: item for item in posts}
+    latest_map = await _latest_extractions_by_raw_post_id(db, raw_post_ids=set(post_map.keys()))
+
+    failed_candidates: list[tuple[RawPost, PostExtraction]] = []
+    for raw_post_id, extraction in latest_map.items():
+        if not (extraction.last_error or "").strip():
+            continue
+        raw_post = post_map.get(raw_post_id)
+        if raw_post is None:
+            continue
+        if _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=extraction) is not None:
+            continue
+        failed_candidates.append((raw_post, extraction))
+    failed_candidates.sort(
+        key=lambda item: (
+            item[1].created_at or datetime.min.replace(tzinfo=UTC),
+            item[1].id or 0,
+        ),
+        reverse=True,
+    )
+    targets = failed_candidates[:limit]
+
+    reason_counter: Counter[str] = Counter()
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    for raw_post, _ in targets:
+        if not await _raw_post_matches_enabled_x_kol(db, raw_post):
+            skipped_count += 1
+            continue
+        try:
+            _check_reextract_rate_limit(raw_post.id)
+            await create_pending_extraction(db, raw_post)
+            success_count += 1
+        except Exception as exc:  # noqa: BLE001
+            failed_count += 1
+            reason_counter[_format_retry_failure_reason(exc)] += 1
+
+    await db.commit()
+    retried_count = success_count + failed_count
+    return XRetryFailedRead(
+        author_handle=author_handle,
+        requested_limit=limit,
+        retried_count=retried_count,
+        success_count=success_count,
+        failed_count=failed_count,
+        skipped_count=skipped_count,
+        failure_reasons=dict(reason_counter),
+    )
+
+
+@app.delete("/admin/extractions/pending", response_model=AdminDeletePendingExtractionsRead)
+async def delete_pending_or_failed_extractions(
+    confirm: str = Query(...),
+    enable_cascade: bool = Query(default=False),
+    also_delete_raw_posts: bool = Query(default=False),
+    author_handle: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    _require_raw_delete_cascade_guard(also_delete_raw_posts=also_delete_raw_posts, enable_cascade=enable_cascade)
+
+    scoped_handle = _normalize_author_handle(author_handle) if (author_handle or "").strip() else None
+    result = await db.execute(
+        select(PostExtraction).options(selectinload(PostExtraction.raw_post)).order_by(PostExtraction.id.asc())
+    )
+    all_extractions = list(result.scalars().all())
+    filtered: list[PostExtraction] = []
+    for extraction in all_extractions:
+        status_key = _extraction_status_key(extraction)
+        if status_key not in {"pending", "failed"}:
+            continue
+        raw_post = extraction.raw_post
+        if scoped_handle and (
+            raw_post is None or _normalize_author_handle(raw_post.author_handle) != scoped_handle
+        ):
+            continue
+        filtered.append(extraction)
+
+    targeted_extraction_ids = {item.id for item in filtered if item.id is not None}
+    targeted_raw_post_ids = {item.raw_post_id for item in filtered if item.raw_post_id is not None}
+    deleted_raw_posts_count = 0
+
+    if also_delete_raw_posts and targeted_raw_post_ids:
+        safe_to_delete_raw_post_ids: set[int] = set()
+        for raw_post_id in targeted_raw_post_ids:
+            rows_result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
+            all_ids_for_post = {
+                item.id
+                for item in rows_result.scalars().all()
+                if getattr(item, "id", None) is not None
+            }
+            if all_ids_for_post and all_ids_for_post.issubset(targeted_extraction_ids):
+                safe_to_delete_raw_post_ids.add(raw_post_id)
+
+        for raw_post_id in safe_to_delete_raw_post_ids:
+            raw_post = await db.get(RawPost, raw_post_id)
+            if raw_post is None:
+                continue
+            await db.delete(raw_post)
+            deleted_raw_posts_count += 1
+
+        filtered = [item for item in filtered if item.raw_post_id not in safe_to_delete_raw_post_ids]
+
+    for extraction in filtered:
+        await db.delete(extraction)
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action="admin/extractions/pending",
+                hint="raw_posts or related rows are still referenced by other records",
+            ),
+        ) from exc
+    return AdminDeletePendingExtractionsRead(
+        deleted_extractions_count=len(targeted_extraction_ids),
+        deleted_raw_posts_count=deleted_raw_posts_count,
+        scoped_author_handle=scoped_handle,
+    )
+
+
+@app.delete("/admin/kols/{kol_id}", response_model=AdminHardDeleteRead)
+async def admin_delete_kol(
+    kol_id: int = Path(ge=1),
+    confirm: str = Query(...),
+    enable_cascade: bool = Query(default=False),
+    also_delete_raw_posts: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    _require_raw_delete_cascade_guard(also_delete_raw_posts=also_delete_raw_posts, enable_cascade=enable_cascade)
+
+    kol = await db.get(Kol, kol_id)
+    if kol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol not found")
+
+    counts = _admin_delete_counts_template()
+
+    raw_posts_result = await db.execute(select(RawPost).order_by(RawPost.id.asc()))
+    related_raw_posts = [item for item in raw_posts_result.scalars().all() if item.kol_id == kol_id]
+    related_raw_post_ids = {item.id for item in related_raw_posts if item.id is not None}
+
+    extractions_result = await db.execute(select(PostExtraction).order_by(PostExtraction.id.asc()))
+    related_extractions = [
+        item
+        for item in extractions_result.scalars().all()
+        if item.raw_post_id in related_raw_post_ids
+    ]
+    for extraction in related_extractions:
+        await db.delete(extraction)
+        counts["post_extractions"] += 1
+
+    views_result = await db.execute(select(KolView).order_by(KolView.id.asc()))
+    related_views = [item for item in views_result.scalars().all() if item.kol_id == kol_id]
+    related_view_ids = {item.id for item in related_views if item.id is not None}
+
+    if related_view_ids:
+        all_extractions_result = await db.execute(select(PostExtraction).order_by(PostExtraction.id.asc()))
+        for extraction in all_extractions_result.scalars().all():
+            if extraction.applied_kol_view_id in related_view_ids:
+                extraction.applied_kol_view_id = None
+
+    for view in related_views:
+        await db.delete(view)
+        counts["kol_views"] += 1
+
+    digests_result = await db.execute(select(DailyDigest).order_by(DailyDigest.id.asc()))
+    related_digests = [
+        item
+        for item in digests_result.scalars().all()
+        if _digest_mentions_kol(item.content, kol_id=kol_id)
+    ]
+    for digest in related_digests:
+        await db.delete(digest)
+        counts["daily_digests"] += 1
+
+    profile_weights_result = await db.execute(select(ProfileKolWeight).order_by(ProfileKolWeight.id.asc()))
+    related_profile_weights = [item for item in profile_weights_result.scalars().all() if item.kol_id == kol_id]
+    for item in related_profile_weights:
+        await db.delete(item)
+        counts["profile_kol_weights"] += 1
+
+    if also_delete_raw_posts:
+        for raw_post in related_raw_posts:
+            await db.delete(raw_post)
+            counts["raw_posts"] += 1
+    else:
+        for raw_post in related_raw_posts:
+            raw_post.kol_id = None
+
+    await db.delete(kol)
+    counts["kols"] += 1
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action=f"admin/kols/{kol_id}",
+                hint="delete dependent raw_posts/post_extractions or enable cascade for raw_posts",
+            ),
+        ) from exc
+
+    return AdminHardDeleteRead(
+        operation="delete_kol",
+        target=f"kol:{kol_id}",
+        derived_only=not also_delete_raw_posts,
+        enable_cascade=enable_cascade,
+        also_delete_raw_posts=also_delete_raw_posts,
+        counts=counts,
+    )
+
+
+@app.delete("/admin/assets/{asset_id}", response_model=AdminHardDeleteRead)
+async def admin_delete_asset(
+    asset_id: int = Path(ge=1),
+    confirm: str = Query(...),
+    enable_cascade: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+
+    asset = await db.get(Asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    counts = _admin_delete_counts_template()
+    views_result = await db.execute(select(KolView).order_by(KolView.id.asc()))
+    related_views = [item for item in views_result.scalars().all() if item.asset_id == asset_id]
+    related_view_ids = {item.id for item in related_views if item.id is not None}
+
+    if related_view_ids:
+        all_extractions_result = await db.execute(select(PostExtraction).order_by(PostExtraction.id.asc()))
+        for extraction in all_extractions_result.scalars().all():
+            if extraction.applied_kol_view_id in related_view_ids:
+                extraction.applied_kol_view_id = None
+
+    for view in related_views:
+        await db.delete(view)
+        counts["kol_views"] += 1
+
+    digests_result = await db.execute(select(DailyDigest).order_by(DailyDigest.id.asc()))
+    related_digests = [
+        item
+        for item in digests_result.scalars().all()
+        if _digest_mentions_asset(item.content, asset_id=asset_id)
+    ]
+    for digest in related_digests:
+        await db.delete(digest)
+        counts["daily_digests"] += 1
+
+    if enable_cascade:
+        aliases_result = await db.execute(select(AssetAlias).order_by(AssetAlias.id.asc()))
+        related_aliases = [item for item in aliases_result.scalars().all() if item.asset_id == asset_id]
+        for alias in related_aliases:
+            await db.delete(alias)
+            counts["asset_aliases"] += 1
+
+        await db.delete(asset)
+        counts["assets"] += 1
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action=f"admin/assets/{asset_id}",
+                hint="delete dependent kol_views/aliases first, or retry with enable_cascade=true",
+            ),
+        ) from exc
+
+    return AdminHardDeleteRead(
+        operation="delete_asset",
+        target=f"asset:{asset_id}",
+        derived_only=not enable_cascade,
+        enable_cascade=enable_cascade,
+        also_delete_raw_posts=False,
+        counts=counts,
+    )
+
+
+@app.delete("/admin/digests", response_model=AdminHardDeleteRead)
+async def admin_delete_digests_by_date(
+    confirm: str = Query(...),
+    digest_date: date = Query(...),
+    profile_id: int = Query(..., ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    counts = _admin_delete_counts_template()
+
+    result = await db.execute(select(DailyDigest).order_by(DailyDigest.id.asc()))
+    matched = [
+        item
+        for item in result.scalars().all()
+        if item.digest_date == digest_date and item.profile_id == profile_id
+    ]
+    if not matched:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="digest not found")
+
+    for item in matched:
+        await db.delete(item)
+        counts["daily_digests"] += 1
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action="admin/digests",
+                hint="digest rows are still referenced by other records",
+            ),
+        ) from exc
+
+    return AdminHardDeleteRead(
+        operation="delete_digests_by_date",
+        target=f"profile:{profile_id},date:{digest_date.isoformat()}",
+        derived_only=True,
+        enable_cascade=False,
+        also_delete_raw_posts=False,
+        counts=counts,
+    )
+
+
+@app.delete("/admin/digests/{digest_id}", response_model=AdminHardDeleteRead)
+async def admin_delete_digest_by_id(
+    digest_id: int = Path(ge=1),
+    confirm: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    counts = _admin_delete_counts_template()
+
+    digest = await db.get(DailyDigest, digest_id)
+    if digest is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="digest not found")
+
+    await db.delete(digest)
+    counts["daily_digests"] += 1
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action=f"admin/digests/{digest_id}",
+                hint="digest row is still referenced by other records",
+            ),
+        ) from exc
+
+    return AdminHardDeleteRead(
+        operation="delete_digest_by_id",
+        target=f"digest:{digest_id}",
+        derived_only=True,
+        enable_cascade=False,
+        also_delete_raw_posts=False,
+        counts=counts,
+    )
+
+
+@app.delete("/admin/extractions/{extraction_id}", response_model=AdminHardDeleteRead)
+async def admin_delete_extraction(
+    extraction_id: int = Path(ge=1),
+    confirm: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    counts = _admin_delete_counts_template()
+
+    extraction = await db.get(PostExtraction, extraction_id)
+    if extraction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+
+    await db.delete(extraction)
+    counts["post_extractions"] += 1
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action=f"admin/extractions/{extraction_id}",
+                hint="delete dependent records first",
+            ),
+        ) from exc
+
+    return AdminHardDeleteRead(
+        operation="delete_extraction",
+        target=f"extraction:{extraction_id}",
+        derived_only=True,
+        enable_cascade=False,
+        also_delete_raw_posts=False,
+        counts=counts,
+    )
+
+
+@app.delete("/admin/kol-views/{kol_view_id}", response_model=AdminHardDeleteRead)
+async def admin_delete_kol_view(
+    kol_view_id: int = Path(ge=1),
+    confirm: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    counts = _admin_delete_counts_template()
+
+    kol_view = await db.get(KolView, kol_view_id)
+    if kol_view is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol view not found")
+
+    all_extractions_result = await db.execute(select(PostExtraction).order_by(PostExtraction.id.asc()))
+    for extraction in all_extractions_result.scalars().all():
+        if extraction.applied_kol_view_id == kol_view_id:
+            extraction.applied_kol_view_id = None
+
+    await db.delete(kol_view)
+    counts["kol_views"] += 1
+
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_build_fk_conflict_detail(
+                action=f"admin/kol-views/{kol_view_id}",
+                hint="delete dependent records first",
+            ),
+        ) from exc
+
+    return AdminHardDeleteRead(
+        operation="delete_kol_view",
+        target=f"kol_view:{kol_view_id}",
+        derived_only=True,
+        enable_cascade=False,
+        also_delete_raw_posts=False,
+        counts=counts,
+    )
+
+
+async def _create_failed_extraction(
+    db: AsyncSession,
+    *,
+    raw_post: RawPost,
+    last_error: str,
+    error_category: str,
+    batch_retry_count: int,
+) -> PostExtraction:
+    settings = get_settings()
+    extraction = PostExtraction(
+        raw_post_id=raw_post.id,
+        status=ExtractionStatus.pending,
+        extracted_json={
+            **default_extracted_json(raw_post),
+            "meta": {
+                "retry_exhausted": True,
+                "retry_source": "extract_batch",
+                "error_category": error_category,
+                "batch_retry_count": batch_retry_count,
+            },
+        },
+        model_name=settings.openai_model,
+        extractor_name="openai_structured",
+        prompt_version=settings.prompt_version,
+        raw_model_output=None,
+        parsed_model_output=None,
+        last_error=last_error[:2048],
+    )
+    db.add(extraction)
+    await db.flush()
+    _attach_extraction_auto_approve_settings(extraction)
+    return extraction
+
+
+def _build_runtime_settings_read(settings) -> RuntimeSettingsRead:
+    _refresh_runtime_budget_state(settings)
+    default_budget_total = _get_default_call_budget_total(settings)
+    runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
+    throttle = _get_runtime_throttle(settings)
+    return RuntimeSettingsRead(
+        extractor_mode=settings.extractor_mode.strip().lower(),
+        model=settings.openai_model,
+        has_api_key=bool(settings.openai_api_key.strip()),
+        base_url=settings.openai_base_url,
+        budget_remaining=get_openai_call_budget_remaining(settings, budget_total=runtime_budget_total),
+        budget_total=runtime_budget_total,
+        default_budget_total=default_budget_total,
+        call_budget_override_enabled=RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE is not None,
+        call_budget_override_value=RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE,
+        override_value=RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE,
+        window_start=RUNTIME_BUDGET_WINDOW_START or _utc_now(),
+        window_end=RUNTIME_BUDGET_WINDOW_END or _utc_now(),
+        max_output_tokens=max(1, settings.openai_max_output_tokens),
+        throttle=throttle,
+        burst={
+            "enabled": bool(RUNTIME_BURST_STATE["enabled"]),
+            "mode": RUNTIME_BURST_STATE.get("mode"),
+            "expires_at": RUNTIME_BURST_STATE["expires_at"],
+        },
+        runtime_overrides={
+            "call_budget": RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE is not None,
+            "burst": bool(RUNTIME_BURST_STATE["enabled"]),
+            "throttle": bool(RUNTIME_THROTTLE_OVERRIDE),
+        },
+    )
+
+
 @app.post("/raw-posts/{raw_post_id}/extract", response_model=PostExtractionRead, status_code=status.HTTP_201_CREATED)
-async def extract_raw_post(raw_post_id: int, db: AsyncSession = Depends(get_db)):
+async def extract_raw_post(
+    raw_post_id: int,
+    force: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
     raw_post = await db.get(RawPost, raw_post_id)
     if raw_post is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="raw post not found")
     _check_reextract_rate_limit(raw_post_id)
 
-    extraction = await create_pending_extraction(db, raw_post)
+    extraction = await create_pending_extraction(db, raw_post, force_reextract=force)
     await db.commit()
     await db.refresh(extraction)
     return extraction
@@ -1108,14 +3142,58 @@ async def extract_raw_post(raw_post_id: int, db: AsyncSession = Depends(get_db))
 @app.get("/extractor-status", response_model=ExtractorStatusRead)
 def get_extractor_status():
     settings = get_settings()
+    runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
     return ExtractorStatusRead(
         mode=settings.extractor_mode.strip().lower(),
         has_api_key=bool(settings.openai_api_key.strip()),
         default_model=settings.openai_model,
         base_url=settings.openai_base_url,
-        call_budget_remaining=get_openai_call_budget_remaining(settings),
+        call_budget_remaining=get_openai_call_budget_remaining(settings, budget_total=runtime_budget_total),
         max_output_tokens=max(1, settings.openai_max_output_tokens),
     )
+
+
+@app.get("/settings/runtime", response_model=RuntimeSettingsRead)
+def get_runtime_settings():
+    settings = get_settings()
+    return _build_runtime_settings_read(settings)
+
+
+@app.post("/settings/runtime/call-budget", response_model=RuntimeSettingsRead)
+def set_runtime_call_budget(payload: RuntimeCallBudgetUpdateRequest):
+    # TODO: add auth before exposing this endpoint in non-local environments.
+    _set_runtime_openai_call_budget_total(payload.call_budget)
+    return get_runtime_settings()
+
+
+@app.post("/settings/runtime/call-budget/clear", response_model=RuntimeSettingsRead)
+def clear_runtime_call_budget_override():
+    _clear_runtime_openai_call_budget_override()
+    return get_runtime_settings()
+
+
+@app.post("/settings/runtime/burst", response_model=RuntimeSettingsRead)
+def set_runtime_burst(payload: RuntimeBurstUpdateRequest):
+    _set_runtime_burst(
+        enabled=payload.enabled,
+        mode=payload.mode,
+        call_budget=payload.call_budget,
+        duration_minutes=payload.duration_minutes,
+    )
+    return get_runtime_settings()
+
+
+@app.post("/settings/runtime/throttle", response_model=RuntimeSettingsRead)
+def set_runtime_throttle(payload: RuntimeThrottleUpdateRequest):
+    settings = get_settings()
+    _set_runtime_throttle(
+        settings,
+        max_concurrency=payload.max_concurrency,
+        max_rpm=payload.max_rpm,
+        batch_size=payload.batch_size,
+        batch_sleep_ms=payload.batch_sleep_ms,
+    )
+    return get_runtime_settings()
 
 
 @app.get("/dashboard", response_model=DashboardRead)
@@ -1338,6 +3416,54 @@ async def get_dashboard(
     )
 
 
+@app.post("/digests/generate", response_model=DailyDigestRead)
+async def generate_daily_digest(
+    digest_date: date = Query(alias="date"),
+    days: int = Query(default=7, ge=1, le=90),
+    to_ts: datetime | None = Query(default=None),
+    profile_id: int = Query(default=1, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    return await generate_daily_digest_service(
+        db,
+        digest_date=digest_date,
+        days=days,
+        to_ts=to_ts,
+        profile_id=profile_id,
+    )
+
+
+@app.get("/digests", response_model=DailyDigestRead)
+async def get_daily_digest(
+    digest_date: date = Query(alias="date"),
+    version: int | None = Query(default=None, ge=1),
+    profile_id: int = Query(default=1, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_daily_digest_by_date_service(
+        db,
+        digest_date=digest_date,
+        version=version,
+        profile_id=profile_id,
+    )
+
+
+@app.get("/digests/dates", response_model=list[date])
+async def list_daily_digest_dates(
+    profile_id: int = Query(default=1, ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    return await list_daily_digest_dates_service(db, profile_id=profile_id)
+
+
+@app.get("/digests/{digest_id}", response_model=DailyDigestRead)
+async def get_daily_digest_by_id(
+    digest_id: int = Path(ge=1),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_daily_digest_by_id_service(db, digest_id=digest_id)
+
+
 @app.get("/extractions", response_model=list[PostExtractionWithRawPostRead])
 async def list_extractions(
     status: ExtractionStatus = Query(default=ExtractionStatus.pending),
@@ -1374,6 +3500,34 @@ async def get_extraction(extraction_id: int, db: AsyncSession = Depends(get_db))
     return extraction
 
 
+@app.post("/extractions/{extraction_id}/re-extract", response_model=PostExtractionRead, status_code=status.HTTP_201_CREATED)
+async def force_reextract_extraction(
+    extraction_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    source = await db.get(PostExtraction, extraction_id)
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+
+    raw_post = await db.get(RawPost, source.raw_post_id)
+    if raw_post is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="raw post not found")
+
+    _check_reextract_rate_limit(raw_post.id)
+    triggered_by = (source.reviewed_by or EXTRACTION_REVIEWER).strip() or EXTRACTION_REVIEWER
+    extraction = await create_pending_extraction(
+        db,
+        raw_post,
+        allow_budget_fallback=False,
+        force_reextract=True,
+        force_reextract_triggered_by=triggered_by,
+        source_extraction_id=source.id,
+    )
+    await db.commit()
+    await db.refresh(extraction)
+    return extraction
+
+
 @app.post("/extractions/{extraction_id}/approve", response_model=PostExtractionRead)
 async def approve_extraction(
     extraction_id: int,
@@ -1400,6 +3554,11 @@ async def approve_extraction(
     extraction.reviewed_at = datetime.now(UTC)
     extraction.reviewed_by = EXTRACTION_REVIEWER
     extraction.review_note = None
+    raw_post = await db.get(RawPost, extraction.raw_post_id)
+    if raw_post is not None:
+        raw_post.review_status = ReviewStatus.approved
+        raw_post.reviewed_at = extraction.reviewed_at
+        raw_post.reviewed_by = extraction.reviewed_by
 
     inserted_count = 0
     skipped_count = 0
@@ -1481,6 +3640,11 @@ async def approve_extraction_batch(
         extraction.reviewed_by = EXTRACTION_REVIEWER
         extraction.review_note = None
         extraction.applied_kol_view_id = first_applied_kol_view_id
+        raw_post = await db.get(RawPost, extraction.raw_post_id)
+        if raw_post is not None:
+            raw_post.review_status = ReviewStatus.approved
+            raw_post.reviewed_at = extraction.reviewed_at
+            raw_post.reviewed_by = extraction.reviewed_by
         await db.commit()
     except HTTPException:
         await db.rollback()
@@ -1516,6 +3680,11 @@ async def reject_extraction(
     extraction.reviewed_by = EXTRACTION_REVIEWER
     extraction.review_note = (payload.reason or "").strip() or None
     extraction.applied_kol_view_id = None
+    raw_post = await db.get(RawPost, extraction.raw_post_id)
+    if raw_post is not None:
+        raw_post.review_status = ReviewStatus.rejected
+        raw_post.reviewed_at = extraction.reviewed_at
+        raw_post.reviewed_by = extraction.reviewed_by
     await db.commit()
     await db.refresh(extraction)
     return extraction

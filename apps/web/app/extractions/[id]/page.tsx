@@ -373,7 +373,7 @@ export default function ExtractionDetailPage() {
     if (reExtractCooldown) {
       return;
     }
-    if (!window.confirm("确认重新提取？这会创建一个新的 pending extraction。")) {
+    if (!window.confirm("确认强制重新提取？这会创建新的 extraction 版本并消耗预算（不会覆盖历史）。")) {
       return;
     }
     setActionError(null);
@@ -381,7 +381,7 @@ export default function ExtractionDetailPage() {
     window.setTimeout(() => setReExtractCooldown(false), 3000);
     setReExtracting(true);
     try {
-      const res = await fetch(`/api/raw-posts/${extraction.raw_post_id}/extract`, { method: "POST" });
+      const res = await fetch(`/api/extractions/${extraction.id}/re-extract`, { method: "POST" });
       const body = (await res.json()) as { id?: number; detail?: string };
       if (!res.ok || typeof body.id !== "number") {
         throw new Error(getHttpErrorMessage(res.status, body.detail, `Re-extract failed: ${res.status}`));
@@ -741,7 +741,7 @@ export default function ExtractionDetailPage() {
               disabled={reExtracting || reExtractCooldown}
               style={{ marginBottom: "10px" }}
             >
-              {reExtracting ? "Re-extracting..." : "Re-extract（需确认）"}
+              {reExtracting ? "Re-extracting..." : "Re-extract with AI (force)"}
             </button>
             {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
             <form

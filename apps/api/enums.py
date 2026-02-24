@@ -21,6 +21,12 @@ class ExtractionStatus(str, Enum):
     rejected = "rejected"
 
 
+class ReviewStatus(str, Enum):
+    unreviewed = "unreviewed"
+    approved = "approved"
+    rejected = "rejected"
+
+
 HORIZON_ORDER: list[str] = [
     Horizon.intraday.value,
     Horizon.one_week.value,

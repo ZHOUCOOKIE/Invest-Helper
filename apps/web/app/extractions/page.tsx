@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type RawPost = {
   id: number;
@@ -28,6 +28,12 @@ type Extraction = {
   applied_kol_view_id: number | null;
   created_at: string;
   raw_post: RawPost;
+};
+
+type ClearPendingResponse = {
+  deleted_extractions_count: number;
+  deleted_raw_posts_count: number;
+  scoped_author_handle: string | null;
 };
 
 const PAGE_SIZE = 20;
@@ -57,11 +63,15 @@ export default function ExtractionsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(searchParams.get("msg"));
+  const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
+  const requestSeqRef = useRef(0);
 
   const canPrev = useMemo(() => offset > 0, [offset]);
   const canNext = useMemo(() => items.length === PAGE_SIZE, [items.length]);
 
   const load = async () => {
+    const requestSeq = requestSeqRef.current + 1;
+    requestSeqRef.current = requestSeq;
     setLoading(true);
     setError(null);
     try {
@@ -72,11 +82,23 @@ export default function ExtractionsPage() {
       if (!res.ok) {
         throw new Error("detail" in body ? (body.detail ?? "Load failed") : "Load failed");
       }
-      setItems(body as Extraction[]);
+      if (requestSeq !== requestSeqRef.current) return;
+      const dedupedMap = new Map<number, Extraction>();
+      for (const item of body as Extraction[]) {
+        dedupedMap.set(item.id, item);
+      }
+      const deduped = Array.from(dedupedMap.values()).sort((a, b) => {
+        if (a.created_at === b.created_at) return b.id - a.id;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+      setItems(deduped);
     } catch (err) {
+      if (requestSeq !== requestSeqRef.current) return;
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
-      setLoading(false);
+      if (requestSeq === requestSeqRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -102,6 +124,34 @@ export default function ExtractionsPage() {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Reject failed");
+    }
+  };
+
+  const clearPending = async () => {
+    const confirmText = window.prompt(
+      "Dangerous operation: this will hard delete pending/failed extractions. Type YES to continue.",
+      "",
+    );
+    if (confirmText !== "YES") return;
+    setError(null);
+    setMessage(null);
+    try {
+      const params = new URLSearchParams({
+        confirm: "YES",
+        also_delete_raw_posts: clearAlsoDeleteRawPosts ? "true" : "false",
+      });
+      const res = await fetch(`/api/admin/extractions/pending?${params.toString()}`, { method: "DELETE" });
+      const body = (await res.json()) as ClearPendingResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error("detail" in body ? (body.detail ?? "Clear pending failed") : "Clear pending failed");
+      }
+      const done = body as ClearPendingResponse;
+      setMessage(
+        `Deleted extractions=${done.deleted_extractions_count}, raw_posts=${done.deleted_raw_posts_count}.`,
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Clear pending failed");
     }
   };
 
@@ -131,6 +181,21 @@ export default function ExtractionsPage() {
         <button type="button" onClick={() => void load()} disabled={loading}>
           {loading ? "Loading..." : "Refresh"}
         </button>
+        {status === "pending" && (
+          <>
+            <label>
+              <input
+                type="checkbox"
+                checked={clearAlsoDeleteRawPosts}
+                onChange={(event) => setClearAlsoDeleteRawPosts(event.target.checked)}
+              />{" "}
+              also delete raw posts
+            </label>
+            <button type="button" onClick={() => void clearPending()} disabled={loading}>
+              Clear Pending (Delete)
+            </button>
+          </>
+        )}
       </div>
 
       {message && <p style={{ color: "green" }}>{message}</p>}

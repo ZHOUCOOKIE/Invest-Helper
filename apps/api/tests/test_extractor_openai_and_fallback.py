@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -326,10 +326,9 @@ def test_openai_call_budget_falls_back_to_dummy_after_budget_exhausted(
 
     assert second.status_code == 201
     second_body = second.json()
-    assert second_body["extractor_name"] == "dummy"
-    assert second_body["last_error"] is not None
-    assert "budget_exhausted" in second_body["last_error"]
-    assert second_body["extracted_json"]["meta"]["fallback_reason"] == "budget_exhausted"
+    assert second_body["id"] == first_body["id"]
+    assert second_body["extractor_name"] == "openai_structured"
+    assert second_body["last_error"] is None
     assert call_count["n"] == 1
 
 
@@ -352,6 +351,195 @@ def test_extractor_status_includes_openrouter_and_budget_fields(monkeypatch: pyt
     assert body["base_url"] == "https://openrouter.ai/api/v1"
     assert body["call_budget_remaining"] == 3
     assert body["max_output_tokens"] == 888
+
+
+def test_runtime_settings_budget_get_and_post(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXTRACTOR_MODE", "auto")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "5")
+    monkeypatch.setenv("OPENAI_MODEL", "qwen/qwen-2.5-72b-instruct")
+
+    client = TestClient(app)
+
+    initial = client.get("/settings/runtime")
+    assert initial.status_code == 200
+    initial_body = initial.json()
+    assert initial_body["extractor_mode"] == "auto"
+    assert initial_body["model"] == "qwen/qwen-2.5-72b-instruct"
+    assert initial_body["has_api_key"] is True
+    assert initial_body["budget_total"] == 5
+    assert initial_body["budget_remaining"] == 5
+    assert "runtime_overrides" in initial_body
+
+    updated = client.post("/settings/runtime/call-budget", json={"call_budget": 12})
+    assert updated.status_code == 200
+    updated_body = updated.json()
+    assert updated_body["budget_total"] == 12
+    assert updated_body["budget_remaining"] == 12
+    assert updated_body["runtime_overrides"]["call_budget"] is True
+
+
+def test_runtime_default_budget_is_30_per_hour(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
+    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "30")
+
+    client = TestClient(app)
+    response = client.get("/settings/runtime")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["default_budget_total"] == 30
+    assert body["budget_total"] == 30
+
+
+def test_runtime_budget_resets_on_new_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
+    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "2")
+    monkeypatch.setenv("CALL_BUDGET_WINDOW_MINUTES", "60")
+    now_ref = {"value": datetime(2026, 2, 23, 10, 0, tzinfo=UTC)}
+
+    def fake_now():
+        return now_ref["value"]
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 78,
+            "summary": "window test",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-23",
+            "event_tags": [],
+        }
+
+    monkeypatch.setattr("main._utc_now", fake_now)
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    initial = client.get("/settings/runtime")
+    assert initial.status_code == 200
+    assert initial.json()["budget_remaining"] == 2
+
+    extracted = client.post("/raw-posts/1/extract")
+    assert extracted.status_code == 201
+    after_extract = client.get("/settings/runtime")
+    assert after_extract.status_code == 200
+    assert after_extract.json()["budget_remaining"] == 1
+
+    now_ref["value"] = now_ref["value"] + timedelta(minutes=61)
+    after_window = client.get("/settings/runtime")
+    app.dependency_overrides.clear()
+
+    assert after_window.status_code == 200
+    body = after_window.json()
+    assert body["budget_total"] == 2
+    assert body["budget_remaining"] == 2
+
+
+def test_runtime_burst_enable_and_expire_restores_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
+    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "5")
+    now_ref = {"value": datetime(2026, 2, 23, 12, 0, tzinfo=UTC)}
+
+    def fake_now():
+        return now_ref["value"]
+
+    monkeypatch.setattr("main._utc_now", fake_now)
+    client = TestClient(app)
+
+    burst_on = client.post(
+        "/settings/runtime/burst",
+        json={"enabled": True, "call_budget": 500, "duration_minutes": 10},
+    )
+    assert burst_on.status_code == 200
+    on_body = burst_on.json()
+    assert on_body["burst"]["enabled"] is True
+    assert on_body["budget_total"] == 500
+
+    now_ref["value"] = now_ref["value"] + timedelta(minutes=11)
+    after_expire = client.get("/settings/runtime")
+    assert after_expire.status_code == 200
+    expired_body = after_expire.json()
+    assert expired_body["burst"]["enabled"] is False
+    assert expired_body["budget_total"] == 5
+
+    burst_off = client.post(
+        "/settings/runtime/burst",
+        json={"enabled": False, "call_budget": 0, "duration_minutes": 1},
+    )
+    assert burst_off.status_code == 200
+    assert burst_off.json()["burst"]["enabled"] is False
+
+
+def test_runtime_burst_unlimited_safe_sets_large_budget_and_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
+    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "30")
+    client = TestClient(app)
+
+    response = client.post(
+        "/settings/runtime/burst",
+        json={"enabled": True, "mode": "unlimited_safe", "call_budget": 1, "duration_minutes": 30},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["budget_total"] == 100000
+    assert body["burst"]["enabled"] is True
+    assert body["burst"]["mode"] == "unlimited_safe"
+
+
+def test_runtime_throttle_update_clamps_to_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXTRACT_MAX_CONCURRENCY_MAX", "4")
+    monkeypatch.setenv("EXTRACT_MAX_RPM_MAX", "60")
+    monkeypatch.setenv("EXTRACT_BATCH_SIZE_MAX", "50")
+    monkeypatch.setenv("EXTRACT_BATCH_SLEEP_MS_MIN", "100")
+
+    client = TestClient(app)
+    response = client.post(
+        "/settings/runtime/throttle",
+        json={
+            "max_concurrency": 999,
+            "max_rpm": 9999,
+            "batch_size": 999,
+            "batch_sleep_ms": 1,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["throttle"]["max_concurrency"] == 4
+    assert body["throttle"]["max_rpm"] == 60
+    assert body["throttle"]["batch_size"] == 50
+    assert body["throttle"]["batch_sleep_ms"] == 100
+
+
+def test_runtime_call_budget_override_visibility_and_clear(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
+    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "50")
+
+    client = TestClient(app)
+    set_override = client.post("/settings/runtime/call-budget", json={"call_budget": 3})
+    assert set_override.status_code == 200
+    set_body = set_override.json()
+    assert set_body["budget_total"] == 3
+    assert set_body["default_budget_total"] == 50
+    assert set_body["call_budget_override_enabled"] is True
+    assert set_body["call_budget_override_value"] == 3
+
+    clear_resp = client.post("/settings/runtime/call-budget/clear")
+    assert clear_resp.status_code == 200
+    cleared = clear_resp.json()
+    assert cleared["call_budget_override_enabled"] is False
+    assert cleared["call_budget_override_value"] is None
+    assert cleared["default_budget_total"] == 50
+    assert cleared["budget_total"] == 50
 
 
 def test_structured_unsupported_retries_once_with_json_mode_and_succeeds(
@@ -938,8 +1126,9 @@ def test_auto_approve_repeat_trigger_skips_same_key(monkeypatch: pytest.MonkeyPa
     assert first_body["status"] == ExtractionStatus.approved.value
     assert second.status_code == 201
     second_body = second.json()
-    assert second_body["auto_applied_count"] == 0
-    assert second_body["status"] == ExtractionStatus.pending.value
+    assert second_body["id"] == first_body["id"]
+    assert second_body["auto_applied_count"] == first_body["auto_applied_count"]
+    assert second_body["status"] == ExtractionStatus.approved.value
     assert len(fake_db._data[KolView]) == 1
     only_view = list(fake_db._data[KolView].values())[0]
     assert only_view.summary == "BTC view v1"

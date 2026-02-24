@@ -18,7 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from enums import ExtractionStatus, Horizon, Stance
+from enums import ExtractionStatus, Horizon, ReviewStatus, Stance
 
 enum_values = lambda enum_cls: [item.value for item in enum_cls]
 
@@ -74,6 +74,9 @@ class Kol(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     views: Mapped[list["KolView"]] = relationship(back_populates="kol", cascade="all, delete-orphan")
+    profile_weights: Mapped[list["ProfileKolWeight"]] = relationship(
+        back_populates="kol", cascade="all, delete-orphan"
+    )
 
 
 class KolView(Base):
@@ -137,6 +140,7 @@ class RawPost(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    kol_id: Mapped[int | None] = mapped_column(ForeignKey("kols.id", ondelete="SET NULL"), nullable=True)
     author_handle: Mapped[str] = mapped_column(String(128), nullable=False)
     external_id: Mapped[str] = mapped_column(String(128), nullable=False)
     url: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -145,6 +149,21 @@ class RawPost(Base):
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    review_status: Mapped[ReviewStatus] = mapped_column(
+        SQLEnum(
+            ReviewStatus,
+            name="review_status_enum",
+            native_enum=False,
+            validate_strings=True,
+            create_constraint=True,
+            values_callable=enum_values,
+        ),
+        nullable=False,
+        default=ReviewStatus.unreviewed,
+        server_default=text("'unreviewed'"),
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     raw_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     extractions: Mapped[list["PostExtraction"]] = relationship(
@@ -157,6 +176,12 @@ class PostExtraction(Base):
     __table_args__ = (
         Index("ix_post_extractions_raw_post_created", "raw_post_id", "created_at"),
         Index("ix_post_extractions_status_created", "status", "created_at"),
+        Index(
+            "uq_post_extractions_active_raw_post_id",
+            "raw_post_id",
+            unique=True,
+            postgresql_where=text("status = 'pending' AND (last_error IS NULL OR btrim(last_error) = '')"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -211,3 +236,76 @@ class PostExtraction(Base):
     )
 
     raw_post: Mapped["RawPost"] = relationship(back_populates="extractions")
+
+
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    kol_weights: Mapped[list["ProfileKolWeight"]] = relationship(
+        back_populates="profile", cascade="all, delete-orphan"
+    )
+    markets: Mapped[list["ProfileMarket"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
+    digests: Mapped[list["DailyDigest"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
+
+
+class ProfileKolWeight(Base):
+    __tablename__ = "profile_kol_weights"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "kol_id", name="uq_profile_kol_weights_profile_kol"),
+        Index("ix_profile_kol_weights_profile_id", "profile_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False)
+    kol_id: Mapped[int] = mapped_column(ForeignKey("kols.id", ondelete="CASCADE"), nullable=False)
+    weight: Mapped[float] = mapped_column(nullable=False, server_default=text("1.0"), default=1.0)
+    enabled: Mapped[bool] = mapped_column(nullable=False, server_default=text("true"), default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    profile: Mapped["UserProfile"] = relationship(back_populates="kol_weights")
+    kol: Mapped["Kol"] = relationship(back_populates="profile_weights")
+
+
+class ProfileMarket(Base):
+    __tablename__ = "profile_markets"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "market", name="uq_profile_markets_profile_market"),
+        Index("ix_profile_markets_profile_id", "profile_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False)
+    market: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    profile: Mapped["UserProfile"] = relationship(back_populates="markets")
+
+
+class DailyDigest(Base):
+    __tablename__ = "daily_digests"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "digest_date", "version", name="uq_daily_digests_profile_date_version"),
+        Index("ix_daily_digests_profile_date_version", "profile_id", "digest_date", "version"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    digest_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    profile: Mapped["UserProfile"] = relationship(back_populates="digests")

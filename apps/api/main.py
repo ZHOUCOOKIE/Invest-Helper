@@ -1,6 +1,7 @@
 from collections import Counter, defaultdict, deque
 import asyncio
 from datetime import UTC, date, datetime, timedelta
+from enum import Enum
 import hashlib
 import json
 import random
@@ -9,8 +10,10 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +35,7 @@ from schemas import (
     AssetViewsMetaRead,
     AssetRead,
     AdminDeletePendingExtractionsRead,
+    AdminBackfillAutoReviewRead,
     AdminHardDeleteRead,
     AssetViewsRead,
     AutoAppliedViewRead,
@@ -45,6 +49,9 @@ from schemas import (
     DashboardRead,
     DashboardTopAssetRead,
     DailyDigestRead,
+    ExtractJobCreateRead,
+    ExtractJobCreateRequest,
+    ExtractJobRead,
     ExtractorStatusRead,
     ExtractionApproveRequest,
     ExtractionApproveBatchRequest,
@@ -83,14 +90,18 @@ from schemas import (
     XFollowingImportErrorRead,
     XFollowingImportKolRead,
     XFollowingImportStatsRead,
+    AutoReviewBackfillErrorRead,
 )
 from services.extraction import (
+    EXTRACTION_OUTPUT_TEXT_JSON,
     DummyExtractor,
     OpenAIFallbackError,
     OpenAIExtractor,
+    detect_provider_from_base_url,
     default_extracted_json,
     normalize_extracted_json,
     get_openai_call_budget_remaining,
+    resolve_extraction_output_mode,
     reset_openai_call_budget_counter,
     select_extractor,
     try_consume_openai_call_budget,
@@ -114,6 +125,7 @@ from settings import get_settings
 app = FastAPI(title="InvestPulse API")
 EXTRACTION_REVIEWER = "human-review"
 AUTO_EXTRACTION_REVIEWER = "auto"
+AUTO_REVIEW_CONFIDENCE_THRESHOLD = 70
 REEXTRACT_ATTEMPTS: dict[int, deque[datetime]] = defaultdict(deque)
 RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE: int | None = None
 UNLIMITED_SAFE_BURST_BUDGET = 100000
@@ -126,6 +138,11 @@ RUNTIME_BURST_STATE: dict[str, Any] = {
 RUNTIME_THROTTLE_OVERRIDE: dict[str, int] = {}
 RUNTIME_BUDGET_WINDOW_START: datetime | None = None
 RUNTIME_BUDGET_WINDOW_END: datetime | None = None
+EXTRACT_JOBS: dict[str, dict[str, Any]] = {}
+EXTRACT_JOBS_LOCK = asyncio.Lock()
+EXTRACT_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
+EXTRACT_JOB_IDEMPOTENCY: dict[str, str] = {}
+EXTRACT_JOB_SESSION_FACTORY = AsyncSessionLocal
 
 # 先放开本地前端跨域，后面再收紧
 app.add_middleware(
@@ -135,6 +152,68 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid4().hex
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["x-request-id"] = request_id
+    return response
+
+
+def _json_error(
+    request: Request,
+    *,
+    status_code: int,
+    error_code: str,
+    message: str,
+    detail: Any,
+) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", None) or uuid4().hex
+    body = {
+        "request_id": request_id,
+        "error_code": error_code,
+        "message": message,
+        "detail": detail,
+    }
+    return JSONResponse(status_code=status_code, content=body, headers={"x-request-id": request_id})
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, exc: HTTPException):
+    detail = exc.detail if exc.detail is not None else "HTTP error"
+    message = detail if isinstance(detail, str) else "HTTP error"
+    return _json_error(
+        request,
+        status_code=exc.status_code,
+        error_code="http_error",
+        message=message,
+        detail=detail,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_exception(request: Request, exc: RequestValidationError):
+    return _json_error(
+        request,
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        error_code="request_validation_error",
+        message="Request validation failed",
+        detail=exc.errors(),
+    )
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_exception(request: Request, exc: Exception):
+    return _json_error(
+        request,
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        error_code="internal_server_error",
+        message="Internal Server Error",
+        detail=str(exc),
+    )
 
 
 def is_newer_view(candidate: KolView, current: KolView) -> bool:
@@ -215,24 +294,120 @@ def _build_last_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _is_failed_extraction(extraction: PostExtraction | None) -> bool:
+def _extractor_provider_output(extractor: DummyExtractor | OpenAIExtractor) -> tuple[str, str]:
+    if isinstance(extractor, OpenAIExtractor):
+        return extractor.provider_detected, extractor.output_mode
+    return ("dummy", "dummy")
+
+
+def _build_extraction_meta(
+    *,
+    extracted_json: dict[str, Any],
+    extractor: DummyExtractor | OpenAIExtractor,
+    fallback_reason: str | None,
+    last_error: str | None,
+) -> dict[str, Any]:
+    base_meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
+    safe_meta = dict(base_meta)
+    provider_detected, output_mode_used = _extractor_provider_output(extractor)
+    safe_meta.setdefault("provider_detected", provider_detected)
+    safe_meta.setdefault("output_mode_used", output_mode_used)
+    safe_meta.setdefault("parse_strategy_used", "none" if isinstance(extractor, DummyExtractor) else "unknown")
+    safe_meta.setdefault("raw_len", 0)
+    safe_meta.setdefault("repaired", False)
+    if "extraction_mode" not in safe_meta:
+        safe_meta["extraction_mode"] = "dummy" if isinstance(extractor, DummyExtractor) else output_mode_used
+    if fallback_reason:
+        safe_meta["fallback_reason"] = fallback_reason
+    if isinstance(extractor, DummyExtractor) and fallback_reason:
+        safe_meta["dummy_fallback"] = True
+    if last_error:
+        safe_meta["parse_error"] = safe_meta.get("parse_error") or ("json" in last_error.lower() and "openai" in last_error.lower())
+    return safe_meta
+
+
+class ClassifiedExtractionState(str, Enum):
+    approved = "APPROVED"
+    rejected = "REJECTED"
+    success = "SUCCESS"
+    failed = "FAILED"
+    pending = "PENDING"
+    no_extraction = "NO_EXTRACTION"
+
+
+def _is_valid_extracted_object(extracted_json: Any) -> bool:
+    if isinstance(extracted_json, dict):
+        return True
+    if not isinstance(extracted_json, str):
+        return False
+    try:
+        parsed = json.loads(extracted_json)
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(parsed, dict)
+
+
+def classify_extraction_state(
+    extraction: PostExtraction | None,
+    raw_post: RawPost | None,
+) -> ClassifiedExtractionState:
+    review_status = _review_status_key(raw_post) if raw_post is not None else ReviewStatus.unreviewed.value
+    if review_status == ReviewStatus.rejected.value:
+        return ClassifiedExtractionState.rejected
+    if review_status == ReviewStatus.approved.value:
+        return ClassifiedExtractionState.approved
+
     if extraction is None:
-        return False
-    return bool((extraction.last_error or "").strip())
+        return ClassifiedExtractionState.no_extraction
+
+    status_value = extraction.status.value if hasattr(extraction.status, "value") else str(extraction.status)
+    status_key = status_value.strip().lower()
+    if status_key == ExtractionStatus.rejected.value:
+        return ClassifiedExtractionState.rejected
+    if status_key == ExtractionStatus.approved.value:
+        return ClassifiedExtractionState.approved
+
+    meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json, dict) else None
+    parse_error = bool(meta.get("parse_error")) if isinstance(meta, dict) else False
+    dummy_fallback = bool(meta.get("dummy_fallback")) if isinstance(meta, dict) else False
+    has_last_error = bool((extraction.last_error or "").strip())
+    is_dummy = (extraction.extractor_name or "").strip().lower() == "dummy"
+    if has_last_error or parse_error or dummy_fallback or is_dummy:
+        return ClassifiedExtractionState.failed
+
+    if _is_valid_extracted_object(extraction.extracted_json):
+        return ClassifiedExtractionState.success
+
+    if status_key == ExtractionStatus.pending.value:
+        return ClassifiedExtractionState.pending
+    return ClassifiedExtractionState.pending
 
 
-def _is_active_extraction(extraction: PostExtraction | None) -> bool:
-    if extraction is None:
-        return False
-    return extraction.status == ExtractionStatus.pending and not _is_failed_extraction(extraction)
+def _is_failed_extraction(extraction: PostExtraction | None, raw_post: RawPost | None = None) -> bool:
+    return classify_extraction_state(extraction, raw_post) == ClassifiedExtractionState.failed
 
 
-def _is_successful_extraction(extraction: PostExtraction | None) -> bool:
-    if extraction is None:
-        return False
-    if _is_failed_extraction(extraction):
-        return False
-    return extraction.status in {ExtractionStatus.pending, ExtractionStatus.approved}
+def _is_active_extraction(extraction: PostExtraction | None, raw_post: RawPost | None = None) -> bool:
+    return classify_extraction_state(extraction, raw_post) == ClassifiedExtractionState.pending
+
+
+def _is_successful_extraction(extraction: PostExtraction | None, raw_post: RawPost | None = None) -> bool:
+    return classify_extraction_state(extraction, raw_post) in {
+        ClassifiedExtractionState.success,
+        ClassifiedExtractionState.approved,
+    }
+
+
+def _has_extracted_result(extraction: PostExtraction | None, raw_post: RawPost | None = None) -> bool:
+    return classify_extraction_state(extraction, raw_post) in {
+        ClassifiedExtractionState.success,
+        ClassifiedExtractionState.approved,
+        ClassifiedExtractionState.rejected,
+    }
+
+
+def _is_result_available_extraction(extraction: PostExtraction | None, raw_post: RawPost | None = None) -> bool:
+    return _has_extracted_result(extraction, raw_post)
 
 
 def _extraction_status_key(extraction: PostExtraction) -> str:
@@ -253,16 +428,10 @@ def _terminal_review_skip_kind(
     raw_post: RawPost,
     latest_extraction: PostExtraction | None,
 ) -> str | None:
-    review_status = _review_status_key(raw_post)
-    if review_status == ReviewStatus.rejected.value:
+    state = classify_extraction_state(latest_extraction, raw_post)
+    if state == ClassifiedExtractionState.rejected:
         return "skipped_already_rejected"
-    if review_status == ReviewStatus.approved.value:
-        return "skipped_already_approved"
-
-    latest_status = _extraction_status_key(latest_extraction) if latest_extraction is not None else None
-    if latest_status == ExtractionStatus.rejected.value:
-        return "skipped_already_rejected"
-    if latest_status == ExtractionStatus.approved.value:
+    if state == ClassifiedExtractionState.approved:
         return "skipped_already_approved"
     return None
 
@@ -346,6 +515,8 @@ async def _raw_post_matches_enabled_x_kol(db: AsyncSession, raw_post: RawPost) -
     if raw_post.platform.strip().lower() != "x":
         return True
     enabled_by_id, enabled_by_handle = await _enabled_x_kol_maps(db)
+    if not enabled_by_id and not enabled_by_handle:
+        return True
     if raw_post.kol_id is not None and raw_post.kol_id in enabled_by_id:
         return True
     handle_key = _normalize_author_handle(raw_post.author_handle or "")
@@ -454,6 +625,7 @@ def reset_runtime_counters() -> None:
     RUNTIME_THROTTLE_OVERRIDE.clear()
     RUNTIME_BUDGET_WINDOW_START = None
     RUNTIME_BUDGET_WINDOW_END = None
+    EXTRACT_JOB_IDEMPOTENCY.clear()
     reset_reextract_rate_limiter()
     reset_openai_call_budget_counter()
 
@@ -829,8 +1001,12 @@ def _resolve_extractor_name(
         return extractor.extractor_name
 
     meta = extracted_json.get("meta")
+    output_mode_used = meta.get("output_mode_used") if isinstance(meta, dict) else None
     extraction_mode = meta.get("extraction_mode") if isinstance(meta, dict) else None
-    if extraction_mode == "json_mode" and "openrouter.ai" in settings_base_url.lower():
+    if (
+        output_mode_used == EXTRACTION_OUTPUT_TEXT_JSON
+        or extraction_mode == EXTRACTION_OUTPUT_TEXT_JSON
+    ) and "openrouter.ai" in settings_base_url.lower():
         return "openrouter_json_mode"
     return extractor.extractor_name
 
@@ -980,6 +1156,7 @@ async def _auto_apply_extraction_views(
     *,
     extraction: PostExtraction,
     raw_post: RawPost,
+    force_apply: bool = False,
 ) -> None:
     settings = get_settings()
     extraction.auto_applied_count = 0
@@ -987,7 +1164,7 @@ async def _auto_apply_extraction_views(
     extraction.auto_applied_kol_view_ids = None
     setattr(extraction, "auto_applied_asset_view_keys", [])
     setattr(extraction, "auto_applied_views", [])
-    if not settings.auto_approve_enabled or extraction.status != ExtractionStatus.pending:
+    if (not settings.auto_approve_enabled and not force_apply) or extraction.status != ExtractionStatus.pending:
         print(
             "[auto-approve]",
             {
@@ -1171,6 +1348,76 @@ def _attach_extraction_auto_approve_settings(extraction: PostExtraction) -> None
     settings = get_settings()
     setattr(extraction, "auto_approve_confidence_threshold", settings.auto_approve_confidence_threshold)
     setattr(extraction, "auto_approve_min_display_confidence", settings.auto_approve_min_display_confidence)
+    setattr(extraction, "auto_reject_confidence_threshold", max(0, min(100, settings.auto_reject_confidence_threshold)))
+
+
+def _coerce_extraction_confidence(extracted_json: dict[str, Any]) -> int | None:
+    confidence_raw = extracted_json.get("confidence")
+    if not isinstance(confidence_raw, (int, float)):
+        return None
+    return int(max(0, min(100, round(float(confidence_raw)))))
+
+
+async def postprocess_auto_review(
+    *,
+    db: AsyncSession,
+    extraction: PostExtraction,
+    raw_post: RawPost,
+) -> str | None:
+    threshold = AUTO_REVIEW_CONFIDENCE_THRESHOLD
+    if classify_extraction_state(extraction, raw_post) != ClassifiedExtractionState.success:
+        return None
+    if not isinstance(extraction.extracted_json, dict):
+        return None
+    model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
+    if model_confidence is None:
+        return None
+
+    base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
+    reviewed_at = datetime.now(UTC)
+    if model_confidence < threshold:
+        extraction.extracted_json = {
+            **extraction.extracted_json,
+            "meta": {
+                **base_meta,
+                "auto_rejected": True,
+                "auto_review_threshold": threshold,
+                "auto_review_reason": "confidence_below_threshold",
+                "model_confidence": model_confidence,
+                "auto_reject_reason": "confidence_below_threshold",
+                "auto_reject_threshold": threshold,
+            },
+        }
+        extraction.status = ExtractionStatus.rejected
+        extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
+        extraction.reviewed_at = reviewed_at
+        extraction.review_note = "auto-rejected: confidence_below_threshold"
+        raw_post.review_status = ReviewStatus.rejected
+        raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
+        raw_post.reviewed_at = reviewed_at
+        return "rejected"
+
+    extraction.extracted_json = {
+        **extraction.extracted_json,
+        "meta": {
+            **base_meta,
+            "auto_approved": True,
+            "auto_review_threshold": threshold,
+            "auto_review_reason": "confidence_at_or_above_threshold",
+            "model_confidence": model_confidence,
+        },
+    }
+    await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post, force_apply=True)
+    if extraction.status == ExtractionStatus.pending:
+        extraction.status = ExtractionStatus.approved
+        extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
+        extraction.reviewed_at = reviewed_at
+        if not extraction.review_note:
+            extraction.review_note = "auto-approved"
+        raw_post.review_status = ReviewStatus.approved
+        raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
+        raw_post.reviewed_at = reviewed_at
+    return "approved"
 
 
 async def create_pending_extraction(
@@ -1195,7 +1442,7 @@ async def create_pending_extraction(
             ),
             reverse=True,
         )
-        active = next((item for item in existing_rows if _is_active_extraction(item)), None)
+        active = next((item for item in existing_rows if _is_active_extraction(item, raw_post)), None)
         if active is not None:
             _attach_extraction_auto_approve_settings(active)
             return active
@@ -1209,9 +1456,10 @@ async def create_pending_extraction(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"raw post already {terminal_skip_kind.replace('skipped_already_', '')}",
             )
-        if latest is not None and _is_successful_extraction(latest):
-            _attach_extraction_auto_approve_settings(latest)
-            return latest
+        any_result = next((item for item in existing_rows if _is_result_available_extraction(item, raw_post)), None)
+        if any_result is not None:
+            _attach_extraction_auto_approve_settings(any_result)
+            return any_result
 
     settings = get_settings()
     _refresh_runtime_budget_state(settings)
@@ -1240,6 +1488,8 @@ async def create_pending_extraction(
     last_error: str | None = None
     budget_exhausted = False
     fallback_reason: str | None = None
+    force_fail_reason: str | None = None
+    allow_dummy_fallback = bool(settings.dummy_fallback) or settings.extractor_mode.strip().lower() == "dummy"
 
     runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
     if isinstance(extractor, OpenAIExtractor) and not try_consume_openai_call_budget(
@@ -1251,23 +1501,29 @@ async def create_pending_extraction(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="openai call budget exhausted for current process; increase runtime call budget and retry",
             )
-        budget_exhausted = True
-        extractor = DummyExtractor()
-        extractor.set_prompt_bundle(prompt_bundle)
         fallback_reason = "budget_exhausted"
-
-    try:
-        extracted_json = extractor.extract(extraction_input)
-    except Exception as exc:  # noqa: BLE001
-        if raise_retryable_errors and isinstance(extractor, OpenAIExtractor) and _is_retryable_extraction_error(exc):
-            raise
-        last_error = _build_last_error(exc)
-        if isinstance(exc, OpenAIFallbackError):
-            fallback_reason = exc.fallback_reason
-        if isinstance(extractor, OpenAIExtractor):
+        if allow_dummy_fallback:
+            budget_exhausted = True
             extractor = DummyExtractor()
             extractor.set_prompt_bundle(prompt_bundle)
+        else:
+            force_fail_reason = "budget_exhausted: call budget reached and dummy_fallback disabled"
+
+    if force_fail_reason:
+        last_error = force_fail_reason
+    else:
+        try:
             extracted_json = extractor.extract(extraction_input)
+        except Exception as exc:  # noqa: BLE001
+            if raise_retryable_errors and isinstance(extractor, OpenAIExtractor) and _is_retryable_extraction_error(exc):
+                raise
+            last_error = _build_last_error(exc)
+            if isinstance(exc, OpenAIFallbackError):
+                fallback_reason = exc.fallback_reason
+            if isinstance(extractor, OpenAIExtractor) and allow_dummy_fallback:
+                extractor = DummyExtractor()
+                extractor.set_prompt_bundle(prompt_bundle)
+                extracted_json = extractor.extract(extraction_input)
 
     if isinstance(extracted_json, dict):
         extracted_json = extracted_json.copy()
@@ -1281,13 +1537,12 @@ async def create_pending_extraction(
         known_symbols=known_symbols,
     )
 
-    base_meta = extracted_json.get("meta") if isinstance(extracted_json, dict) else None
-    safe_meta = base_meta if isinstance(base_meta, dict) else {}
-    if "extraction_mode" not in safe_meta:
-        safe_meta = {**safe_meta, "extraction_mode": "dummy" if isinstance(extractor, DummyExtractor) else "structured"}
-    if fallback_reason == "structured_unsupported" and "fallback_reason" not in safe_meta:
-        safe_meta = {**safe_meta, "fallback_reason": "structured_unsupported"}
-    extracted_json["meta"] = safe_meta
+    extracted_json["meta"] = _build_extraction_meta(
+        extracted_json=extracted_json,
+        extractor=extractor,
+        fallback_reason=fallback_reason,
+        last_error=last_error,
+    )
 
     if truncation_meta:
         extracted_json["meta"] = {
@@ -1300,6 +1555,7 @@ async def create_pending_extraction(
         extracted_json["meta"] = {
             **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
             "fallback_reason": "budget_exhausted",
+            "dummy_fallback": True,
         }
     if force_reextract:
         extracted_json["meta"] = {
@@ -1344,8 +1600,12 @@ async def create_pending_extraction(
     )
     db.add(extraction)
     await db.flush()
+    auto_review_outcome = await postprocess_auto_review(db=db, extraction=extraction, raw_post=raw_post)
+    setattr(extraction, "auto_rejected", auto_review_outcome == "rejected")
+    setattr(extraction, "auto_approved", auto_review_outcome == "approved")
     try:
-        await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post)
+        if auto_review_outcome is None:
+            await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post)
     except Exception as exc:  # noqa: BLE001
         auto_error = _build_last_error(exc)
         extraction.last_error = auto_error if not extraction.last_error else f"{extraction.last_error}; auto_apply={auto_error}"
@@ -1402,7 +1662,8 @@ async def _raw_post_ids_with_successful_extractions(
     for extraction in result.scalars().all():
         if extraction.raw_post_id not in raw_post_ids:
             continue
-        if _is_successful_extraction(extraction):
+        raw_post = await db.get(RawPost, extraction.raw_post_id)
+        if _is_result_available_extraction(extraction, raw_post):
             successful_ids.add(extraction.raw_post_id)
     return successful_ids
 
@@ -1411,10 +1672,12 @@ async def _has_successful_extraction(
     db: AsyncSession,
     *,
     raw_post_id: int,
+    raw_post: RawPost | None = None,
 ) -> bool:
     result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
+    target_raw_post = raw_post if raw_post is not None else await db.get(RawPost, raw_post_id)
     for extraction in result.scalars().all():
-        if _is_successful_extraction(extraction):
+        if _is_result_available_extraction(extraction, target_raw_post):
             return True
     return False
 
@@ -2123,8 +2386,8 @@ async def import_x_posts(
     payload: list[XImportItemCreate],
     trigger_extraction: bool = Query(default=False),
     author_handle_override: str | None = Query(default=None),
-    only_followed: bool = Query(default=True),
-    allow_unknown_handles: bool = Query(default=False),
+    only_followed: bool = Query(default=False),
+    allow_unknown_handles: bool = Query(default=True),
     db: AsyncSession = Depends(get_db),
 ):
     inserted_raw_posts: list[RawPost] = []
@@ -2281,17 +2544,27 @@ async def import_x_posts(
                 if handle_key:
                     imported_by_handle[handle_key]["skipped_already_extracted"] += 1
                 continue
-            if _is_active_extraction(latest_extraction) or _is_successful_extraction(latest_extraction):
+            if _is_active_extraction(latest_extraction, raw_post):
+                skipped_already_extracted_count += 1
+                if handle_key:
+                    imported_by_handle[handle_key]["skipped_already_extracted"] += 1
+                continue
+            if await _has_successful_extraction(db, raw_post_id=raw_post_id, raw_post=raw_post):
                 skipped_already_extracted_count += 1
                 if handle_key:
                     imported_by_handle[handle_key]["skipped_already_extracted"] += 1
                 continue
             try:
                 _check_reextract_rate_limit(raw_post.id)
-                await create_pending_extraction(db, raw_post)
-                extract_success_count += 1
-                if handle_key:
-                    imported_by_handle[handle_key]["extract_success"] += 1
+                extraction = await create_pending_extraction(db, raw_post)
+                if _is_failed_extraction(extraction, raw_post):
+                    extract_failed_count += 1
+                    if handle_key:
+                        imported_by_handle[handle_key]["extract_failed"] += 1
+                else:
+                    extract_success_count += 1
+                    if handle_key:
+                        imported_by_handle[handle_key]["extract_success"] += 1
             except Exception:  # noqa: BLE001
                 extract_failed_count += 1
                 if handle_key:
@@ -2341,17 +2614,61 @@ async def import_x_posts(
     )
 
 
-@app.post("/raw-posts/extract-batch", response_model=RawPostsExtractBatchRead)
-async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: AsyncSession = Depends(get_db)):
+def _empty_extract_counters(*, requested_count: int = 0) -> dict[str, int]:
+    return {
+        "requested_count": requested_count,
+        "success_count": 0,
+        "skipped_count": 0,
+        "skipped_already_extracted_count": 0,
+        "skipped_already_pending_count": 0,
+        "skipped_already_success_count": 0,
+        "skipped_already_has_result_count": 0,
+        "skipped_already_rejected_count": 0,
+        "skipped_already_approved_count": 0,
+        "skipped_not_followed_count": 0,
+        "failed_count": 0,
+        "auto_approved_count": 0,
+        "auto_rejected_count": 0,
+        "resumed_requested_count": 0,
+        "resumed_success": 0,
+        "resumed_failed": 0,
+        "resumed_skipped": 0,
+    }
+
+
+def _merge_extract_counters(total: dict[str, int], chunk: RawPostsExtractBatchRead) -> None:
+    total["success_count"] += chunk.success_count
+    total["skipped_count"] += chunk.skipped_count
+    total["skipped_already_extracted_count"] += chunk.skipped_already_extracted_count
+    total["skipped_already_pending_count"] += chunk.skipped_already_pending_count
+    total["skipped_already_success_count"] += chunk.skipped_already_success_count
+    total["skipped_already_has_result_count"] += chunk.skipped_already_has_result_count
+    total["skipped_already_rejected_count"] += chunk.skipped_already_rejected_count
+    total["skipped_already_approved_count"] += chunk.skipped_already_approved_count
+    total["skipped_not_followed_count"] += chunk.skipped_not_followed_count
+    total["failed_count"] += chunk.failed_count
+    total["auto_approved_count"] += chunk.auto_approved_count
+    total["auto_rejected_count"] += chunk.auto_rejected_count
+    total["resumed_requested_count"] += chunk.resumed_requested_count
+    total["resumed_success"] += chunk.resumed_success
+    total["resumed_failed"] += chunk.resumed_failed
+    total["resumed_skipped"] += chunk.resumed_skipped
+
+
+async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db: AsyncSession) -> RawPostsExtractBatchRead:
     requested_ids = list(dict.fromkeys(payload.raw_post_ids))
     success_count = 0
     skipped_count = 0
     skipped_already_extracted_count = 0
     skipped_already_pending_count = 0
     skipped_already_success_count = 0
+    skipped_already_has_result_count = 0
     skipped_already_rejected_count = 0
     skipped_already_approved_count = 0
+    skipped_not_followed_count = 0
     failed_count = 0
+    auto_approved_count = 0
+    auto_rejected_count = 0
     resumed_requested_count = 0
     resumed_success = 0
     resumed_failed = 0
@@ -2369,52 +2686,73 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
     chunk_size = max(1, throttle["batch_size"])
     batch_sleep_seconds = max(0.0, throttle["batch_sleep_ms"] / 1000.0)
 
-    async def _process_one(raw_post_id: int, local_db: AsyncSession) -> tuple[str, str | None, bool]:
+    async def _process_one(raw_post_id: int, local_db: AsyncSession) -> tuple[str, str | None, bool, str | None]:
         async with semaphore:
             raw_post = await local_db.get(RawPost, raw_post_id)
             if raw_post is None:
-                return ("skipped", None, False)
+                return ("skipped", None, False, None)
             if not await _raw_post_matches_enabled_x_kol(local_db, raw_post):
-                return ("skipped_not_followed", None, False)
+                return ("skipped_not_followed", None, False, None)
 
-            latest_extraction = await _latest_extraction_for_raw_post(local_db, raw_post_id=raw_post_id)
+            rows_result = await local_db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
+            extraction_rows = list(rows_result.scalars().all())
+            extraction_rows.sort(
+                key=lambda item: (
+                    item.created_at or datetime.min.replace(tzinfo=UTC),
+                    item.id or 0,
+                ),
+                reverse=True,
+            )
+            latest_extraction = extraction_rows[0] if extraction_rows else None
+            has_result_already = any(_is_result_available_extraction(item, raw_post) for item in extraction_rows)
             resume_candidate = payload.mode == "pending_or_failed" and (
-                latest_extraction is None or _is_failed_extraction(latest_extraction)
+                latest_extraction is None or _is_failed_extraction(latest_extraction, raw_post)
             )
             if payload.mode in {"pending_only", "pending_or_failed"}:
                 terminal_skip_kind = _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=latest_extraction)
                 if terminal_skip_kind is not None:
-                    return (terminal_skip_kind, None, resume_candidate)
-            if payload.mode in {"pending_only", "pending_or_failed"} and _is_active_extraction(latest_extraction):
-                return ("skipped_already_pending", None, resume_candidate)
+                    return (terminal_skip_kind, None, resume_candidate, None)
+            if payload.mode in {"pending_only", "pending_or_failed"} and _is_active_extraction(latest_extraction, raw_post):
+                return ("skipped_already_pending", None, resume_candidate, None)
 
-            if payload.mode in {"pending_only", "pending_or_failed"} and _is_successful_extraction(latest_extraction):
-                return ("skipped_already_success", None, resume_candidate)
+            if payload.mode in {"pending_only", "pending_or_failed"} and has_result_already:
+                return ("skipped_already_has_result", None, resume_candidate, None)
 
             if payload.mode == "pending_only" and latest_extraction is not None:
-                return ("skipped", None, resume_candidate)
+                return ("skipped", None, resume_candidate, None)
 
-            if payload.mode == "pending_or_failed" and _is_failed_extraction(latest_extraction):
+            if payload.mode == "pending_or_failed" and _is_failed_extraction(latest_extraction, raw_post):
                 failed_retries = await _failed_batch_retry_count(local_db, raw_post_id=raw_post_id)
                 if failed_retries >= max_resume_retries:
-                    return ("skipped_retry_limited", None, resume_candidate)
+                    return ("skipped_retry_limited", None, resume_candidate, None)
 
             _check_reextract_rate_limit(raw_post.id)
             for attempt in range(1, retry_max + 2):
                 try:
                     await limiter.acquire()
-                    await create_pending_extraction(
-                        local_db,
-                        raw_post,
-                        raise_retryable_errors=True,
-                        force_reextract=payload.mode == "force",
-                    )
+                    try:
+                        extraction = await create_pending_extraction(
+                            local_db,
+                            raw_post,
+                            raise_retryable_errors=True,
+                            force_reextract=payload.mode == "force",
+                        )
+                    except TypeError as exc:
+                        # Allow monkeypatched test doubles that only accept (db, raw_post).
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        extraction = await create_pending_extraction(local_db, raw_post)
                     await local_db.commit()
-                    return ("success", None, resume_candidate)
+                    if _is_failed_extraction(extraction, raw_post):
+                        return ("failed_existing", (extraction.last_error or "extraction_failed"), resume_candidate, None)
+                    auto_outcome = "rejected" if bool(getattr(extraction, "auto_rejected", False)) else (
+                        "approved" if bool(getattr(extraction, "auto_approved", False)) else None
+                    )
+                    return ("success", None, resume_candidate, auto_outcome)
                 except Exception as exc:  # noqa: BLE001
                     if not _is_retryable_extraction_error(exc) or attempt > retry_max:
                         await local_db.rollback()
-                        return ("failed", _build_last_error(exc), resume_candidate)
+                        return ("failed", _build_last_error(exc), resume_candidate, None)
                     await local_db.rollback()
                     await asyncio.sleep(
                         _build_retry_backoff_seconds(
@@ -2423,12 +2761,12 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
                             cap_ms=backoff_cap_ms,
                         )
                     )
-            return ("failed", "retry_exhausted", resume_candidate)
+            return ("failed", "retry_exhausted", resume_candidate, None)
 
     for offset in range(0, len(requested_ids), chunk_size):
         chunk = requested_ids[offset : offset + chunk_size]
         if isinstance(db, AsyncSession):
-            async def _run_with_task_db(raw_post_id: int) -> tuple[str, str | None]:
+            async def _run_with_task_db(raw_post_id: int) -> tuple[str, str | None, bool, str | None]:
                 async with AsyncSessionLocal() as task_db:
                     return await _process_one(raw_post_id, task_db)
 
@@ -2439,12 +2777,16 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
                 result = await _process_one(raw_post_id, db)
                 results.append(result)
         for idx, result in enumerate(results):
-            kind, last_error, resume_candidate = result
+            kind, last_error, resume_candidate, auto_outcome = result
             raw_post_id = chunk[idx]
             if payload.mode == "pending_or_failed" and resume_candidate:
                 resumed_requested_count += 1
             if kind == "success":
                 success_count += 1
+                if auto_outcome == "rejected":
+                    auto_rejected_count += 1
+                elif auto_outcome == "approved":
+                    auto_approved_count += 1
                 if payload.mode == "pending_or_failed" and resume_candidate:
                     resumed_success += 1
             elif kind == "skipped_already_pending":
@@ -2453,8 +2795,9 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
                 skipped_count += 1
                 if payload.mode == "pending_or_failed" and resume_candidate:
                     resumed_skipped += 1
-            elif kind == "skipped_already_success":
+            elif kind in {"skipped_already_success", "skipped_already_has_result"}:
                 skipped_already_success_count += 1
+                skipped_already_has_result_count += 1
                 skipped_already_extracted_count += 1
                 skipped_count += 1
                 if payload.mode == "pending_or_failed" and resume_candidate:
@@ -2476,6 +2819,7 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
                 if payload.mode == "pending_or_failed" and resume_candidate:
                     resumed_skipped += 1
             elif kind == "skipped_not_followed":
+                skipped_not_followed_count += 1
                 skipped_count += 1
                 if payload.mode == "pending_or_failed" and resume_candidate:
                     resumed_skipped += 1
@@ -2487,6 +2831,8 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
                 failed_count += 1
                 if payload.mode == "pending_or_failed" and resume_candidate:
                     resumed_failed += 1
+                if kind == "failed_existing":
+                    continue
                 if last_error:
                     error_category = _classify_last_error(last_error)
                     if isinstance(db, AsyncSession):
@@ -2534,14 +2880,161 @@ async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: Asyn
         skipped_already_extracted_count=skipped_already_extracted_count,
         skipped_already_pending_count=skipped_already_pending_count,
         skipped_already_success_count=skipped_already_success_count,
+        skipped_already_has_result_count=skipped_already_has_result_count,
         skipped_already_rejected_count=skipped_already_rejected_count,
         skipped_already_approved_count=skipped_already_approved_count,
+        skipped_not_followed_count=skipped_not_followed_count,
         failed_count=failed_count,
+        auto_approved_count=auto_approved_count,
+        auto_rejected_count=auto_rejected_count,
         resumed_requested_count=resumed_requested_count if resume_mode else 0,
         resumed_success=resumed_success if resume_mode else 0,
         resumed_failed=resumed_failed if resume_mode else 0,
         resumed_skipped=resumed_skipped if resume_mode else 0,
     )
+
+
+@app.post("/raw-posts/extract-batch", response_model=RawPostsExtractBatchRead)
+async def extract_raw_posts_batch(payload: RawPostsExtractBatchRequest, db: AsyncSession = Depends(get_db)):
+    return await _extract_raw_posts_batch_core(payload, db)
+
+
+def _extract_job_read(state: dict[str, Any]) -> ExtractJobRead:
+    return ExtractJobRead(
+        job_id=state["job_id"],
+        status=state["status"],
+        mode=state["mode"],
+        batch_size=state["batch_size"],
+        batch_sleep_ms=state["batch_sleep_ms"],
+        requested_count=state["requested_count"],
+        success_count=state["success_count"],
+        skipped_count=state["skipped_count"],
+        skipped_already_extracted_count=state["skipped_already_extracted_count"],
+        skipped_already_pending_count=state["skipped_already_pending_count"],
+        skipped_already_success_count=state["skipped_already_success_count"],
+        skipped_already_has_result_count=state["skipped_already_has_result_count"],
+        skipped_already_rejected_count=state["skipped_already_rejected_count"],
+        skipped_already_approved_count=state["skipped_already_approved_count"],
+        skipped_not_followed_count=state["skipped_not_followed_count"],
+        failed_count=state["failed_count"],
+        auto_approved_count=state["auto_approved_count"],
+        auto_rejected_count=state["auto_rejected_count"],
+        resumed_requested_count=state["resumed_requested_count"],
+        resumed_success=state["resumed_success"],
+        resumed_failed=state["resumed_failed"],
+        resumed_skipped=state["resumed_skipped"],
+        last_error_summary=state.get("last_error_summary"),
+        created_at=state["created_at"],
+        started_at=state.get("started_at"),
+        finished_at=state.get("finished_at"),
+    )
+
+
+async def _latest_error_summary_for_job(db: AsyncSession, raw_post_ids: set[int]) -> str | None:
+    if not raw_post_ids:
+        return None
+    latest_map = await _latest_extractions_by_raw_post_id(db, raw_post_ids=raw_post_ids)
+    latest_by_time = sorted(
+        (
+            item for item in latest_map.values() if (item.last_error or "").strip()
+        ),
+        key=lambda item: item.created_at or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    if not latest_by_time:
+        return None
+    return (latest_by_time[0].last_error or "").strip()[:240] or None
+
+
+async def _run_extract_job(job_id: str) -> None:
+    async with EXTRACT_JOBS_LOCK:
+        state = EXTRACT_JOBS.get(job_id)
+        if state is None:
+            EXTRACT_JOB_TASKS.pop(job_id, None)
+            return
+        state["status"] = "running"
+        state["started_at"] = _utc_now()
+        raw_post_ids = list(state["raw_post_ids"])
+        mode = state["mode"]
+        batch_size = state["batch_size"]
+        batch_sleep_seconds = max(0.0, state["batch_sleep_ms"] / 1000.0)
+
+    try:
+        for offset in range(0, len(raw_post_ids), batch_size):
+            chunk = raw_post_ids[offset : offset + batch_size]
+            payload = RawPostsExtractBatchRequest(raw_post_ids=chunk, mode=mode)
+            async with EXTRACT_JOB_SESSION_FACTORY() as task_db:
+                result = await _extract_raw_posts_batch_core(payload, task_db)
+                chunk_error_summary = await _latest_error_summary_for_job(task_db, set(chunk))
+            async with EXTRACT_JOBS_LOCK:
+                state = EXTRACT_JOBS.get(job_id)
+                if state is None:
+                    EXTRACT_JOB_TASKS.pop(job_id, None)
+                    return
+                _merge_extract_counters(state, result)
+                if chunk_error_summary:
+                    state["last_error_summary"] = chunk_error_summary
+            if offset + batch_size < len(raw_post_ids):
+                await asyncio.sleep(batch_sleep_seconds)
+        async with EXTRACT_JOBS_LOCK:
+            state = EXTRACT_JOBS.get(job_id)
+            if state is not None:
+                state["status"] = "done"
+                state["finished_at"] = _utc_now()
+    except Exception as exc:  # noqa: BLE001
+        async with EXTRACT_JOBS_LOCK:
+            state = EXTRACT_JOBS.get(job_id)
+            if state is not None:
+                state["status"] = "failed"
+                state["finished_at"] = _utc_now()
+                state["last_error_summary"] = _build_last_error(exc)[:240]
+    finally:
+        EXTRACT_JOB_TASKS.pop(job_id, None)
+
+
+@app.post("/extract-jobs", response_model=ExtractJobCreateRead, status_code=status.HTTP_201_CREATED)
+async def create_extract_job(payload: ExtractJobCreateRequest):
+    raw_post_ids = list(dict.fromkeys(payload.raw_post_ids))
+    idempotency_key = (payload.idempotency_key or "").strip() or None
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key[:256]
+
+    async with EXTRACT_JOBS_LOCK:
+        if idempotency_key:
+            existing_job_id = EXTRACT_JOB_IDEMPOTENCY.get(idempotency_key)
+            existing_state = EXTRACT_JOBS.get(existing_job_id or "")
+            if existing_state is not None and existing_state["status"] in {"queued", "running"}:
+                return ExtractJobCreateRead(job_id=existing_job_id)
+        job_id = uuid4().hex
+        counters = _empty_extract_counters(requested_count=len(raw_post_ids))
+        state: dict[str, Any] = {
+            "job_id": job_id,
+            "status": "queued",
+            "mode": payload.mode,
+            "batch_size": payload.batch_size,
+            "batch_sleep_ms": payload.batch_sleep_ms,
+            "raw_post_ids": raw_post_ids,
+            "idempotency_key": idempotency_key,
+            "last_error_summary": None,
+            "created_at": _utc_now(),
+            "started_at": None,
+            "finished_at": None,
+            **counters,
+        }
+        EXTRACT_JOBS[job_id] = state
+        if idempotency_key:
+            EXTRACT_JOB_IDEMPOTENCY[idempotency_key] = job_id
+        EXTRACT_JOB_TASKS[job_id] = asyncio.create_task(_run_extract_job(job_id))
+    return ExtractJobCreateRead(job_id=job_id)
+
+
+@app.get("/extract-jobs/{job_id}", response_model=ExtractJobRead)
+async def get_extract_job(job_id: str = Path(..., min_length=1)):
+    async with EXTRACT_JOBS_LOCK:
+        state = EXTRACT_JOBS.get(job_id)
+        if state is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extract job not found")
+        return _extract_job_read(state)
 
 
 @app.get("/ingest/x/progress", response_model=XIngestProgressRead)
@@ -2556,32 +3049,34 @@ async def get_x_ingest_progress(
     extracted_success_count = 0
     pending_count = 0
     failed_count = 0
+    no_extraction_count = 0
     latest_error_summary: str | None = None
     latest_error_at: datetime | None = None
     latest_extraction_at: datetime | None = None
 
     for post in posts:
         latest = latest_map.get(post.id)
-        if latest is None:
-            continue
-        if latest_extraction_at is None or (
-            latest.created_at is not None and latest.created_at > latest_extraction_at
+        if latest is not None and (
+            latest_extraction_at is None or (latest.created_at is not None and latest.created_at > latest_extraction_at)
         ):
             latest_extraction_at = latest.created_at
 
-        has_error = bool((latest.last_error or "").strip())
-        if has_error:
+        state = classify_extraction_state(latest, post)
+        if state == ClassifiedExtractionState.failed or state == ClassifiedExtractionState.rejected:
             failed_count += 1
             if latest_error_at is None or (latest.created_at is not None and latest.created_at > latest_error_at):
                 latest_error_at = latest.created_at
                 latest_error_summary = (latest.last_error or "").strip()[:240]
             continue
 
-        extracted_success_count += 1
-        if latest.status == ExtractionStatus.pending:
+        if state in {ClassifiedExtractionState.success, ClassifiedExtractionState.approved}:
+            extracted_success_count += 1
+            continue
+        if state == ClassifiedExtractionState.pending:
             pending_count += 1
-
-    no_extraction_count = len(posts) - len(latest_map)
+            continue
+        if state == ClassifiedExtractionState.no_extraction:
+            no_extraction_count += 1
     return XIngestProgressRead(
         scope="author" if author_handle else "global",
         author_handle=author_handle,
@@ -2607,12 +3102,14 @@ async def retry_failed_x_extractions(
 
     failed_candidates: list[tuple[RawPost, PostExtraction]] = []
     for raw_post_id, extraction in latest_map.items():
-        if not (extraction.last_error or "").strip():
-            continue
         raw_post = post_map.get(raw_post_id)
+        if not _is_failed_extraction(extraction, raw_post):
+            continue
         if raw_post is None:
             continue
         if _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=extraction) is not None:
+            continue
+        if await _has_successful_extraction(db, raw_post_id=raw_post.id, raw_post=raw_post):
             continue
         failed_candidates.append((raw_post, extraction))
     failed_candidates.sort(
@@ -2653,6 +3150,83 @@ async def retry_failed_x_extractions(
     )
 
 
+@app.post("/admin/extractions/backfill-auto-review", response_model=AdminBackfillAutoReviewRead)
+async def backfill_auto_review_by_confidence(
+    confirm: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+
+    result = await db.execute(select(PostExtraction).order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc()))
+    extractions = list(result.scalars().all())
+    scanned = len(extractions)
+    approved_count = 0
+    rejected_count = 0
+    skipped_no_result_count = 0
+    skipped_no_confidence_count = 0
+    skipped_already_terminal_count = 0
+    errors: list[AutoReviewBackfillErrorRead] = []
+
+    for extraction in extractions:
+        extraction_id = getattr(extraction, "id", None)
+        raw_post = await db.get(RawPost, extraction.raw_post_id)
+        if raw_post is None:
+            if len(errors) < 20:
+                errors.append(
+                    AutoReviewBackfillErrorRead(
+                        extraction_id=extraction_id,
+                        raw_post_id=extraction.raw_post_id,
+                        error="raw_post_not_found",
+                    )
+                )
+            continue
+        state = classify_extraction_state(extraction, raw_post)
+        if state in {ClassifiedExtractionState.approved, ClassifiedExtractionState.rejected}:
+            skipped_already_terminal_count += 1
+            continue
+        if state != ClassifiedExtractionState.success:
+            skipped_no_result_count += 1
+            continue
+        if not isinstance(extraction.extracted_json, dict):
+            skipped_no_result_count += 1
+            continue
+        model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
+        if model_confidence is None:
+            skipped_no_confidence_count += 1
+            continue
+
+        try:
+            outcome = await postprocess_auto_review(db=db, extraction=extraction, raw_post=raw_post)
+        except Exception as exc:  # noqa: BLE001
+            if len(errors) < 20:
+                errors.append(
+                    AutoReviewBackfillErrorRead(
+                        extraction_id=extraction_id,
+                        raw_post_id=raw_post.id,
+                        error=_build_last_error(exc)[:240],
+                    )
+                )
+            continue
+
+        if outcome == "approved":
+            approved_count += 1
+        elif outcome == "rejected":
+            rejected_count += 1
+        else:
+            skipped_no_result_count += 1
+
+    await db.commit()
+    return AdminBackfillAutoReviewRead(
+        scanned=scanned,
+        approved_count=approved_count,
+        rejected_count=rejected_count,
+        skipped_no_result_count=skipped_no_result_count,
+        skipped_no_confidence_count=skipped_no_confidence_count,
+        skipped_already_terminal_count=skipped_already_terminal_count,
+        errors=errors[:20],
+    )
+
+
 @app.delete("/admin/extractions/pending", response_model=AdminDeletePendingExtractionsRead)
 async def delete_pending_or_failed_extractions(
     confirm: str = Query(...),
@@ -2671,8 +3245,7 @@ async def delete_pending_or_failed_extractions(
     all_extractions = list(result.scalars().all())
     filtered: list[PostExtraction] = []
     for extraction in all_extractions:
-        status_key = _extraction_status_key(extraction)
-        if status_key not in {"pending", "failed"}:
+        if not (_is_active_extraction(extraction, extraction.raw_post) or _is_failed_extraction(extraction, extraction.raw_post)):
             continue
         raw_post = extraction.raw_post
         if scoped_handle and (
@@ -3064,6 +3637,8 @@ async def _create_failed_extraction(
     batch_retry_count: int,
 ) -> PostExtraction:
     settings = get_settings()
+    provider_detected = detect_provider_from_base_url(settings.openai_base_url)
+    output_mode = resolve_extraction_output_mode(settings.openai_base_url)
     extraction = PostExtraction(
         raw_post_id=raw_post.id,
         status=ExtractionStatus.pending,
@@ -3074,6 +3649,12 @@ async def _create_failed_extraction(
                 "retry_source": "extract_batch",
                 "error_category": error_category,
                 "batch_retry_count": batch_retry_count,
+                "provider_detected": provider_detected,
+                "output_mode_used": output_mode,
+                "parse_strategy_used": "failed",
+                "raw_len": 0,
+                "repaired": False,
+                "parse_error": True,
             },
         },
         model_name=settings.openai_model,
@@ -3094,8 +3675,12 @@ def _build_runtime_settings_read(settings) -> RuntimeSettingsRead:
     default_budget_total = _get_default_call_budget_total(settings)
     runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
     throttle = _get_runtime_throttle(settings)
+    provider_detected = detect_provider_from_base_url(settings.openai_base_url)
+    extraction_output_mode = resolve_extraction_output_mode(settings.openai_base_url)
     return RuntimeSettingsRead(
         extractor_mode=settings.extractor_mode.strip().lower(),
+        provider_detected=provider_detected,
+        extraction_output_mode=extraction_output_mode,
         model=settings.openai_model,
         has_api_key=bool(settings.openai_api_key.strip()),
         base_url=settings.openai_base_url,
@@ -3108,6 +3693,7 @@ def _build_runtime_settings_read(settings) -> RuntimeSettingsRead:
         window_start=RUNTIME_BUDGET_WINDOW_START or _utc_now(),
         window_end=RUNTIME_BUDGET_WINDOW_END or _utc_now(),
         max_output_tokens=max(1, settings.openai_max_output_tokens),
+        auto_reject_confidence_threshold=max(0, min(100, settings.auto_reject_confidence_threshold)),
         throttle=throttle,
         burst={
             "enabled": bool(RUNTIME_BURST_STATE["enabled"]),

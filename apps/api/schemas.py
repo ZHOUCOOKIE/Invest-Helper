@@ -168,6 +168,7 @@ class PostExtractionRead(BaseModel):
     auto_applied_kol_view_ids: list[int] | None
     auto_approve_confidence_threshold: int | None = None
     auto_approve_min_display_confidence: int | None = None
+    auto_reject_confidence_threshold: int | None = None
     approve_inserted_count: int | None = None
     approve_skipped_count: int | None = None
     auto_applied_asset_view_keys: list[str] | None = None
@@ -337,6 +338,22 @@ class AdminDeletePendingExtractionsRead(BaseModel):
     scoped_author_handle: str | None
 
 
+class AutoReviewBackfillErrorRead(BaseModel):
+    extraction_id: int | None = None
+    raw_post_id: int | None = None
+    error: str
+
+
+class AdminBackfillAutoReviewRead(BaseModel):
+    scanned: int
+    approved_count: int
+    rejected_count: int
+    skipped_no_result_count: int
+    skipped_no_confidence_count: int
+    skipped_already_terminal_count: int
+    errors: list[AutoReviewBackfillErrorRead] = Field(default_factory=list)
+
+
 class AdminHardDeleteRead(BaseModel):
     operation: str
     target: str
@@ -365,13 +382,58 @@ class RawPostsExtractBatchRead(BaseModel):
     skipped_already_extracted_count: int
     skipped_already_pending_count: int = 0
     skipped_already_success_count: int = 0
+    skipped_already_has_result_count: int = 0
     skipped_already_rejected_count: int = 0
     skipped_already_approved_count: int = 0
+    skipped_not_followed_count: int = 0
     failed_count: int
+    auto_approved_count: int = 0
+    auto_rejected_count: int = 0
     resumed_requested_count: int = 0
     resumed_success: int = 0
     resumed_failed: int = 0
     resumed_skipped: int = 0
+
+
+class ExtractJobCreateRequest(BaseModel):
+    raw_post_ids: list[int] = Field(min_length=1, max_length=5000)
+    mode: Literal["pending_only", "pending_or_failed", "force"] = "pending_or_failed"
+    batch_size: int = Field(default=50, ge=1, le=500)
+    batch_sleep_ms: int = Field(default=200, ge=0, le=60_000)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class ExtractJobCreateRead(BaseModel):
+    job_id: str
+
+
+class ExtractJobRead(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "done", "failed"]
+    mode: Literal["pending_only", "pending_or_failed", "force"]
+    batch_size: int
+    batch_sleep_ms: int
+    requested_count: int
+    success_count: int
+    skipped_count: int
+    skipped_already_extracted_count: int
+    skipped_already_pending_count: int = 0
+    skipped_already_success_count: int = 0
+    skipped_already_has_result_count: int = 0
+    skipped_already_rejected_count: int = 0
+    skipped_already_approved_count: int = 0
+    skipped_not_followed_count: int = 0
+    failed_count: int
+    auto_approved_count: int = 0
+    auto_rejected_count: int = 0
+    resumed_requested_count: int = 0
+    resumed_success: int = 0
+    resumed_failed: int = 0
+    resumed_skipped: int = 0
+    last_error_summary: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class XIngestProgressRead(BaseModel):
@@ -633,6 +695,8 @@ class ExtractorStatusRead(BaseModel):
 
 class RuntimeSettingsRead(BaseModel):
     extractor_mode: str
+    provider_detected: str
+    extraction_output_mode: str
     model: str
     has_api_key: bool
     base_url: str
@@ -645,6 +709,7 @@ class RuntimeSettingsRead(BaseModel):
     window_start: datetime
     window_end: datetime
     max_output_tokens: int
+    auto_reject_confidence_threshold: int
     throttle: dict[str, int]
     burst: dict[str, bool | datetime | str | None]
     runtime_overrides: dict[str, bool]

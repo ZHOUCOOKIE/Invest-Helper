@@ -36,6 +36,32 @@ type ClearPendingResponse = {
   scoped_author_handle: string | null;
 };
 
+type XProgress = {
+  scope: string;
+  author_handle: string | null;
+  total_raw_posts: number;
+  extracted_success_count: number;
+  pending_count: number;
+  failed_count: number;
+  no_extraction_count: number;
+  latest_error_summary: string | null;
+  latest_extraction_at: string | null;
+};
+
+type BackfillAutoReviewResponse = {
+  scanned: number;
+  approved_count: number;
+  rejected_count: number;
+  skipped_no_result_count: number;
+  skipped_no_confidence_count: number;
+  skipped_already_terminal_count: number;
+  errors: Array<{
+    extraction_id: number | null;
+    raw_post_id: number | null;
+    error: string;
+  }>;
+};
+
 const PAGE_SIZE = 20;
 
 function summarizeExtraction(extracted: Record<string, unknown>): string {
@@ -54,6 +80,17 @@ function summarizeExtraction(extracted: Record<string, unknown>): string {
   return "(no summary)";
 }
 
+function autoRejectInfo(extracted: Record<string, unknown>): { reason: string; threshold: string } | null {
+  const rawMeta = extracted.meta;
+  if (!rawMeta || typeof rawMeta !== "object") return null;
+  const meta = rawMeta as Record<string, unknown>;
+  if (meta.auto_rejected !== true) return null;
+  return {
+    reason: String(meta.auto_reject_reason ?? "-"),
+    threshold: String(meta.auto_reject_threshold ?? "-"),
+  };
+}
+
 export default function ExtractionsPage() {
   const searchParams = useSearchParams();
   const initialStatus = (searchParams.get("status") as Extraction["status"] | null) ?? "pending";
@@ -64,6 +101,9 @@ export default function ExtractionsPage() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(searchParams.get("msg"));
   const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
+  const [progress, setProgress] = useState<XProgress | null>(null);
+  const [backfillBusy, setBackfillBusy] = useState(false);
+  const [backfillResult, setBackfillResult] = useState<BackfillAutoReviewResponse | null>(null);
   const requestSeqRef = useRef(0);
 
   const canPrev = useMemo(() => offset > 0, [offset]);
@@ -105,6 +145,19 @@ export default function ExtractionsPage() {
   useEffect(() => {
     void load();
   }, [status, offset]);
+
+  const refreshProgress = async () => {
+    const res = await fetch("/api/ingest/x/progress", { cache: "no-store" });
+    const body = (await res.json()) as XProgress | { detail?: string };
+    if (!res.ok) {
+      throw new Error("detail" in body ? (body.detail ?? "Load progress failed") : "Load progress failed");
+    }
+    setProgress(body as XProgress);
+  };
+
+  useEffect(() => {
+    void refreshProgress();
+  }, []);
 
   const rejectInline = async (extractionId: number) => {
     const reason = window.prompt("Reject reason (optional):", "") ?? "";
@@ -149,9 +202,38 @@ export default function ExtractionsPage() {
       setMessage(
         `Deleted extractions=${done.deleted_extractions_count}, raw_posts=${done.deleted_raw_posts_count}.`,
       );
-      await load();
+      await Promise.all([load(), refreshProgress()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Clear pending failed");
+    }
+  };
+
+  const backfillAutoReview = async () => {
+    const confirmText = window.prompt(
+      "This updates historical extractions by confidence only, with no model calls. Type YES to continue.",
+      "",
+    );
+    if (confirmText !== "YES") return;
+    setBackfillBusy(true);
+    setError(null);
+    setMessage(null);
+    setBackfillResult(null);
+    try {
+      const res = await fetch("/api/admin/extractions/backfill-auto-review?confirm=YES", { method: "POST" });
+      const body = (await res.json()) as BackfillAutoReviewResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error("detail" in body ? (body.detail ?? "Backfill auto review failed") : "Backfill auto review failed");
+      }
+      const done = body as BackfillAutoReviewResponse;
+      setBackfillResult(done);
+      setMessage(
+        `Backfill done: scanned=${done.scanned}, approved=${done.approved_count}, rejected=${done.rejected_count}.`,
+      );
+      await Promise.all([load(), refreshProgress()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Backfill auto review failed");
+    } finally {
+      setBackfillBusy(false);
     }
   };
 
@@ -183,6 +265,9 @@ export default function ExtractionsPage() {
         </button>
         {status === "pending" && (
           <>
+            <button type="button" onClick={() => void backfillAutoReview()} disabled={loading || backfillBusy}>
+              {backfillBusy ? "Running..." : "Backfill Auto Review (confidence rule)"}
+            </button>
             <label>
               <input
                 type="checkbox"
@@ -200,34 +285,72 @@ export default function ExtractionsPage() {
 
       {message && <p style={{ color: "green" }}>{message}</p>}
       {error && <p style={{ color: "crimson" }}>{error}</p>}
+      {progress && (
+        <p style={{ color: "#555" }}>
+          progress[{progress.scope}] total={progress.total_raw_posts}, success={progress.extracted_success_count}, pending=
+          {progress.pending_count}, failed={progress.failed_count}, no_extraction={progress.no_extraction_count}
+        </p>
+      )}
+      {backfillResult && (
+        <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px", marginBottom: "10px" }}>
+          <div>
+            scanned={backfillResult.scanned}, approved={backfillResult.approved_count}, rejected={backfillResult.rejected_count}
+          </div>
+          <div>
+            skipped_no_result={backfillResult.skipped_no_result_count}, skipped_no_confidence=
+            {backfillResult.skipped_no_confidence_count}, skipped_already_terminal=
+            {backfillResult.skipped_already_terminal_count}
+          </div>
+          {backfillResult.errors.length > 0 && (
+            <details style={{ marginTop: "6px" }}>
+              <summary>errors (showing first {Math.min(20, backfillResult.errors.length)})</summary>
+              <ul>
+                {backfillResult.errors.slice(0, 20).map((item, index) => (
+                  <li key={`${item.extraction_id ?? "na"}-${index}`}>
+                    extraction_id={item.extraction_id ?? "null"}, raw_post_id={item.raw_post_id ?? "null"}: {item.error}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
 
       {!loading && items.length === 0 && <p>No extractions.</p>}
 
       <div style={{ display: "grid", gap: "10px" }}>
-        {items.map((item) => (
-          <article key={item.id} style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", marginBottom: "6px" }}>
-              <strong>#{item.id} [{item.status}]</strong>
-              <small>created_at: {item.created_at}</small>
-            </div>
-            <div>
-              {item.raw_post.platform} / @{item.raw_post.author_handle}
-            </div>
-            <div>
-              <a href={item.raw_post.url} target="_blank" rel="noreferrer">
-                {item.raw_post.url}
-              </a>
-            </div>
-            <div>posted_at: {item.raw_post.posted_at}</div>
-            <div style={{ marginTop: "6px" }}>summary: {summarizeExtraction(item.extracted_json)}</div>
-            <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-              <Link href={`/extractions/${item.id}`}>Approve</Link>
-              <button type="button" onClick={() => void rejectInline(item.id)} disabled={item.status !== "pending"}>
-                Reject
-              </button>
-            </div>
-          </article>
-        ))}
+        {items.map((item) => {
+          const autoRejected = autoRejectInfo(item.extracted_json);
+          return (
+            <article key={item.id} style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", marginBottom: "6px" }}>
+                <strong>#{item.id} [{item.status}]</strong>
+                <small>created_at: {item.created_at}</small>
+              </div>
+              <div>
+                {item.raw_post.platform} / @{item.raw_post.author_handle}
+              </div>
+              <div>
+                <a href={item.raw_post.url} target="_blank" rel="noreferrer">
+                  {item.raw_post.url}
+                </a>
+              </div>
+              <div>posted_at: {item.raw_post.posted_at}</div>
+              <div style={{ marginTop: "6px" }}>summary: {summarizeExtraction(item.extracted_json)}</div>
+              {autoRejected && (
+                <div style={{ marginTop: "4px", color: "#8a5800" }}>
+                  auto_rejected=true, reason={autoRejected.reason}, threshold={autoRejected.threshold}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                <Link href={`/extractions/${item.id}`}>Approve</Link>
+                <button type="button" onClick={() => void rejectInline(item.id)} disabled={item.status !== "pending"}>
+                  Reject
+                </button>
+              </div>
+            </article>
+          );
+        })}
       </div>
 
       <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>

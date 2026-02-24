@@ -167,17 +167,45 @@ type ExtractBatchStats = {
   skipped_already_extracted_count: number;
   skipped_already_pending_count: number;
   skipped_already_success_count: number;
+  skipped_already_has_result_count: number;
   skipped_already_rejected_count: number;
   skipped_already_approved_count: number;
+  skipped_not_followed_count: number;
   failed_count: number;
+  auto_rejected_count: number;
   resumed_requested_count: number;
   resumed_success: number;
   resumed_failed: number;
   resumed_skipped: number;
 };
 
+type ExtractJobCreateResponse = {
+  job_id: string;
+};
+
+type ExtractJob = ExtractBatchStats & {
+  job_id: string;
+  status: "queued" | "running" | "done" | "failed";
+  mode: "pending_only" | "pending_or_failed" | "force";
+  batch_size: number;
+  batch_sleep_ms: number;
+  last_error_summary: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+type ApiErrorBody = {
+  request_id?: string;
+  error_code?: string;
+  message?: string;
+  detail?: unknown;
+};
+
 type RuntimeSettings = {
   extractor_mode: string;
+  provider_detected: string;
+  extraction_output_mode: string;
   model: string;
   has_api_key: boolean;
   base_url: string;
@@ -189,6 +217,7 @@ type RuntimeSettings = {
   window_start: string;
   window_end: string;
   max_output_tokens: number;
+  auto_reject_confidence_threshold: number;
   throttle: {
     max_concurrency: number;
     max_rpm: number;
@@ -296,6 +325,7 @@ export default function IngestPage() {
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [workflowStep, setWorkflowStep] = useState<string | null>(null);
   const [workflowError, setWorkflowError] = useState<string | null>(null);
+  const [workflowRequestId, setWorkflowRequestId] = useState<string | null>(null);
   const [convertedCount, setConvertedCount] = useState<number | null>(null);
   const [convertResult, setConvertResult] = useState<XConvertResult | null>(null);
   const [importStats, setImportStats] = useState<XImportStats | null>(null);
@@ -345,21 +375,17 @@ export default function IngestPage() {
           fetch("/api/extractor-status", { cache: "no-store" }),
           fetch("/api/settings/runtime", { cache: "no-store" }),
         ]);
-        const extractorBody = (await extractorRes.json()) as ExtractorStatus | { detail?: string };
-        if (!extractorRes.ok) {
-          throw new Error(
-            "detail" in extractorBody ? (extractorBody.detail ?? "Load extractor status failed") : "Load failed",
-          );
+        const extractorParsed = await parseApiResponse<ExtractorStatus>(extractorRes);
+        if (!extractorRes.ok || !extractorParsed.data) {
+          throw new Error(formatApiError("Load extractor status failed", extractorParsed.data, extractorParsed.textBody, extractorParsed.requestId));
         }
-        setExtractorStatus(extractorBody as ExtractorStatus);
+        setExtractorStatus(extractorParsed.data as ExtractorStatus);
 
-        const runtimeBody = (await runtimeRes.json()) as RuntimeSettings | { detail?: string };
-        if (!runtimeRes.ok) {
-          throw new Error(
-            "detail" in runtimeBody ? (runtimeBody.detail ?? "Load runtime settings failed") : "Load failed",
-          );
+        const runtimeParsed = await parseApiResponse<RuntimeSettings>(runtimeRes);
+        if (!runtimeRes.ok || !runtimeParsed.data) {
+          throw new Error(formatApiError("Load runtime settings failed", runtimeParsed.data, runtimeParsed.textBody, runtimeParsed.requestId));
         }
-        const runtime = runtimeBody as RuntimeSettings;
+        const runtime = runtimeParsed.data as RuntimeSettings;
         setRuntimeSettings(runtime);
         setRuntimeBudgetInput(String(runtime.budget_total));
         setBurstEnabledInput(runtime.burst.enabled);
@@ -377,11 +403,11 @@ export default function IngestPage() {
     const loadKols = async () => {
       try {
         const res = await fetch("/api/kols?enabled=true", { cache: "no-store" });
-        const body = (await res.json()) as Kol[] | { detail?: string };
-        if (!res.ok || !Array.isArray(body)) {
-          throw new Error("detail" in body ? (body.detail ?? "Load kols failed") : "Load kols failed");
+        const parsed = await parseApiResponse<Kol[]>(res);
+        if (!res.ok || !Array.isArray(parsed.data)) {
+          throw new Error(formatApiError("Load kols failed", parsed.data, parsed.textBody, parsed.requestId));
         }
-        const xKols = (body as Kol[]).filter((item) => item.platform === "x");
+        const xKols = (parsed.data as Kol[]).filter((item) => item.platform === "x");
         setKols(xKols);
       } catch (err) {
         setKolsError(err instanceof Error ? err.message : "Load kols failed");
@@ -390,11 +416,11 @@ export default function IngestPage() {
     const loadAssets = async () => {
       try {
         const res = await fetch("/api/assets", { cache: "no-store" });
-        const body = (await res.json()) as AssetItem[] | { detail?: string };
-        if (!res.ok || !Array.isArray(body)) {
-          throw new Error("detail" in body ? (body.detail ?? "Load assets failed") : "Load assets failed");
+        const parsed = await parseApiResponse<AssetItem[]>(res);
+        if (!res.ok || !Array.isArray(parsed.data)) {
+          throw new Error(formatApiError("Load assets failed", parsed.data, parsed.textBody, parsed.requestId));
         }
-        const sorted = [...(body as AssetItem[])].sort((a, b) => a.symbol.localeCompare(b.symbol));
+        const sorted = [...(parsed.data as AssetItem[])].sort((a, b) => a.symbol.localeCompare(b.symbol));
         setAssets(sorted);
       } catch (err) {
         setAssetsError(err instanceof Error ? err.message : "Load assets failed");
@@ -407,6 +433,33 @@ export default function IngestPage() {
 
   const selectedKol = useMemo(() => kols.find((item) => item.id === selectedKolId) ?? null, [kols, selectedKolId]);
 
+  const formatApiError = (fallbackMessage: string, body: unknown, textBody: string, requestId: string | null): string => {
+    let message = fallbackMessage;
+    if (body && typeof body === "object") {
+      const obj = body as Record<string, unknown>;
+      if (typeof obj.message === "string" && obj.message) message = obj.message;
+      else if (typeof obj.detail === "string" && obj.detail) message = obj.detail;
+    } else if (textBody) {
+      message = `非 JSON 错误文本: ${textBody.slice(0, 300)}`;
+    }
+    return requestId ? `${message} (request_id=${requestId})` : message;
+  };
+
+  const parseApiResponse = async <T,>(res: Response): Promise<{ data: T | ApiErrorBody | null; textBody: string; requestId: string | null }> => {
+    const requestId = res.headers.get("x-request-id");
+    const textBody = await res.text();
+    try {
+      const parsed = JSON.parse(textBody) as T | ApiErrorBody;
+      if (parsed && typeof parsed === "object") {
+        const bodyRequestId = (parsed as ApiErrorBody).request_id;
+        return { data: parsed, textBody: "", requestId: bodyRequestId ?? requestId };
+      }
+      return { data: parsed, textBody: "", requestId };
+    } catch {
+      return { data: null, textBody, requestId };
+    }
+  };
+
   const progressHandle = useMemo(() => {
     if (authorHandle.trim()) return authorHandle.trim();
     if (selectedKol) return selectedKol.handle;
@@ -417,11 +470,11 @@ export default function IngestPage() {
   const refreshProgress = async () => {
     const query = progressHandle ? `?author_handle=${encodeURIComponent(progressHandle)}` : "";
     const res = await fetch(`/api/ingest/x/progress${query}`, { cache: "no-store" });
-    const body = (await res.json()) as XProgress | { detail?: string };
-    if (!res.ok) {
-      throw new Error("detail" in body ? (body.detail ?? "Load progress failed") : "Load progress failed");
+    const parsed = await parseApiResponse<XProgress>(res);
+    if (!res.ok || !parsed.data) {
+      throw new Error(formatApiError("Load progress failed", parsed.data, parsed.textBody, parsed.requestId));
     }
-    setProgress(body as XProgress);
+    setProgress(parsed.data as XProgress);
   };
 
   const onManualSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -443,9 +496,9 @@ export default function IngestPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const body = (await res.json()) as ManualIngestResponse | { detail?: string };
-      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Submit failed") : "Submit failed");
-      setResult(body as ManualIngestResponse);
+      const parsed = await parseApiResponse<ManualIngestResponse>(res);
+      if (!res.ok || !parsed.data) throw new Error(formatApiError("Submit failed", parsed.data, parsed.textBody, parsed.requestId));
+      setResult(parsed.data as ManualIngestResponse);
       setForm((prev) => ({ ...prev, url: "", content_text: "" }));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
@@ -487,17 +540,12 @@ export default function IngestPage() {
       headers: { "Content-Type": targetFile.type || "application/octet-stream" },
       body: targetFile,
     });
-    const body = (await res.json()) as
-      | XConvertResult
-      | { detail?: string | { message?: string } };
-    if (!res.ok || !("items" in body) || !Array.isArray(body.items)) {
-      throw new Error(
-        "detail" in body
-          ? (typeof body.detail === "string" ? body.detail : body.detail?.message) ?? "Convert failed"
-          : "Convert failed",
-      );
+    const parsed = await parseApiResponse<XConvertResult>(res);
+    if (!res.ok || !parsed.data || !("items" in (parsed.data as Record<string, unknown>))) {
+      setWorkflowRequestId(parsed.requestId);
+      throw new Error(formatApiError("Convert failed", parsed.data, parsed.textBody, parsed.requestId));
     }
-    return body as XConvertResult;
+    return parsed.data as XConvertResult;
   };
 
   const importRows = async (rows: XImportItem[], authorHandleOverride?: string): Promise<XImportStats> => {
@@ -512,67 +560,58 @@ export default function IngestPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(rows),
     });
-    const body = (await res.json()) as
-      | XImportStats
-      | { detail?: string | { message?: string } };
-    if (!res.ok) {
-      throw new Error(
-        "detail" in body
-          ? (typeof body.detail === "string" ? body.detail : body.detail?.message) ?? "Import failed"
-          : "Import failed",
-      );
+    const parsed = await parseApiResponse<XImportStats>(res);
+    setWorkflowRequestId(parsed.requestId);
+    if (!res.ok || !parsed.data) {
+      throw new Error(formatApiError("Import failed", parsed.data, parsed.textBody, parsed.requestId));
     }
-    return body as XImportStats;
+    return parsed.data as XImportStats;
   };
 
-  const runExtractBatch = async (
+  const runExtractJob = async (
     ids: number[],
-    chunkSize: number,
+    batchSize: number,
     mode: "pending_only" | "pending_or_failed" | "force",
   ): Promise<ExtractBatchStats> => {
-    const total = {
-      requested_count: 0,
-      success_count: 0,
-      skipped_count: 0,
-      skipped_already_extracted_count: 0,
-      skipped_already_pending_count: 0,
-      skipped_already_success_count: 0,
-      skipped_already_rejected_count: 0,
-      skipped_already_approved_count: 0,
-      failed_count: 0,
-      resumed_requested_count: 0,
-      resumed_success: 0,
-      resumed_failed: 0,
-      resumed_skipped: 0,
-    };
-    const chunks: number[][] = [];
-    const safeChunkSize = Math.max(1, chunkSize);
-    for (let i = 0; i < ids.length; i += safeChunkSize) chunks.push(ids.slice(i, i + safeChunkSize));
-
-    for (let i = 0; i < chunks.length; i += 1) {
-      setWorkflowStep(`Extracting batch ${i + 1}/${chunks.length}...`);
-      const res = await fetch("/api/raw-posts/extract-batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ raw_post_ids: chunks[i], mode }),
-      });
-      const body = (await res.json()) as ExtractBatchStats | { detail?: string };
-      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Extract batch failed") : "Extract batch failed");
-      total.requested_count += (body as ExtractBatchStats).requested_count;
-      total.success_count += (body as ExtractBatchStats).success_count;
-      total.skipped_count += (body as ExtractBatchStats).skipped_count;
-      total.skipped_already_extracted_count += (body as ExtractBatchStats).skipped_already_extracted_count;
-      total.skipped_already_pending_count += (body as ExtractBatchStats).skipped_already_pending_count;
-      total.skipped_already_success_count += (body as ExtractBatchStats).skipped_already_success_count;
-      total.skipped_already_rejected_count += (body as ExtractBatchStats).skipped_already_rejected_count;
-      total.skipped_already_approved_count += (body as ExtractBatchStats).skipped_already_approved_count;
-      total.failed_count += (body as ExtractBatchStats).failed_count;
-      total.resumed_requested_count += (body as ExtractBatchStats).resumed_requested_count;
-      total.resumed_success += (body as ExtractBatchStats).resumed_success;
-      total.resumed_failed += (body as ExtractBatchStats).resumed_failed;
-      total.resumed_skipped += (body as ExtractBatchStats).resumed_skipped;
+    const stableIds = Array.from(new Set(ids)).sort((a, b) => a - b);
+    const idempotencyKey = `ingest:${mode}:${Math.max(1, batchSize)}:${stableIds.join(",")}`.slice(0, 256);
+    const createRes = await fetch("/api/extract-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        raw_post_ids: stableIds,
+        mode,
+        batch_size: Math.max(1, batchSize),
+        idempotency_key: idempotencyKey,
+      }),
+    });
+    const createParsed = await parseApiResponse<ExtractJobCreateResponse>(createRes);
+    setWorkflowRequestId(createParsed.requestId);
+    if (!createRes.ok || !createParsed.data || !("job_id" in (createParsed.data as Record<string, unknown>))) {
+      throw new Error(formatApiError("Create extract job failed", createParsed.data, createParsed.textBody, createParsed.requestId));
     }
-    return total;
+    const jobId = (createParsed.data as ExtractJobCreateResponse).job_id;
+
+    for (let attempt = 0; attempt < 1800; attempt += 1) {
+      const res = await fetch(`/api/extract-jobs/${jobId}`, { cache: "no-store" });
+      const parsed = await parseApiResponse<ExtractJob>(res);
+      if (!res.ok || !parsed.data) {
+        setWorkflowRequestId(parsed.requestId);
+        throw new Error(formatApiError("Load extract job failed", parsed.data, parsed.textBody, parsed.requestId));
+      }
+      const job = parsed.data as ExtractJob;
+      setWorkflowRequestId(parsed.requestId);
+      setWorkflowStep(
+        `Extract job ${job.status}: success=${job.success_count}, failed=${job.failed_count}, skipped=${job.skipped_count}, requested=${job.requested_count}`,
+      );
+      if (job.status === "done") return job;
+      if (job.status === "failed") {
+        const summary = job.last_error_summary ? `: ${job.last_error_summary}` : "";
+        throw new Error(`Extract job failed${summary}${parsed.requestId ? ` (request_id=${parsed.requestId})` : ""}`);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    }
+    throw new Error("Extract job polling timeout");
   };
 
   const updateRuntimeCallBudget = async () => {
@@ -947,6 +986,7 @@ export default function IngestPage() {
     }
     setWorkflowBusy(true);
     setWorkflowError(null);
+    setWorkflowRequestId(null);
     setWorkflowStep("Reading file...");
     setConvertResult(null);
     setExtractByHandle({});
@@ -1040,9 +1080,12 @@ export default function IngestPage() {
           skipped_already_extracted_count: 0,
           skipped_already_pending_count: 0,
           skipped_already_success_count: 0,
+          skipped_already_has_result_count: 0,
           skipped_already_rejected_count: 0,
           skipped_already_approved_count: 0,
+          skipped_not_followed_count: 0,
           failed_count: 0,
+          auto_rejected_count: 0,
           resumed_requested_count: 0,
           resumed_success: 0,
           resumed_failed: 0,
@@ -1052,7 +1095,7 @@ export default function IngestPage() {
         for (const [handle, byHandle] of Object.entries(imported.imported_by_handle)) {
           const ids = byHandle.raw_post_ids ?? [];
           if (ids.length === 0) continue;
-          const extracted = await runExtractBatch(ids, extractBatchSize, "pending_or_failed");
+          const extracted = await runExtractJob(ids, extractBatchSize, "pending_or_failed");
           perHandle[handle] = extracted;
           totals.requested_count += extracted.requested_count;
           totals.success_count += extracted.success_count;
@@ -1060,9 +1103,12 @@ export default function IngestPage() {
           totals.skipped_already_extracted_count += extracted.skipped_already_extracted_count;
           totals.skipped_already_pending_count += extracted.skipped_already_pending_count;
           totals.skipped_already_success_count += extracted.skipped_already_success_count;
+          totals.skipped_already_has_result_count += extracted.skipped_already_has_result_count;
           totals.skipped_already_rejected_count += extracted.skipped_already_rejected_count;
           totals.skipped_already_approved_count += extracted.skipped_already_approved_count;
+          totals.skipped_not_followed_count += extracted.skipped_not_followed_count;
           totals.failed_count += extracted.failed_count;
+          totals.auto_rejected_count += extracted.auto_rejected_count;
           totals.resumed_requested_count += extracted.resumed_requested_count;
           totals.resumed_success += extracted.resumed_success;
           totals.resumed_failed += extracted.resumed_failed;
@@ -1393,6 +1439,7 @@ export default function IngestPage() {
 
         {workflowStep && <p style={{ marginBottom: 0 }}>step: {workflowStep}</p>}
         {workflowError && <p style={{ color: "crimson", marginBottom: 0 }}>{workflowError}</p>}
+        {workflowRequestId && <p style={{ color: "#666", marginTop: "4px", marginBottom: 0 }}>request_id: {workflowRequestId}</p>}
 
         {convertedCount !== null && <p style={{ marginBottom: 0 }}>converted_rows={convertedCount}</p>}
         {convertResult && (
@@ -1541,8 +1588,12 @@ export default function IngestPage() {
               {extractStats.skipped_already_success_count}
             </p>
             <p style={{ margin: 0 }}>
+              skipped_already_has_result={extractStats.skipped_already_has_result_count}, auto_rejected=
+              {extractStats.auto_rejected_count}
+            </p>
+            <p style={{ margin: 0 }}>
               skipped_already_rejected={extractStats.skipped_already_rejected_count}, skipped_already_approved=
-              {extractStats.skipped_already_approved_count}
+              {extractStats.skipped_already_approved_count}, skipped_not_followed={extractStats.skipped_not_followed_count}
             </p>
             <p style={{ margin: 0 }}>
               resumed_requested_count={extractStats.resumed_requested_count}, resumed_success={extractStats.resumed_success},
@@ -1644,6 +1695,9 @@ export default function IngestPage() {
             )}
             <p style={{ margin: 0 }}>
               window_start: {runtimeSettings.window_start} | window_end: {runtimeSettings.window_end} (remaining {windowRemainingText})
+            </p>
+            <p style={{ margin: 0 }}>
+              provider_detected: {runtimeSettings.provider_detected} | extraction_output_mode: {runtimeSettings.extraction_output_mode}
             </p>
             <p style={{ margin: 0 }}>
               burst: {runtimeSettings.burst.enabled ? "enabled" : "disabled"} | mode: {runtimeSettings.burst.mode ?? "-"} | expires_at: {runtimeSettings.burst.expires_at ?? "-"}

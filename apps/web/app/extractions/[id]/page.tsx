@@ -59,6 +59,7 @@ type Extraction = {
   auto_applied_kol_view_ids: number[] | null;
   auto_approve_confidence_threshold: number | null;
   auto_approve_min_display_confidence: number | null;
+  auto_reject_confidence_threshold: number | null;
   approve_inserted_count: number | null;
   approve_skipped_count: number | null;
   auto_applied_asset_view_keys: string[] | null;
@@ -532,6 +533,19 @@ export default function ExtractionDetailPage() {
     return (meta as Record<string, unknown>)["fallback_reason"] === "budget_exhausted";
   }, [extraction]);
 
+  const autoRejectMeta = useMemo(() => {
+    if (!extraction) return null;
+    const rawMeta = extraction.extracted_json["meta"];
+    if (!rawMeta || typeof rawMeta !== "object") return null;
+    const meta = rawMeta as Record<string, unknown>;
+    if (meta["auto_rejected"] !== true) return null;
+    return {
+      reason: String(meta["auto_reject_reason"] ?? "-"),
+      threshold: String(meta["auto_reject_threshold"] ?? extraction.auto_reject_confidence_threshold ?? "-"),
+      modelConfidence: String(meta["model_confidence"] ?? "-"),
+    };
+  }, [extraction]);
+
   const extractedAssetViews = useMemo(() => {
     if (!extraction) return [];
     const minDisplayConfidence = extraction.auto_approve_min_display_confidence ?? 50;
@@ -630,6 +644,24 @@ export default function ExtractionDetailPage() {
               </div>
             )}
             {extraction.last_error && <div style={{ color: "crimson" }}>last_error: {extraction.last_error}</div>}
+            {autoRejectMeta && (
+              <div style={{ color: "#8a5800", marginTop: "4px" }}>
+                auto_rejected=true, reason={autoRejectMeta.reason}, threshold={autoRejectMeta.threshold},
+                model_confidence={autoRejectMeta.modelConfidence}
+              </div>
+            )}
+            {typeof extraction.extracted_json["meta"] === "object" && extraction.extracted_json["meta"] !== null && (
+              <div style={{ marginTop: "4px" }}>
+                meta: provider_detected=
+                {String((extraction.extracted_json["meta"] as Record<string, unknown>)["provider_detected"] ?? "-")},
+                output_mode_used=
+                {String((extraction.extracted_json["meta"] as Record<string, unknown>)["output_mode_used"] ?? "-")},
+                parse_strategy_used=
+                {String((extraction.extracted_json["meta"] as Record<string, unknown>)["parse_strategy_used"] ?? "-")},
+                raw_len={String((extraction.extracted_json["meta"] as Record<string, unknown>)["raw_len"] ?? "-")},
+                repaired={String((extraction.extracted_json["meta"] as Record<string, unknown>)["repaired"] ?? "-")}
+              </div>
+            )}
             {budgetExhaustedFallback && (
               <div style={{ color: "#b35c00" }}>已自动降级 Dummy，避免过度消耗额度。</div>
             )}

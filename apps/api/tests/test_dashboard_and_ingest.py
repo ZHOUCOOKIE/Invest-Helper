@@ -462,7 +462,8 @@ def test_x_import_triggers_extraction_for_new_posts_only(monkeypatch) -> None:  
 
     first = client.post("/ingest/x/import?trigger_extraction=true", json=payload)
     assert first.status_code == 200
-    assert first.json()["extract_success_count"] == 1
+    assert first.json()["extract_success_count"] == 0
+    assert first.json()["extract_failed_count"] == 1
     assert first.json()["skipped_already_extracted_count"] == 0
     assert len(called_raw_post_ids) == 1
 
@@ -472,8 +473,8 @@ def test_x_import_triggers_extraction_for_new_posts_only(monkeypatch) -> None:  
     assert second.status_code == 200
     assert second.json()["inserted_raw_posts_count"] == 0
     assert second.json()["extract_success_count"] == 0
-    assert second.json()["skipped_already_extracted_count"] == 1
-    assert len(called_raw_post_ids) == 1
+    assert second.json()["skipped_already_extracted_count"] == 0
+    assert len(called_raw_post_ids) == 2
 
 
 def test_resume_after_partial_success_reupload_only_retries_unfinished(monkeypatch) -> None:  # noqa: ANN001
@@ -514,8 +515,8 @@ def test_resume_after_partial_success_reupload_only_retries_unfinished(monkeypat
             raw_post_id=inserted_ids[0],
             status=ExtractionStatus.approved,
             extracted_json={"summary": "ok"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error=None,
             created_at=now,
         )
@@ -526,8 +527,8 @@ def test_resume_after_partial_success_reupload_only_retries_unfinished(monkeypat
             raw_post_id=inserted_ids[1],
             status=ExtractionStatus.pending,
             extracted_json={"summary": "failed"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error="OpenAIRequestError: status=429 rate_limited",
             created_at=now,
         )
@@ -541,8 +542,8 @@ def test_resume_after_partial_success_reupload_only_retries_unfinished(monkeypat
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "retried"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
         )
         db.add(extraction)
         await db.flush()
@@ -714,8 +715,8 @@ def test_multi_handle_reupload_dedup_and_pending_or_failed_only_resumes_failed(m
             raw_post_id=inserted_ids[0],
             status=ExtractionStatus.approved,
             extracted_json={"summary": "ok"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error=None,
             created_at=now,
         )
@@ -726,8 +727,8 @@ def test_multi_handle_reupload_dedup_and_pending_or_failed_only_resumes_failed(m
             raw_post_id=inserted_ids[1],
             status=ExtractionStatus.pending,
             extracted_json={"summary": "failed"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error="OpenAIRequestError: status=429 rate_limited",
             created_at=now,
         )
@@ -741,8 +742,8 @@ def test_multi_handle_reupload_dedup_and_pending_or_failed_only_resumes_failed(m
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "retried"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
         )
         db.add(extraction)
         await db.flush()
@@ -968,8 +969,8 @@ def test_extract_batch_pending_only_and_force(monkeypatch) -> None:  # noqa: ANN
             raw_post_id=2,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "already"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             created_at=now,
         )
     )
@@ -982,8 +983,8 @@ def test_extract_batch_pending_only_and_force(monkeypatch) -> None:  # noqa: ANN
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "created"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
         )
         db.add(extraction)
         await db.flush()
@@ -1097,8 +1098,23 @@ def test_extract_batch_idempotent_for_same_raw_post_pending_reused(monkeypatch) 
             raw_json=None,
         )
     )
-    monkeypatch.setenv("EXTRACTOR_MODE", "dummy")
-    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+    created_calls = {"n": 0}
+
+    async def fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        created_calls["n"] += 1
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "ok", "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+        )
+        db.add(extraction)
+        await db.flush()
+        return extraction
+
+    monkeypatch.setattr("main.create_pending_extraction", fake_create_pending_extraction)
 
     async def override_get_db():
         yield fake_db
@@ -1117,15 +1133,10 @@ def test_extract_batch_idempotent_for_same_raw_post_pending_reused(monkeypatch) 
     second_body = second.json()
     assert second_body["success_count"] == 0
     assert second_body["skipped_count"] == 1
-    assert second_body["skipped_already_pending_count"] == 1
-    assert second_body["skipped_already_success_count"] == 0
+    assert second_body["skipped_already_pending_count"] == 0
+    assert second_body["skipped_already_success_count"] == 1
 
-    active = [
-        item
-        for item in fake_db._data[PostExtraction].values()
-        if item.raw_post_id == 1 and item.status == ExtractionStatus.pending and not (item.last_error or "").strip()
-    ]
-    assert len(active) == 1
+    assert created_calls["n"] == 1
 
 
 def test_repeat_upload_resume_only_failed_or_no_extraction_skips_success_and_pending(monkeypatch) -> None:  # noqa: ANN001
@@ -1179,8 +1190,8 @@ def test_repeat_upload_resume_only_failed_or_no_extraction_skips_success_and_pen
             raw_post_id=raw_ids[0],
             status=ExtractionStatus.approved,
             extracted_json={"summary": "approved"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error=None,
             created_at=now,
         )
@@ -1191,8 +1202,8 @@ def test_repeat_upload_resume_only_failed_or_no_extraction_skips_success_and_pen
             raw_post_id=raw_ids[1],
             status=ExtractionStatus.pending,
             extracted_json={"summary": "pending"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error=None,
             created_at=now,
         )
@@ -1203,8 +1214,8 @@ def test_repeat_upload_resume_only_failed_or_no_extraction_skips_success_and_pen
             raw_post_id=raw_ids[2],
             status=ExtractionStatus.pending,
             extracted_json={"summary": "failed"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error="OpenAIRequestError: timeout",
             created_at=now,
         )
@@ -1218,8 +1229,8 @@ def test_repeat_upload_resume_only_failed_or_no_extraction_skips_success_and_pen
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "retried"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
         )
         db.add(extraction)
         await db.flush()
@@ -1240,7 +1251,8 @@ def test_repeat_upload_resume_only_failed_or_no_extraction_skips_success_and_pen
     assert body["requested_count"] == 4
     assert body["success_count"] == 2
     assert body["skipped_count"] == 2
-    assert body["skipped_already_pending_count"] == 1
+    assert body["skipped_already_pending_count"] == 0
+    assert body["skipped_already_success_count"] == 1
     assert body["skipped_already_approved_count"] == 1
     assert set(called_ids) == {raw_ids[2], raw_ids[3]}
 
@@ -1362,8 +1374,8 @@ def test_x_progress_counts_pending_failed_and_success() -> None:
             raw_post_id=1,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "ok"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error=None,
             created_at=now,
         )
@@ -1374,8 +1386,8 @@ def test_x_progress_counts_pending_failed_and_success() -> None:
             raw_post_id=2,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "failed"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error="OpenAIRequestError: timeout",
             created_at=now,
         )
@@ -1394,7 +1406,7 @@ def test_x_progress_counts_pending_failed_and_success() -> None:
     global_body = global_resp.json()
     assert global_body["total_raw_posts"] == 3
     assert global_body["extracted_success_count"] == 1
-    assert global_body["pending_count"] == 1
+    assert global_body["pending_count"] == 0
     assert global_body["failed_count"] == 1
     assert global_body["no_extraction_count"] == 1
     assert "timeout" in (global_body["latest_error_summary"] or "")
@@ -1405,6 +1417,204 @@ def test_x_progress_counts_pending_failed_and_success() -> None:
     assert handle_body["author_handle"] == "alice"
     assert handle_body["total_raw_posts"] == 2
     assert handle_body["failed_count"] == 1
+
+
+def test_pending_valid_extraction_is_counted_as_success_not_pending() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="pending-success-1",
+            url="https://x.com/alice/status/pending-success-1",
+            content_text="ok",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=101,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "valid", "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    progress = client.get("/ingest/x/progress")
+    batch = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "pending_or_failed"})
+    app.dependency_overrides.clear()
+
+    assert progress.status_code == 200
+    progress_body = progress.json()
+    assert progress_body["extracted_success_count"] == 1
+    assert progress_body["pending_count"] == 0
+    assert progress_body["failed_count"] == 0
+    assert batch.status_code == 200
+    batch_body = batch.json()
+    assert batch_body["success_count"] == 0
+    assert batch_body["skipped_already_success_count"] == 1
+    assert batch_body["skipped_already_pending_count"] == 0
+
+
+def test_pending_with_error_or_dummy_is_counted_as_failed_not_success() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="pending-failed-1",
+            url="https://x.com/alice/status/pending-failed-1",
+            content_text="err",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=2,
+            platform="x",
+            author_handle="alice",
+            external_id="pending-failed-2",
+            url="https://x.com/alice/status/pending-failed-2",
+            content_text="dummy",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=201,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "err", "meta": {"parse_error": True}},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error="RuntimeError: parse failed",
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=202,
+            raw_post_id=2,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "dummy", "meta": {"dummy_fallback": True}},
+            model_name="dummy-v1",
+            extractor_name="dummy",
+            last_error=None,
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    progress = client.get("/ingest/x/progress")
+    app.dependency_overrides.clear()
+
+    assert progress.status_code == 200
+    body = progress.json()
+    assert body["extracted_success_count"] == 0
+    assert body["pending_count"] == 0
+    assert body["failed_count"] == 2
+
+
+def test_approved_rejected_are_terminal_skip_unless_force(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="terminal-approved",
+            url="https://x.com/alice/status/terminal-approved",
+            content_text="approved",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            review_status=ReviewStatus.approved,
+            reviewed_at=now,
+            reviewed_by="human-review",
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=2,
+            platform="x",
+            author_handle="alice",
+            external_id="terminal-rejected",
+            url="https://x.com/alice/status/terminal-rejected",
+            content_text="rejected",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            review_status=ReviewStatus.rejected,
+            reviewed_at=now,
+            reviewed_by="human-review",
+        )
+    )
+
+    calls: list[int] = []
+
+    async def fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        calls.append(raw_post.id)
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "forced", "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+        )
+        db.add(extraction)
+        await db.flush()
+        return extraction
+
+    monkeypatch.setattr("main.create_pending_extraction", fake_create_pending_extraction)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    normal = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1, 2], "mode": "pending_or_failed"})
+
+    assert normal.status_code == 200
+    normal_body = normal.json()
+    assert normal_body["success_count"] == 0
+    assert normal_body["skipped_already_approved_count"] == 1
+    assert normal_body["skipped_already_rejected_count"] == 1
+    assert calls == []
+
+    forced = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1, 2], "mode": "force"})
+    app.dependency_overrides.clear()
+    assert forced.status_code == 200
+    forced_body = forced.json()
+    assert forced_body["success_count"] == 2
+    assert calls == [1, 2]
 
 
 def test_retry_failed_retries_only_failed_and_respects_limit(monkeypatch) -> None:  # noqa: ANN001
@@ -1454,8 +1664,8 @@ def test_retry_failed_retries_only_failed_and_respects_limit(monkeypatch) -> Non
             raw_post_id=2,
             status=ExtractionStatus.pending,
             extracted_json={"summary": "ok"},
-            model_name="dummy-v1",
-            extractor_name="dummy",
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
             last_error=None,
             created_at=now,
         )

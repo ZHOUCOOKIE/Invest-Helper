@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
 import json
+import re
 from threading import Lock
 from time import perf_counter
 from typing import Any, Literal, Mapping
@@ -20,6 +21,10 @@ STANCE_VALUES = ["bull", "bear", "neutral"]
 HORIZON_VALUES = ["intraday", "1w", "1m", "3m", "1y"]
 _OPENAI_CALLS_MADE = 0
 _OPENAI_CALLS_LOCK = Lock()
+OPENAI_PROVIDER_OPENROUTER = "openrouter"
+OPENAI_PROVIDER_COMPATIBLE = "openai_compatible"
+EXTRACTION_OUTPUT_STRUCTURED = "structured"
+EXTRACTION_OUTPUT_TEXT_JSON = "text_json"
 
 
 class OpenAIRequestError(RuntimeError):
@@ -720,11 +725,36 @@ class OpenAIExtractor(Extractor):
         self.max_output_tokens = max(1, max_output_tokens)
         self.openrouter_site_url = openrouter_site_url.strip()
         self.openrouter_app_name = openrouter_app_name.strip()
+        self.provider_detected = detect_provider_from_base_url(self.base_url)
+        self.output_mode = resolve_extraction_output_mode(self.base_url)
         self._audit = ExtractionAudit()
 
     def extract(self, raw_post: RawPost) -> dict[str, Any]:
+        if self.output_mode == EXTRACTION_OUTPUT_TEXT_JSON:
+            model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_TEXT_JSON)
+            parsed_content, raw_content, latency_ms, input_tokens, output_tokens = _coerce_call_result(model_json)
+            self._record_model_output(
+                raw_model_output=raw_content,
+                parsed_model_output=parsed_content,
+                model_latency_ms=latency_ms,
+                model_input_tokens=input_tokens,
+                model_output_tokens=output_tokens,
+            )
+            normalized_json = normalize_extracted_json(parsed_content, posted_at=raw_post.posted_at)
+            payload = ExtractionPayload.model_validate(normalized_json)
+            parsed = payload.model_dump(mode="json")
+            parsed["meta"] = {
+                "extraction_mode": EXTRACTION_OUTPUT_TEXT_JSON,
+                "output_mode_used": EXTRACTION_OUTPUT_TEXT_JSON,
+                "provider_detected": self.provider_detected,
+                "parse_strategy_used": model_json.get("parse_strategy_used"),
+                "raw_len": model_json.get("raw_len"),
+                "repaired": bool(model_json.get("repaired")),
+            }
+            return parsed
+
         try:
-            model_json = self._call_openai(raw_post, response_mode="structured")
+            model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_STRUCTURED)
             parsed_content, raw_content, latency_ms, input_tokens, output_tokens = _coerce_call_result(model_json)
             self._record_model_output(
                 raw_model_output=raw_content,
@@ -735,24 +765,22 @@ class OpenAIExtractor(Extractor):
             )
             payload = ExtractionPayload.model_validate(parsed_content)
             parsed = payload.model_dump(mode="json")
-            parsed["meta"] = {"extraction_mode": "structured"}
+            parsed["meta"] = {
+                "extraction_mode": EXTRACTION_OUTPUT_STRUCTURED,
+                "output_mode_used": EXTRACTION_OUTPUT_STRUCTURED,
+                "provider_detected": self.provider_detected,
+                "parse_strategy_used": "native_json",
+                "raw_len": model_json.get("raw_len"),
+                "repaired": False,
+            }
             return parsed
         except OpenAIRequestError as exc:
             self._record_model_output(raw_model_output=exc.body_preview)
             if not self._is_structured_outputs_unsupported(exc):
                 raise
 
-            from settings import get_settings
-
-            settings = get_settings()
-            if not try_consume_openai_call_budget(settings):
-                raise OpenAIFallbackError(
-                    "OpenAI structured-outputs unsupported, but retry budget exhausted",
-                    fallback_reason="structured_unsupported",
-                ) from exc
-
             try:
-                model_json = self._call_openai(raw_post, response_mode="json_mode")
+                model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_TEXT_JSON)
                 parsed_content, raw_content, latency_ms, input_tokens, output_tokens = _coerce_call_result(model_json)
                 self._record_model_output(
                     raw_model_output=raw_content,
@@ -765,18 +793,23 @@ class OpenAIExtractor(Extractor):
                 payload = ExtractionPayload.model_validate(normalized_json)
                 parsed = payload.model_dump(mode="json")
                 parsed["meta"] = {
-                    "extraction_mode": "json_mode",
+                    "extraction_mode": EXTRACTION_OUTPUT_TEXT_JSON,
+                    "output_mode_used": EXTRACTION_OUTPUT_TEXT_JSON,
+                    "provider_detected": self.provider_detected,
+                    "parse_strategy_used": model_json.get("parse_strategy_used"),
+                    "raw_len": model_json.get("raw_len"),
+                    "repaired": bool(model_json.get("repaired")),
                     "fallback_reason": "structured_unsupported",
                 }
                 return parsed
             except Exception as retry_exc:
                 raise OpenAIFallbackError(
-                    f"OpenAI json_mode retry failed after structured unsupported: {retry_exc}",
+                    f"OpenAI text_json retry failed after structured unsupported: {retry_exc}",
                     fallback_reason="structured_unsupported",
                 ) from retry_exc
 
     def _call_openai(
-        self, raw_post: RawPost, *, response_mode: Literal["structured", "json_mode"]
+        self, raw_post: RawPost, *, response_mode: Literal["structured", "text_json"]
     ) -> dict[str, Any]:
         strict_json_hint = (
             "Return exactly one JSON object. "
@@ -802,7 +835,7 @@ class OpenAIExtractor(Extractor):
             "If stance/horizon/confidence cannot be inferred, return null. "
             "Do not guess symbols; keep assets empty when unknown. "
             f"{strict_json_hint} "
-            f"{json_mode_hard_rules if response_mode == 'json_mode' else ''}"
+            f"{json_mode_hard_rules if response_mode == EXTRACTION_OUTPUT_TEXT_JSON else ''}"
         )
         user_prompt = self._build_user_prompt(raw_post)
 
@@ -815,7 +848,7 @@ class OpenAIExtractor(Extractor):
                 {"role": "user", "content": user_prompt},
             ],
         }
-        if response_mode == "structured":
+        if response_mode == EXTRACTION_OUTPUT_STRUCTURED:
             request_payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -824,8 +857,6 @@ class OpenAIExtractor(Extractor):
                     "schema": EXTRACTION_JSON_SCHEMA,
                 },
             }
-        else:
-            request_payload["response_format"] = {"type": "json_object"}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -864,11 +895,20 @@ class OpenAIExtractor(Extractor):
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
 
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as exc:
-            self._record_model_output(raw_model_output=content, model_latency_ms=latency_ms)
-            raise RuntimeError(f"OpenAI content is not valid JSON: {exc}") from exc
+        parse_strategy_used = "native_json"
+        repaired = False
+        if response_mode == EXTRACTION_OUTPUT_STRUCTURED:
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:
+                self._record_model_output(raw_model_output=content, model_latency_ms=latency_ms)
+                raise RuntimeError(f"OpenAI content is not valid JSON: {exc}") from exc
+        else:
+            try:
+                parsed, parse_strategy_used, repaired = parse_text_json_object(content)
+            except RuntimeError:
+                self._record_model_output(raw_model_output=content, model_latency_ms=latency_ms)
+                raise
 
         if not isinstance(parsed, dict):
             raise RuntimeError("OpenAI content is not a JSON object")
@@ -878,6 +918,9 @@ class OpenAIExtractor(Extractor):
             "latency_ms": latency_ms,
             "input_tokens": int(prompt_tokens) if isinstance(prompt_tokens, int) else None,
             "output_tokens": int(completion_tokens) if isinstance(completion_tokens, int) else None,
+            "parse_strategy_used": parse_strategy_used,
+            "raw_len": len(content),
+            "repaired": repaired,
         }
 
     def _build_user_prompt(self, raw_post: RawPost) -> str:
@@ -900,6 +943,92 @@ class OpenAIExtractor(Extractor):
         has_structured_token = "structured-outputs" in text or "structured_outputs" in text
         has_unsupported_signal = "does not support" in text or "unsupported" in text
         return has_structured_token and has_unsupported_signal
+
+
+def detect_provider_from_base_url(base_url: str) -> str:
+    normalized = (base_url or "").strip().lower()
+    if "openrouter.ai" in normalized:
+        return OPENAI_PROVIDER_OPENROUTER
+    return OPENAI_PROVIDER_COMPATIBLE
+
+
+def resolve_extraction_output_mode(base_url: str) -> str:
+    provider = detect_provider_from_base_url(base_url)
+    if provider == OPENAI_PROVIDER_OPENROUTER:
+        return EXTRACTION_OUTPUT_TEXT_JSON
+    return EXTRACTION_OUTPUT_STRUCTURED
+
+
+def parse_text_json_object(content: str) -> tuple[dict[str, Any], str, bool]:
+    if not isinstance(content, str):
+        raise RuntimeError("OpenAI content is not text")
+
+    cleaned = content.lstrip("\ufeff").strip()
+    if not cleaned:
+        raise RuntimeError("OpenAI content is empty")
+
+    parse_candidates: list[tuple[str, str, bool]] = [(cleaned, "direct_json", False)]
+    fenced = _extract_json_codeblock(cleaned)
+    if fenced:
+        parse_candidates.append((fenced, "strip_codeblock", True))
+    outermost = _extract_outermost_json_object(cleaned)
+    if outermost and outermost != cleaned:
+        parse_candidates.append((outermost, "outermost_object", True))
+
+    for candidate, strategy, repaired in parse_candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed, strategy, repaired
+        raise RuntimeError("OpenAI content is not a JSON object")
+    raise RuntimeError("OpenAI content is not valid JSON object text")
+
+
+def _extract_json_codeblock(text: str) -> str | None:
+    match = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _extract_outermost_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    first_open = -1
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                first_open = idx
+            depth += 1
+            continue
+        if ch == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and first_open >= 0:
+                return text[first_open : idx + 1].strip()
+    return None
 
 
 def default_extracted_json(raw_post: RawPost) -> dict[str, Any]:

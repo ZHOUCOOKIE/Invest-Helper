@@ -5,6 +5,7 @@ from enum import Enum
 import hashlib
 import json
 import random
+import re
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -912,6 +913,59 @@ def _build_alias_to_symbol_map(aliases: list[dict[str, str]]) -> dict[str, str]:
         if alias and symbol:
             mapping[alias] = symbol
     return mapping
+
+
+def _extract_directly_mentioned_symbols(
+    text: str = "",
+    *,
+    content_text: str | None = None,
+    alias_to_symbol: dict[str, str] | None = None,
+    known_symbols: set[str] | None = None,
+) -> list[str]:
+    source_text = content_text if content_text is not None else text
+    if not isinstance(source_text, str) or not source_text.strip():
+        return []
+
+    direct_mentions: list[str] = []
+    seen: set[str] = set()
+
+    def _push(symbol: str) -> None:
+        normalized = symbol.strip().upper()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        direct_mentions.append(normalized)
+
+    if known_symbols:
+        normalized_known = sorted(
+            {
+                item.strip().upper()
+                for item in known_symbols
+                if isinstance(item, str) and item.strip()
+            },
+            key=len,
+            reverse=True,
+        )
+        for symbol in normalized_known:
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", source_text, flags=re.IGNORECASE):
+                _push(symbol)
+
+    if alias_to_symbol:
+        lowered_text = source_text.lower()
+        normalized_aliases = sorted(
+            (
+                (_normalize_alias_key(alias), symbol.strip().upper())
+                for alias, symbol in alias_to_symbol.items()
+                if isinstance(alias, str) and isinstance(symbol, str) and alias.strip() and symbol.strip()
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+        for alias_key, symbol in normalized_aliases:
+            if alias_key and alias_key in lowered_text:
+                _push(symbol)
+
+    return direct_mentions
 
 
 async def upsert_asset(

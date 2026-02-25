@@ -1,3 +1,14 @@
 # Python bytecode/cache
 __pycache__/
 *.pyc
+# local secrets
+.env
+apps/api/.env
+*.env
+
+# local runbooks
+RUNBOOK_LOCAL.txt
+RUNBOOK_LOCAL.*.txt
+
+# exported X data
+twitter-*.json

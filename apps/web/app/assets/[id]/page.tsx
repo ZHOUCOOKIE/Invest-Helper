@@ -19,6 +19,8 @@ type KolView = {
   source_url: string;
   as_of: string;
   created_at: string;
+  posted_at?: string | null;
+  extraction_id?: number | null;
 };
 
 type AssetViewsResponse = {
@@ -151,7 +153,7 @@ export default function AssetDetailPage() {
     setTimelineLoading(true);
     setTimelineError(null);
     try {
-      const res = await fetch(`/api/assets/${assetId}/views/timeline?days=30`, { cache: "no-store" });
+      const res = await fetch(`/api/assets/${assetId}/views/timeline?days=365`, { cache: "no-store" });
       const body = (await res.json()) as AssetViewsTimelineResponse | { detail?: string };
       if (!res.ok) {
         throw new Error("detail" in body ? (body.detail ?? "Load timeline failed") : "Load timeline failed");

@@ -61,6 +61,7 @@ type DashboardResponse = {
   pending_extractions_count: number;
   new_views_24h: number;
   new_views_7d: number;
+  total_assets_count: number;
   assets: DashboardAsset[];
   active_kols_7d: DashboardActiveKol[];
   clarity_ranking: DashboardClarityRankingItem[];
@@ -84,15 +85,26 @@ export default function DashboardPage() {
   const [query, setQuery] = useState("");
   const [windowKey, setWindowKey] = useState<WindowKey>("24h");
   const [clarityWindow, setClarityWindow] = useState<WindowKey>("7d");
+  const [showAllAssets, setShowAllAssets] = useState(false);
   const todayDigestDate = new Date().toISOString().slice(0, 10);
 
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/dashboard?days=7&profile_id=1&window=${clarityWindow}&limit=10`, {
-        cache: "no-store",
+      const params = new URLSearchParams({
+        days: "7",
+        profile_id: "1",
+        window: clarityWindow,
+        limit: "10",
+        assets_window: windowKey,
       });
+      if (showAllAssets) {
+        params.set("show_all_assets", "true");
+      } else {
+        params.set("assets_limit", "15");
+      }
+      const res = await fetch(`/api/dashboard?${params.toString()}`, { cache: "no-store" });
       const body = (await res.json()) as DashboardResponse | { detail?: string };
       if (!res.ok) {
         throw new Error("detail" in body ? (body.detail ?? "Load failed") : "Load failed");
@@ -107,7 +119,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     void load();
-  }, [clarityWindow]);
+  }, [clarityWindow, windowKey, showAllAssets]);
 
   const visibleAssets = useMemo(() => {
     const assets = data?.assets ?? [];
@@ -211,7 +223,23 @@ export default function DashboardPage() {
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
-            <h2 style={{ marginTop: 0 }}>资产列表</h2>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+              <h2 style={{ marginTop: 0, marginBottom: "8px" }}>
+                资产列表 {showAllAssets ? "(全部)" : "(Top 15)"}
+              </h2>
+              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                {!showAllAssets && (data?.total_assets_count ?? 0) > 15 && (
+                  <button type="button" onClick={() => setShowAllAssets(true)}>
+                    查看更多资产（共{data?.total_assets_count ?? 0}）
+                  </button>
+                )}
+                {showAllAssets && (
+                  <button type="button" onClick={() => setShowAllAssets(false)}>
+                    收起到 Top 15
+                  </button>
+                )}
+              </div>
+            </div>
             {visibleAssets.length === 0 ? (
               <p>暂无资产或未命中搜索条件。</p>
             ) : (

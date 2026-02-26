@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 import hashlib
 import json
+import os
 import random
 import re
 import time
@@ -39,6 +40,7 @@ from schemas import (
     AssetRead,
     AdminDeletePendingExtractionsRead,
     AdminCleanupDuplicatePendingRead,
+    AdminFixApprovedMissingViewsRead,
     AdminBackfillAutoReviewRead,
     AdminRefreshWrongExtractedJsonRead,
     AdminHardDeleteRead,
@@ -90,6 +92,8 @@ from schemas import (
     XConvertErrorRead,
     XIngestProgressRead,
     XRetryFailedRead,
+    XRawPostsPreviewRead,
+    XRawPostsPreviewSampleRead,
     XImportStatsRead,
     XImportedByHandleRead,
     XCreatedKolRead,
@@ -160,11 +164,19 @@ EXTRACT_JOBS_LOCK = asyncio.Lock()
 EXTRACT_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
 EXTRACT_JOB_IDEMPOTENCY: dict[str, str] = {}
 EXTRACT_JOB_SESSION_FACTORY = AsyncSessionLocal
+DEFAULT_CORS_ALLOW_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+CJK_RE = re.compile(r"[\u3400-\u9fff]")
+EN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+CORS_ALLOW_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", DEFAULT_CORS_ALLOW_ORIGINS).split(",")
+    if origin.strip()
+]
 
 # 先放开本地前端跨域，后面再收紧
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -584,6 +596,31 @@ def _build_last_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _append_last_error(current: str | None, extra: str) -> str:
+    if not extra.strip():
+        return current or ""
+    if not current:
+        return extra
+    return f"{current}; {extra}"
+
+
+def _detect_reasoning_language(reasoning: Any) -> str:
+    if not isinstance(reasoning, str):
+        return "zh"
+    text = reasoning.strip()
+    if not text:
+        return "zh"
+    cjk_count = len(CJK_RE.findall(text))
+    if cjk_count >= 2:
+        return "zh"
+    en_word_count = len(EN_WORD_RE.findall(text))
+    if cjk_count == 0 and en_word_count >= 6:
+        return "non_zh"
+    if cjk_count <= 1 and en_word_count >= 12:
+        return "non_zh"
+    return "zh"
+
+
 def _extractor_provider_output(extractor: DummyExtractor | OpenAIExtractor) -> tuple[str, str]:
     if isinstance(extractor, OpenAIExtractor):
         return extractor.provider_detected, extractor.output_mode
@@ -596,6 +633,9 @@ def _build_extraction_meta(
     extractor: DummyExtractor | OpenAIExtractor,
     fallback_reason: str | None,
     last_error: str | None,
+    reasoning_language: str,
+    reasoning_language_violation: bool,
+    reasoning_language_retry_used: bool,
 ) -> dict[str, Any]:
     base_meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
     safe_meta = dict(base_meta)
@@ -613,6 +653,9 @@ def _build_extraction_meta(
         safe_meta["dummy_fallback"] = True
     if last_error:
         safe_meta["parse_error"] = safe_meta.get("parse_error") or ("json" in last_error.lower() and "openai" in last_error.lower())
+    safe_meta["reasoning_language"] = reasoning_language
+    safe_meta["reasoning_language_violation"] = reasoning_language_violation
+    safe_meta["reasoning_language_retry_used"] = reasoning_language_retry_used
     return safe_meta
 
 
@@ -743,6 +786,46 @@ def _normalize_handle(value: str) -> str:
 
 def _normalize_author_handle(value: str) -> str:
     return value.strip().lstrip("@").lower()
+
+
+def _resolve_x_preview_window(
+    *,
+    start_date: date | None,
+    end_date: date | None,
+) -> tuple[datetime | None, datetime | None]:
+    start_ts = datetime.combine(start_date, datetime.min.time(), tzinfo=UTC) if start_date else None
+    # end_date is inclusive in UI/API contract, so SQL uses < next-day 00:00 UTC.
+    end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=UTC) if end_date else None
+    return start_ts, end_exclusive
+
+
+def _build_x_raw_posts_preview_query(
+    *,
+    author_handle: str | None,
+    start_date: date | None,
+    end_date: date | None,
+):
+    normalized_handle = _normalize_author_handle(author_handle or "")
+    time_expr = func.coalesce(RawPost.posted_at, RawPost.fetched_at)
+    query = (
+        select(
+            RawPost.id,
+            RawPost.external_id,
+            RawPost.author_handle,
+            RawPost.posted_at,
+            RawPost.fetched_at,
+            time_expr.label("matched_time"),
+        )
+        .where(RawPost.platform == "x")
+    )
+    if normalized_handle:
+        query = query.where(func.lower(RawPost.author_handle) == normalized_handle)
+    time_min_utc, time_max_exclusive_utc = _resolve_x_preview_window(start_date=start_date, end_date=end_date)
+    if time_min_utc is not None:
+        query = query.where(time_expr >= time_min_utc)
+    if time_max_exclusive_utc is not None:
+        query = query.where(time_expr < time_max_exclusive_utc)
+    return query, time_expr, time_min_utc, time_max_exclusive_utc
 
 
 def _coerce_row_bool(value: Any) -> bool:
@@ -1281,6 +1364,20 @@ def _build_retry_backoff_seconds(*, attempt: int, base_ms: int, cap_ms: int) -> 
 def _build_extraction_input(raw_post: RawPost) -> tuple[RawPost | SimpleNamespace, dict | None]:
     settings = get_settings()
     max_length = max(1, settings.extraction_max_content_chars)
+    try:
+        context_window_tokens = int(os.getenv("MODEL_CONTEXT_WINDOW_TOKENS", "0") or 0)
+        prompt_reserve_tokens = int(os.getenv("MODEL_PROMPT_RESERVE_TOKENS", "0") or 0)
+        max_output_tokens = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "0") or 0)
+        chars_per_token = max(1, int(os.getenv("MODEL_CHARS_PER_TOKEN", "4") or 4))
+    except ValueError:
+        context_window_tokens = 0
+        prompt_reserve_tokens = 0
+        max_output_tokens = 0
+        chars_per_token = 4
+    if context_window_tokens > 0:
+        content_budget_tokens = context_window_tokens - prompt_reserve_tokens - max_output_tokens
+        if content_budget_tokens > 0:
+            max_length = min(max_length, max(1, content_budget_tokens * chars_per_token))
     original_content = raw_post.content_text or ""
     original_length = len(original_content)
     if original_length <= max_length:
@@ -1412,6 +1509,93 @@ def _extract_directly_mentioned_symbols(
                 _push(symbol)
 
     return direct_mentions
+
+
+def _is_macro_context_text(content_text: str) -> bool:
+    text = (content_text or "").lower()
+    macro_tokens = [
+        "macro",
+        "risk-off",
+        "risk off",
+        "risk sentiment",
+        "宏观",
+        "风险偏好",
+        "避险",
+        "通胀",
+        "收益率",
+    ]
+    return any(token in text for token in macro_tokens)
+
+
+def _cap_asset_views_for_runtime_rules(
+    *,
+    extracted_json: dict[str, Any],
+    raw_post: RawPost | SimpleNamespace,
+    alias_to_symbol: dict[str, str],
+    known_symbols: set[str],
+) -> None:
+    views = extracted_json.get("asset_views")
+    meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
+    if not isinstance(views, list):
+        extracted_json["meta"] = {
+            **meta,
+            "asset_views_capped": False,
+            "asset_views_original_count": 0,
+            "asset_views_final_count": 0,
+            "asset_views_cap_reason": None,
+            "asset_views_kept_symbols": [],
+            "direct_mentioned_symbols": [],
+        }
+        return
+
+    original_count = len(views)
+    direct_mentions = _extract_directly_mentioned_symbols(
+        content_text=getattr(raw_post, "content_text", ""),
+        alias_to_symbol=alias_to_symbol,
+        known_symbols=known_symbols,
+    )
+    direct_set = set(direct_mentions)
+    cap_reason: str | None = None
+    capped = False
+    kept_views = views
+
+    if direct_mentions:
+        kept_views = [
+            item for item in views if isinstance(item, dict) and _normalize_asset_symbol(item.get("symbol")) in direct_set
+        ]
+        if len(direct_mentions) <= 3:
+            cap_reason = "direct_mentions_le_3"
+            capped = len(kept_views) != original_count
+        else:
+            cap_reason = "keep_only_direct_mentions_when_gt_3"
+            capped = len(kept_views) != original_count
+    elif _is_macro_context_text(getattr(raw_post, "content_text", "")):
+        macro_keep = {"SPY", "GLD", "BTC", "ETH", "US10Y", "DXY", "VIX", "XAUUSD", "CL=F"}
+        macro_filtered = [
+            item for item in views if isinstance(item, dict) and _normalize_asset_symbol(item.get("symbol")) in macro_keep
+        ]
+        if macro_filtered and len(macro_filtered) != original_count:
+            kept_views = macro_filtered
+            cap_reason = "macro_keep_representative_assets"
+            capped = True
+
+    final_count = len(kept_views)
+    kept_symbols: list[str] = []
+    for item in kept_views:
+        if isinstance(item, dict):
+            symbol = _normalize_asset_symbol(item.get("symbol"))
+            if symbol:
+                kept_symbols.append(symbol)
+    extracted_json["asset_views"] = kept_views
+    extracted_json["meta"] = {
+        **meta,
+        "asset_views_capped": capped,
+        "asset_views_original_count": original_count,
+        "asset_views_final_count": final_count,
+        "asset_views_cap_reason": cap_reason,
+        "asset_views_kept_symbols": kept_symbols,
+        "direct_mentioned_symbols": direct_mentions,
+    }
 
 
 async def upsert_asset(
@@ -2036,6 +2220,9 @@ async def create_pending_extraction(
     budget_exhausted = False
     fallback_reason: str | None = None
     force_fail_reason: str | None = None
+    reasoning_language = "zh"
+    reasoning_language_violation = False
+    reasoning_language_retry_used = False
     allow_dummy_fallback = bool(settings.dummy_fallback) or settings.extractor_mode.strip().lower() == "dummy"
 
     runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
@@ -2073,8 +2260,10 @@ async def create_pending_extraction(
                 extracted_json = extractor.extract(extraction_input)
 
     if isinstance(extracted_json, dict):
+        raw_extracted_json = extracted_json.copy()
         extracted_json = extracted_json.copy()
     else:
+        raw_extracted_json = {}
         extracted_json = default_extracted_json(extraction_input)
     extracted_json = normalize_extracted_json(
         extracted_json,
@@ -2083,12 +2272,65 @@ async def create_pending_extraction(
         alias_to_symbol=alias_to_symbol,
         known_symbols=known_symbols,
     )
+    _cap_asset_views_for_runtime_rules(
+        extracted_json=extracted_json,
+        raw_post=extraction_input,
+        alias_to_symbol=alias_to_symbol,
+        known_symbols=known_symbols,
+    )
+    raw_horizon = raw_extracted_json.get("horizon")
+    if isinstance(raw_horizon, str) and raw_horizon not in {"intraday", "1w", "1m", "3m", "1y"}:
+        extracted_json["horizon"] = "1w"
+        extracted_json["meta"] = {
+            **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
+            "horizon_coerced": True,
+            "horizon_original": raw_horizon,
+            "horizon_final": "1w",
+            "horizon_coerce_reason": "invalid_horizon_enum",
+        }
+    elif isinstance(extracted_json.get("meta"), dict):
+        extracted_json["meta"].setdefault("horizon_coerced", False)
+    reasoning_language = _detect_reasoning_language(extracted_json.get("reasoning"))
+    reasoning_language_violation = reasoning_language == "non_zh"
+    if reasoning_language_violation and force_fail_reason is None and isinstance(extractor, OpenAIExtractor):
+        if try_consume_openai_call_budget(
+            settings,
+            budget_total=runtime_budget_total,
+        ):
+            reasoning_language_retry_used = True
+            extractor.set_reasoning_language_retry_hint(True)
+            try:
+                extracted_json_retry = extractor.extract(extraction_input)
+                if isinstance(extracted_json_retry, dict):
+                    extracted_json_retry = extracted_json_retry.copy()
+                else:
+                    extracted_json_retry = default_extracted_json(extraction_input)
+                extracted_json = normalize_extracted_json(
+                    extracted_json_retry,
+                    posted_at=extraction_input.posted_at,
+                    include_meta=True,
+                    alias_to_symbol=alias_to_symbol,
+                    known_symbols=known_symbols,
+                )
+                reasoning_language = _detect_reasoning_language(extracted_json.get("reasoning"))
+                reasoning_language_violation = reasoning_language == "non_zh"
+                if reasoning_language_violation:
+                    last_error = _append_last_error(last_error, "reasoning_language_violation_after_retry")
+            except Exception as retry_exc:  # noqa: BLE001
+                last_error = _append_last_error(last_error, f"reasoning_language_retry_failed: {_build_last_error(retry_exc)}")
+            finally:
+                extractor.set_reasoning_language_retry_hint(False)
+        else:
+            last_error = _append_last_error(last_error, "reasoning_language_violation_no_retry_budget")
 
     extracted_json["meta"] = _build_extraction_meta(
         extracted_json=extracted_json,
         extractor=extractor,
         fallback_reason=fallback_reason,
         last_error=last_error,
+        reasoning_language=reasoning_language,
+        reasoning_language_violation=reasoning_language_violation,
+        reasoning_language_retry_used=reasoning_language_retry_used,
     )
 
     if truncation_meta:
@@ -2115,6 +2357,23 @@ async def create_pending_extraction(
     audit = extractor.get_audit()
     if audit.raw_model_output is None:
         audit.raw_model_output = json.dumps(extracted_json, ensure_ascii=False)
+    raw_model_output_limit = max(0, int(os.getenv("RAW_MODEL_OUTPUT_MAX_CHARS", "0") or 0))
+    if raw_model_output_limit > 0 and isinstance(audit.raw_model_output, str):
+        raw_len = len(audit.raw_model_output)
+        if raw_len > raw_model_output_limit:
+            audit.raw_model_output = audit.raw_model_output[:raw_model_output_limit]
+            extracted_json["meta"] = {
+                **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
+                "raw_truncated": True,
+                "raw_saved_len": raw_model_output_limit,
+                "raw_original_len": raw_len,
+            }
+        else:
+            extracted_json["meta"] = {
+                **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
+                "raw_truncated": False,
+                "raw_saved_len": raw_len,
+            }
     if audit.parsed_model_output is None and isinstance(extracted_json, dict):
         audit.parsed_model_output = extracted_json
 
@@ -2599,9 +2858,38 @@ async def get_asset_views_timeline(
     )
     all_views = list(result.scalars().all())
     filtered = [item for item in all_views if item.as_of and item.as_of >= since_date]
+    view_ids = [item.id for item in filtered]
+    source_urls = sorted({item.source_url.strip() for item in filtered if item.source_url and item.source_url.strip()})
 
     kol_result = await db.execute(select(Kol))
     kol_map = {item.id: item for item in kol_result.scalars().all()}
+    posted_at_by_url: dict[str, datetime] = {}
+    if source_urls:
+        raw_posts_result = await db.execute(
+            select(RawPost.url, RawPost.posted_at)
+            .where(RawPost.url.in_(source_urls))
+            .order_by(RawPost.posted_at.desc(), RawPost.id.desc())
+        )
+        for url, posted_at in raw_posts_result.all():
+            if not isinstance(url, str):
+                continue
+            key = url.strip()
+            if not key:
+                continue
+            if key not in posted_at_by_url:
+                posted_at_by_url[key] = posted_at
+    extraction_id_by_view_id: dict[int, int] = {}
+    if view_ids:
+        extraction_result = await db.execute(
+            select(PostExtraction.applied_kol_view_id, PostExtraction.id)
+            .where(PostExtraction.applied_kol_view_id.in_(view_ids))
+            .order_by(PostExtraction.id.desc())
+        )
+        for applied_kol_view_id, extraction_id in extraction_result.all():
+            if not isinstance(applied_kol_view_id, int) or not isinstance(extraction_id, int):
+                continue
+            if applied_kol_view_id not in extraction_id_by_view_id:
+                extraction_id_by_view_id[applied_kol_view_id] = extraction_id
     items = [
         AssetViewsTimelineItemRead(
             id=item.id,
@@ -2615,6 +2903,8 @@ async def get_asset_views_timeline(
             source_url=item.source_url,
             as_of=item.as_of,
             created_at=item.created_at,
+            posted_at=posted_at_by_url.get(item.source_url.strip() if item.source_url else ""),
+            extraction_id=extraction_id_by_view_id.get(item.id),
         )
         for item in filtered
     ]
@@ -2980,6 +3270,49 @@ async def convert_x_import_file(
     )
 
 
+@app.get("/ingest/x/raw-posts/preview", response_model=XRawPostsPreviewRead)
+async def preview_x_raw_posts(
+    author_handle: str | None = Query(default=None),
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+    sample_limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="start_date must be <= end_date")
+
+    query, time_expr, time_min_utc, time_max_exclusive_utc = _build_x_raw_posts_preview_query(
+        author_handle=author_handle,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    count_query = select(func.count()).select_from(query.subquery())
+    matched_count = int((await db.execute(count_query)).scalar() or 0)
+
+    sample_query = query.order_by(time_expr.desc(), RawPost.id.desc()).limit(sample_limit)
+    sample_rows = (await db.execute(sample_query)).all()
+    sample = [
+        XRawPostsPreviewSampleRead(
+            id=int(row[0]),
+            external_id=str(row[1]),
+            author_handle=str(row[2]),
+            posted_at=row[3],
+            fetched_at=row[4],
+            matched_time=row[5],
+        )
+        for row in sample_rows
+    ]
+    return XRawPostsPreviewRead(
+        matched_count=matched_count,
+        sample_limit=sample_limit,
+        sample=sample,
+        start_date=start_date,
+        end_date=end_date,
+        time_min_utc=time_min_utc,
+        time_max_exclusive_utc=time_max_exclusive_utc,
+    )
+
+
 @app.post("/ingest/x/import", response_model=XImportStatsRead)
 async def import_x_posts(
     payload: list[XImportItemCreate],
@@ -3232,6 +3565,9 @@ def _empty_extract_counters(*, requested_count: int = 0) -> dict[str, int]:
         "resumed_success": 0,
         "resumed_failed": 0,
         "resumed_skipped": 0,
+        "capped_count": 0,
+        "horizon_coerced_count": 0,
+        "raw_truncated_count": 0,
     }
 
 
@@ -3252,6 +3588,9 @@ def _merge_extract_counters(total: dict[str, int], chunk: RawPostsExtractBatchRe
     total["resumed_success"] += chunk.resumed_success
     total["resumed_failed"] += chunk.resumed_failed
     total["resumed_skipped"] += chunk.resumed_skipped
+    total["capped_count"] += chunk.capped_count
+    total["horizon_coerced_count"] += chunk.horizon_coerced_count
+    total["raw_truncated_count"] += chunk.raw_truncated_count
 
 
 async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db: AsyncSession) -> RawPostsExtractBatchRead:
@@ -3272,6 +3611,9 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
     resumed_success = 0
     resumed_failed = 0
     resumed_skipped = 0
+    capped_count = 0
+    horizon_coerced_count = 0
+    raw_truncated_count = 0
 
     settings = get_settings()
     throttle = _get_effective_runtime_throttle(settings)
@@ -3285,13 +3627,16 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
     chunk_size = max(1, throttle["batch_size"])
     batch_sleep_seconds = max(0.0, throttle["batch_sleep_ms"] / 1000.0)
 
-    async def _process_one(raw_post_id: int, local_db: AsyncSession) -> tuple[str, str | None, bool, str | None]:
+    async def _process_one(
+        raw_post_id: int,
+        local_db: AsyncSession,
+    ) -> tuple[str, str | None, bool, str | None, bool, bool, bool]:
         async with semaphore:
             raw_post = await local_db.get(RawPost, raw_post_id)
             if raw_post is None:
-                return ("skipped", None, False, None)
+                return ("skipped", None, False, None, False, False, False)
             if not await _raw_post_matches_enabled_x_kol(local_db, raw_post):
-                return ("skipped_not_followed", None, False, None)
+                return ("skipped_not_followed", None, False, None, False, False, False)
 
             rows_result = await local_db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post_id))
             extraction_rows = list(rows_result.scalars().all())
@@ -3310,20 +3655,20 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
             if payload.mode in {"pending_only", "pending_or_failed"}:
                 terminal_skip_kind = _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=latest_extraction)
                 if terminal_skip_kind is not None:
-                    return (terminal_skip_kind, None, resume_candidate, None)
+                    return (terminal_skip_kind, None, resume_candidate, None, False, False, False)
             if payload.mode in {"pending_only", "pending_or_failed"} and _is_active_extraction(latest_extraction, raw_post):
-                return ("skipped_already_pending", None, resume_candidate, None)
+                return ("skipped_already_pending", None, resume_candidate, None, False, False, False)
 
             if payload.mode in {"pending_only", "pending_or_failed"} and has_result_already:
-                return ("skipped_already_has_result", None, resume_candidate, None)
+                return ("skipped_already_has_result", None, resume_candidate, None, False, False, False)
 
             if payload.mode == "pending_only" and latest_extraction is not None:
-                return ("skipped", None, resume_candidate, None)
+                return ("skipped", None, resume_candidate, None, False, False, False)
 
             if payload.mode == "pending_or_failed" and _is_failed_extraction(latest_extraction, raw_post):
                 failed_retries = await _failed_batch_retry_count(local_db, raw_post_id=raw_post_id)
                 if failed_retries >= max_resume_retries:
-                    return ("skipped_retry_limited", None, resume_candidate, None)
+                    return ("skipped_retry_limited", None, resume_candidate, None, False, False, False)
 
             _check_reextract_rate_limit(raw_post.id)
             for attempt in range(1, retry_max + 2):
@@ -3343,19 +3688,28 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
                         extraction = await create_pending_extraction(local_db, raw_post)
                     await local_db.commit()
                     if _is_failed_extraction(extraction, raw_post):
-                        return ("failed_existing", (extraction.last_error or "extraction_failed"), resume_candidate, None)
+                        return ("failed_existing", (extraction.last_error or "extraction_failed"), resume_candidate, None, False, False, False)
                     await _adaptive_throttle_maybe_upgrade(settings)
                     auto_outcome = "rejected" if bool(getattr(extraction, "auto_rejected", False)) else (
                         "approved" if bool(getattr(extraction, "auto_approved", False)) else None
                     )
-                    return ("success", None, resume_candidate, auto_outcome)
+                    meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json, dict) else {}
+                    return (
+                        "success",
+                        None,
+                        resume_candidate,
+                        auto_outcome,
+                        bool(meta.get("asset_views_capped")) if isinstance(meta, dict) else False,
+                        bool(meta.get("horizon_coerced")) if isinstance(meta, dict) else False,
+                        bool(meta.get("raw_truncated")) if isinstance(meta, dict) else False,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     retryable = _is_retryable_extraction_error(exc)
                     if retryable:
                         await _adaptive_throttle_degrade(settings, exc)
                     if not retryable or attempt > retry_max:
                         await local_db.rollback()
-                        return ("failed", _build_last_error(exc), resume_candidate, None)
+                        return ("failed", _build_last_error(exc), resume_candidate, None, False, False, False)
                     await local_db.rollback()
                     await asyncio.sleep(
                         _build_retry_backoff_seconds(
@@ -3364,12 +3718,12 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
                             cap_ms=backoff_cap_ms,
                         )
                     )
-            return ("failed", "retry_exhausted", resume_candidate, None)
+            return ("failed", "retry_exhausted", resume_candidate, None, False, False, False)
 
     for offset in range(0, len(requested_ids), chunk_size):
         chunk = requested_ids[offset : offset + chunk_size]
         if isinstance(db, AsyncSession):
-            async def _run_with_task_db(raw_post_id: int) -> tuple[str, str | None, bool, str | None]:
+            async def _run_with_task_db(raw_post_id: int) -> tuple[str, str | None, bool, str | None, bool, bool, bool]:
                 async with AsyncSessionLocal() as task_db:
                     return await _process_one(raw_post_id, task_db)
 
@@ -3380,7 +3734,7 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
                 result = await _process_one(raw_post_id, db)
                 results.append(result)
         for idx, result in enumerate(results):
-            kind, last_error, resume_candidate, auto_outcome = result
+            kind, last_error, resume_candidate, auto_outcome, capped_flag, horizon_coerced_flag, raw_truncated_flag = result
             raw_post_id = chunk[idx]
             if payload.mode == "pending_or_failed" and resume_candidate:
                 resumed_requested_count += 1
@@ -3392,6 +3746,12 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
                     auto_approved_count += 1
                 if payload.mode == "pending_or_failed" and resume_candidate:
                     resumed_success += 1
+                if capped_flag:
+                    capped_count += 1
+                if horizon_coerced_flag:
+                    horizon_coerced_count += 1
+                if raw_truncated_flag:
+                    raw_truncated_count += 1
             elif kind == "skipped_already_pending":
                 skipped_already_pending_count += 1
                 skipped_already_extracted_count += 1
@@ -3494,6 +3854,9 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
         resumed_success=resumed_success if resume_mode else 0,
         resumed_failed=resumed_failed if resume_mode else 0,
         resumed_skipped=resumed_skipped if resume_mode else 0,
+        capped_count=capped_count,
+        horizon_coerced_count=horizon_coerced_count,
+        raw_truncated_count=raw_truncated_count,
     )
 
 
@@ -3526,6 +3889,9 @@ def _extract_job_read(state: dict[str, Any]) -> ExtractJobRead:
         resumed_success=state["resumed_success"],
         resumed_failed=state["resumed_failed"],
         resumed_skipped=state["resumed_skipped"],
+        capped_count=state["capped_count"],
+        horizon_coerced_count=state["horizon_coerced_count"],
+        raw_truncated_count=state["raw_truncated_count"],
         last_error_summary=state.get("last_error_summary"),
         created_at=state["created_at"],
         started_at=state.get("started_at"),
@@ -4497,6 +4863,9 @@ async def get_dashboard(
     days: int = Query(default=7, ge=1, le=90),
     window: str = Query(default="7d", pattern="^(24h|7d)$"),
     limit: int = Query(default=10, ge=1, le=100),
+    assets_limit: int = Query(default=15, ge=1, le=5000),
+    show_all_assets: bool = Query(default=False),
+    assets_window: str = Query(default="24h", pattern="^(24h|7d)$"),
     profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
@@ -4601,6 +4970,16 @@ async def get_dashboard(
                 latest_views_by_horizon=latest_views,
             )
         )
+
+    total_assets_count = len(dashboard_assets)
+    dashboard_assets.sort(
+        key=lambda item: (
+            -(item.new_views_24h if assets_window == "24h" else item.new_views_7d),
+            item.symbol,
+        )
+    )
+    if not show_all_assets:
+        dashboard_assets = dashboard_assets[:assets_limit]
 
     active_kols_7d: list[DashboardActiveKolRead] = []
     for kol_id, count in sorted(kol_counts_7d.items(), key=lambda item: (-item[1], item[0]))[:10]:
@@ -4719,6 +5098,7 @@ async def get_dashboard(
         ),
         new_views_24h=new_views_24h,
         new_views_7d=new_views_7d,
+        total_assets_count=total_assets_count,
         assets=dashboard_assets,
         active_kols_7d=active_kols_7d,
     )
@@ -4911,6 +5291,71 @@ async def refresh_wrong_extracted_json(
         dry_run=dry_run,
         updated_ids=updated_ids,
     )
+
+
+@app.post("/admin/fix/approved-missing-views", response_model=AdminFixApprovedMissingViewsRead)
+async def fix_approved_missing_views(
+    confirm: str = Query(...),
+    days: int = Query(default=365, ge=1, le=3650),
+    limit: int = Query(default=2000, ge=1, le=10000),
+    dry_run: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    now = datetime.now(UTC)
+    since_ts = now - timedelta(days=days)
+    result = await db.execute(
+        select(PostExtraction)
+        .where(PostExtraction.status == ExtractionStatus.approved)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(limit)
+    )
+    rows = [item for item in result.scalars().all() if item.created_at is None or item.created_at >= since_ts]
+    aliases_for_prompt = await _load_aliases_for_prompt(db)
+    alias_to_symbol = _build_alias_to_symbol_map(aliases_for_prompt)
+    known_symbols = await _load_known_asset_symbols(db)
+
+    scanned = 0
+    fixed = 0
+    skipped = 0
+    for extraction in rows:
+        payload = extraction.extracted_json if isinstance(extraction.extracted_json, dict) else {}
+        current_views = payload.get("asset_views")
+        if isinstance(current_views, list) and current_views:
+            continue
+        parsed = extraction.parsed_model_output if isinstance(extraction.parsed_model_output, dict) else None
+        parsed_views = parsed.get("asset_views") if isinstance(parsed, dict) else None
+        if not isinstance(parsed_views, list) or not parsed_views:
+            continue
+        raw_post = await db.get(RawPost, extraction.raw_post_id)
+        if raw_post is None:
+            skipped += 1
+            continue
+        scanned += 1
+        if dry_run:
+            fixed += 1
+            continue
+        normalized = normalize_extracted_json(
+            parsed,
+            posted_at=raw_post.posted_at,
+            include_meta=True,
+            alias_to_symbol=alias_to_symbol,
+            known_symbols=known_symbols,
+        )
+        extraction.extracted_json = normalized
+        await ensure_assets_from_extracted_json(db, raw_post=raw_post, extracted_json=normalized)
+        if int(extraction.auto_applied_count or 0) <= 0:
+            original_status = extraction.status
+            extraction.status = ExtractionStatus.pending
+            await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post, force_apply=True)
+            extraction.status = original_status
+            if extraction.auto_applied_count and extraction.auto_applied_count > 0:
+                if not isinstance(extraction.auto_applied_kol_view_ids, list):
+                    extraction.auto_applied_kol_view_ids = []
+        fixed += 1
+    if not dry_run:
+        await db.commit()
+    return AdminFixApprovedMissingViewsRead(scanned=scanned, fixed=fixed, skipped=skipped, dry_run=dry_run)
 
 
 @app.get("/extractions/{extraction_id}", response_model=PostExtractionWithRawPostRead)

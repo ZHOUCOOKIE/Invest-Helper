@@ -312,6 +312,29 @@ class XImportStatsRead(BaseModel):
     skipped_not_followed_samples: list[XSkippedNotFollowedRead] = Field(default_factory=list)
 
 
+class XRawPostsPreviewSampleRead(BaseModel):
+    id: int
+    external_id: str
+    author_handle: str
+    posted_at: datetime
+    fetched_at: datetime
+    matched_time: datetime
+
+
+class XRawPostsPreviewRead(BaseModel):
+    matched_count: int
+    sample_limit: int
+    sample: list[XRawPostsPreviewSampleRead] = Field(default_factory=list)
+    start_date: date | None = None
+    end_date: date | None = None
+    time_min_utc: datetime | None = None
+    time_max_exclusive_utc: datetime | None = None
+    timezone: Literal["UTC"] = "UTC"
+    start_inclusive: bool = True
+    end_inclusive: bool = True
+    time_field_priority: list[str] = Field(default_factory=lambda: ["posted_at", "fetched_at"])
+
+
 class XFollowingImportKolRead(BaseModel):
     id: int
     handle: str
@@ -373,6 +396,13 @@ class AdminRefreshWrongExtractedJsonRead(BaseModel):
     updated_ids: list[int] = Field(default_factory=list)
 
 
+class AdminFixApprovedMissingViewsRead(BaseModel):
+    scanned: int
+    fixed: int
+    skipped: int
+    dry_run: bool
+
+
 class AdminHardDeleteRead(BaseModel):
     operation: str
     target: str
@@ -412,6 +442,9 @@ class RawPostsExtractBatchRead(BaseModel):
     resumed_success: int = 0
     resumed_failed: int = 0
     resumed_skipped: int = 0
+    capped_count: int = 0
+    horizon_coerced_count: int = 0
+    raw_truncated_count: int = 0
 
 
 class ExtractJobCreateRequest(BaseModel):
@@ -445,6 +478,9 @@ class ExtractJobRead(BaseModel):
     failed_count: int
     auto_approved_count: int = 0
     auto_rejected_count: int = 0
+    capped_count: int = 0
+    horizon_coerced_count: int = 0
+    raw_truncated_count: int = 0
     resumed_requested_count: int = 0
     resumed_success: int = 0
     resumed_failed: int = 0
@@ -581,6 +617,7 @@ class DashboardRead(BaseModel):
     extraction_stats: DashboardExtractionStatsRead
     new_views_24h: int
     new_views_7d: int
+    total_assets_count: int = 0
     assets: list[DashboardAssetRead]
     active_kols_7d: list[DashboardActiveKolRead]
 
@@ -627,6 +664,8 @@ class AssetViewsTimelineItemRead(BaseModel):
     source_url: str
     as_of: date
     created_at: datetime
+    posted_at: datetime | None = None
+    extraction_id: int | None = None
 
 
 class AssetViewsTimelineRead(BaseModel):

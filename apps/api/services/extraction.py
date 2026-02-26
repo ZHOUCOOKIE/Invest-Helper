@@ -727,7 +727,11 @@ class OpenAIExtractor(Extractor):
         self.openrouter_app_name = openrouter_app_name.strip()
         self.provider_detected = detect_provider_from_base_url(self.base_url)
         self.output_mode = resolve_extraction_output_mode(self.base_url)
+        self.reasoning_language_retry_hint = False
         self._audit = ExtractionAudit()
+
+    def set_reasoning_language_retry_hint(self, enabled: bool) -> None:
+        self.reasoning_language_retry_hint = bool(enabled)
 
     def extract(self, raw_post: RawPost) -> dict[str, Any]:
         if self.output_mode == EXTRACTION_OUTPUT_TEXT_JSON:
@@ -815,6 +819,15 @@ class OpenAIExtractor(Extractor):
             "Return exactly one JSON object. "
             "Do not include markdown fences, explanations, or any extra text."
         )
+        reasoning_language_rule = (
+            "extracted_json.reasoning must be written in Chinese. "
+            "Even when the input post is English, explain in Chinese. "
+            "You may keep proper nouns/tickers/URLs, but sentence body must be Chinese."
+        )
+        retry_reasoning_rule = (
+            "Correction retry: previous output had non-Chinese reasoning. "
+            "Now strictly ensure extracted_json.reasoning is Chinese narrative."
+        )
         json_mode_hard_rules = (
             "JSON mode hard rules (中英都适用): "
             "only return one JSON object. "
@@ -826,7 +839,9 @@ class OpenAIExtractor(Extractor):
             "assets should be array of objects with symbol/name/market, symbol is required. "
             "assets[*].market must be one of CRYPTO/STOCK/ETF/FOREX/OTHER/AUTO. "
             "asset_views must be array of per-asset views, each contains "
-            "symbol/stance/horizon/confidence/reasoning/summary and optional drivers. "
+            "symbol/stance/horizon/confidence/reasoning/summary and optional drivers; "
+            "asset_views[*].symbol must be non-empty, and if symbol is uncertain do not output that item. "
+            "top-level reasoning field must be Chinese prose (proper nouns/tickers/URLs allowed). "
             "as_of must be date-only string in YYYY-MM-DD (no time)."
         )
         system_prompt = (
@@ -834,6 +849,8 @@ class OpenAIExtractor(Extractor):
             "Only output fields required by schema. "
             "If stance/horizon/confidence cannot be inferred, return null. "
             "Do not guess symbols; keep assets empty when unknown. "
+            f"{reasoning_language_rule} "
+            f"{retry_reasoning_rule if self.reasoning_language_retry_hint else ''} "
             f"{strict_json_hint} "
             f"{json_mode_hard_rules if response_mode == EXTRACTION_OUTPUT_TEXT_JSON else ''}"
         )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import json
 import math
 from pathlib import Path
@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db import get_db
 from enums import ExtractionStatus, Horizon, ReviewStatus, Stance
-from main import app, reset_runtime_counters
+from main import _build_x_raw_posts_preview_query, app, reset_runtime_counters
 from models import Asset, Kol, KolView, PostExtraction, ProfileKolWeight, RawPost
 from services.extraction import OpenAIRequestError
 from settings import get_settings
@@ -2049,6 +2049,27 @@ def test_convert_endpoint_export_json_with_date_filter_and_kol_binding() -> None
     assert body["items"][0]["content_text"] == "inside range"
     assert body["items"][0]["posted_at"] == "2026-02-20T10:00:00Z"
     assert "out of range" in body["errors"][0]["reason"]
+
+
+def test_preview_query_builds_utc_inclusive_date_range_and_handle_filter() -> None:
+    query, _, time_min_utc, time_max_exclusive_utc = _build_x_raw_posts_preview_query(
+        author_handle="@Alice",
+        start_date=date(2026, 2, 19),
+        end_date=date(2026, 2, 23),
+    )
+    compiled = str(query.compile(compile_kwargs={"literal_binds": True}))
+    assert "raw_posts.platform = 'x'" in compiled
+    assert "lower(raw_posts.author_handle) = 'alice'" in compiled
+    assert "coalesce(raw_posts.posted_at, raw_posts.fetched_at) >= '2026-02-19 00:00:00+00:00'" in compiled
+    assert "coalesce(raw_posts.posted_at, raw_posts.fetched_at) < '2026-02-24 00:00:00+00:00'" in compiled
+    assert time_min_utc == datetime(2026, 2, 19, 0, 0, tzinfo=UTC)
+    assert time_max_exclusive_utc == datetime(2026, 2, 24, 0, 0, tzinfo=UTC)
+
+
+def test_preview_endpoint_rejects_slash_date_format() -> None:
+    client = TestClient(app)
+    response = client.get("/ingest/x/raw-posts/preview?start_date=2026/02/19&end_date=2026-02-23")
+    assert response.status_code == 422
 
 
 def test_convert_endpoint_accepts_standard_x_import_json() -> None:

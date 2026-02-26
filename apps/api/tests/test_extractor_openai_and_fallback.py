@@ -211,6 +211,194 @@ def test_extract_endpoint_persists_mocked_openai_json_and_get_by_id(monkeypatch:
     assert read_body["raw_post"]["id"] == 1
 
 
+def test_prompt_contract_keeps_reasoning_zh_and_symbol_non_empty_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "dummy")
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    prompt_text = response.json()["prompt_text"]
+    assert "extracted_json.reasoning must be Chinese" in prompt_text
+    assert "sentence body must be Chinese" in prompt_text
+    assert "asset_views[].symbol must be non-empty" in prompt_text
+
+
+def test_reasoning_non_zh_retries_once_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    call_count = {"n": 0}
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {
+                "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+                "reasoning": "Risk appetite improves and BTC can continue higher this week.",
+                "stance": "bull",
+                "horizon": "1w",
+                "confidence": 78,
+                "summary": "first pass english reasoning",
+                "source_url": raw_post.url,
+                "as_of": "2026-02-21",
+                "asset_views": [
+                    {
+                        "symbol": "BTC",
+                        "stance": "bull",
+                        "horizon": "1w",
+                        "confidence": 78,
+                        "reasoning": "Momentum remains constructive.",
+                        "summary": "btc up",
+                    }
+                ],
+            }
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "reasoning": "风险偏好回升，BTC 本周延续上行概率更高。",
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 79,
+            "summary": "retry chinese reasoning",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 79,
+                    "reasoning": "资金回流，结构偏强。",
+                    "summary": "btc up",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert call_count["n"] == 2
+    assert body["last_error"] is None
+    assert meta["reasoning_language"] == "zh"
+    assert meta["reasoning_language_violation"] is False
+    assert meta["reasoning_language_retry_used"] is True
+
+
+def test_reasoning_non_zh_twice_marks_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "2")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    call_count = {"n": 0}
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        call_count["n"] += 1
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "reasoning": "Market momentum remains positive and upside could continue near term.",
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 76,
+            "summary": "still english reasoning",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 76,
+                    "reasoning": "Follow through buying pressure remains.",
+                    "summary": "btc up",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert call_count["n"] == 2
+    assert "reasoning_language_violation_after_retry" in (body["last_error"] or "")
+    assert meta["reasoning_language"] == "non_zh"
+    assert meta["reasoning_language_violation"] is True
+    assert meta["reasoning_language_retry_used"] is True
+
+
+def test_extract_endpoint_filters_out_empty_symbol_asset_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 78,
+            "summary": "symbol filter",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {"symbol": "", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "drop me"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 78, "summary": "keep me"},
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    views = body["extracted_json"]["asset_views"]
+    assert len(views) == 1
+    assert views[0]["symbol"] == "BTC"
+
+
 def test_auto_mode_without_api_key_falls_back_to_dummy_extractor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

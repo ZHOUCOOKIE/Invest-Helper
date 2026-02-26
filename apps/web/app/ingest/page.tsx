@@ -274,6 +274,58 @@ type FormState = {
 
 const STORAGE_START_DATE = "x_import_start_date";
 const STORAGE_END_DATE = "x_import_end_date";
+const DEFAULT_DIRECT_API_BASE_URL = "http://localhost:8000";
+const DIRECT_CONVERT_PATH = "/ingest/x/convert";
+const DIRECT_IMPORT_PATH = "/ingest/x/import";
+const DIRECT_EXTRACT_JOBS_PATH = "/extract-jobs";
+
+function getDirectApiBaseUrl(): string {
+  const raw = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
+  const base = raw && raw.length > 0 ? raw : DEFAULT_DIRECT_API_BASE_URL;
+  return base.replace(/\/+$/, "");
+}
+
+function buildDirectApiUrl(path: string, params: URLSearchParams): string {
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+  return `${getDirectApiBaseUrl()}${path}${suffix}`;
+}
+
+function buildDirectConvertUrl(params: URLSearchParams): string {
+  return buildDirectApiUrl(DIRECT_CONVERT_PATH, params);
+}
+
+function formatConvertNetworkError(err: unknown): string {
+  const baseUrl = getDirectApiBaseUrl();
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "unknown error");
+  return [
+    `Convert failed: 无法连接后端 ${baseUrl}`,
+    "请确认后端服务已启动，或检查是否被代理层的大文件限制中断（例如 10MB 限制导致 ECONNRESET/socket hang up）。",
+    `原始错误: ${rawMessage}`,
+  ].join(" ");
+}
+
+function formatImportNetworkError(err: unknown): string {
+  const baseUrl = getDirectApiBaseUrl();
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "unknown error");
+  return [
+    `Import failed: 无法连接后端 ${baseUrl}`,
+    "请检查后端是否启动、CORS 是否允许当前前端域名，或网络是否中断。",
+    `原始错误: ${rawMessage}`,
+  ].join(" ");
+}
+
+function formatExtractJobNetworkError(stage: "create" | "poll", err: unknown): string {
+  const baseUrl = getDirectApiBaseUrl();
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "unknown error");
+  const action = stage === "create" ? "创建抽取任务" : "轮询抽取任务";
+  return [
+    `Extract job failed: ${action}时无法连接后端 ${baseUrl}`,
+    "请检查后端是否启动、CORS 是否允许当前前端域名，或网络是否中断。",
+    `原始错误: ${rawMessage}`,
+  ].join(" ");
+}
+
 function isStandardImportJson(value: unknown): value is XImportItem[] {
   if (!Array.isArray(value)) return false;
   return value.every((item) => {
@@ -449,30 +501,55 @@ export default function IngestPage() {
 
   const selectedKol = useMemo(() => kols.find((item) => item.id === selectedKolId) ?? null, [kols, selectedKolId]);
 
-  const formatApiError = (fallbackMessage: string, body: unknown, textBody: string, requestId: string | null): string => {
+  const formatApiError = (
+    fallbackMessage: string,
+    body: unknown,
+    textBody: string,
+    requestId: string | null,
+    statusCode?: number,
+    requestPath?: string,
+  ): string => {
     let message = fallbackMessage;
     if (body && typeof body === "object") {
       const obj = body as Record<string, unknown>;
       if (typeof obj.message === "string" && obj.message) message = obj.message;
       else if (typeof obj.detail === "string" && obj.detail) message = obj.detail;
     } else if (textBody) {
-      message = `非 JSON 错误文本: ${textBody.slice(0, 300)}`;
+      const statusPart = typeof statusCode === "number" ? `status=${statusCode}` : "status=unknown";
+      const pathPart = requestPath ? `path=${requestPath}` : "path=unknown";
+      message = `非 JSON 错误文本 (${statusPart}, ${pathPart}): ${textBody.slice(0, 300)}`;
     }
     return requestId ? `${message} (request_id=${requestId})` : message;
   };
 
-  const parseApiResponse = async <T,>(res: Response): Promise<{ data: T | ApiErrorBody | null; textBody: string; requestId: string | null }> => {
+  const parseApiResponse = async <T,>(
+    res: Response,
+  ): Promise<{
+    data: T | ApiErrorBody | null;
+    textBody: string;
+    requestId: string | null;
+    statusCode: number;
+    requestPath: string;
+  }> => {
     const requestId = res.headers.get("x-request-id");
+    let requestPath = res.url || "unknown";
+    try {
+      const parsedUrl = new URL(res.url);
+      requestPath = `${parsedUrl.pathname}${parsedUrl.search}`;
+    } catch {
+      requestPath = res.url || "unknown";
+    }
+    const statusCode = res.status;
     const textBody = await res.text();
     try {
       const parsed = JSON.parse(textBody) as T | ApiErrorBody;
       if (parsed && typeof parsed === "object") {
         const bodyRequestId = (parsed as ApiErrorBody).request_id;
-        return { data: parsed, textBody: "", requestId: bodyRequestId ?? requestId };
+        return { data: parsed, textBody: "", requestId: bodyRequestId ?? requestId, statusCode, requestPath };
       }
-      return { data: parsed, textBody: "", requestId };
+      return { data: parsed, textBody: "", requestId, statusCode, requestPath };
     } catch {
-      return { data: null, textBody, requestId };
+      return { data: null, textBody, requestId, statusCode, requestPath };
     }
   };
 
@@ -551,11 +628,16 @@ export default function IngestPage() {
     params.set("include_raw_json", "true");
     params.set("only_followed", onlyFollowedKols ? "true" : "false");
     params.set("allow_unknown_handles", onlyFollowedKols ? "false" : "true");
-    const res = await fetch(`/api/ingest/x/convert?${params.toString()}`, {
-      method: "POST",
-      headers: { "Content-Type": targetFile.type || "application/octet-stream" },
-      body: targetFile,
-    });
+    let res: Response;
+    try {
+      res = await fetch(buildDirectConvertUrl(params), {
+        method: "POST",
+        headers: { "Content-Type": targetFile.type || "application/octet-stream" },
+        body: targetFile,
+      });
+    } catch (err) {
+      throw new Error(formatConvertNetworkError(err));
+    }
     const parsed = await parseApiResponse<XConvertResult>(res);
     if (!res.ok || !parsed.data || !("items" in (parsed.data as Record<string, unknown>))) {
       setWorkflowRequestId(parsed.requestId);
@@ -570,12 +652,16 @@ export default function IngestPage() {
     if (normalizedOverride) params.set("author_handle_override", normalizedOverride);
     params.set("only_followed", onlyFollowedKols ? "true" : "false");
     params.set("allow_unknown_handles", onlyFollowedKols ? "false" : "true");
-    const query = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`/api/ingest/x/import${query}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(rows),
-    });
+    let res: Response;
+    try {
+      res = await fetch(buildDirectApiUrl(DIRECT_IMPORT_PATH, params), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(rows),
+      });
+    } catch (err) {
+      throw new Error(formatImportNetworkError(err));
+    }
     const parsed = await parseApiResponse<XImportStats>(res);
     setWorkflowRequestId(parsed.requestId);
     if (!res.ok || !parsed.data) {
@@ -591,29 +677,52 @@ export default function IngestPage() {
   ): Promise<ExtractBatchStats> => {
     const stableIds = Array.from(new Set(ids)).sort((a, b) => a - b);
     const idempotencyKey = `ingest:${mode}:${Math.max(1, batchSize)}:${stableIds.join(",")}`.slice(0, 256);
-    const createRes = await fetch("/api/extract-jobs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        raw_post_ids: stableIds,
-        mode,
-        batch_size: Math.max(1, batchSize),
-        idempotency_key: idempotencyKey,
-      }),
-    });
+    let createRes: Response;
+    try {
+      createRes = await fetch(buildDirectApiUrl(DIRECT_EXTRACT_JOBS_PATH, new URLSearchParams()), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          raw_post_ids: stableIds,
+          mode,
+          batch_size: Math.max(1, batchSize),
+          idempotency_key: idempotencyKey,
+        }),
+      });
+    } catch (err) {
+      throw new Error(formatExtractJobNetworkError("create", err));
+    }
     const createParsed = await parseApiResponse<ExtractJobCreateResponse>(createRes);
     setWorkflowRequestId(createParsed.requestId);
     if (!createRes.ok || !createParsed.data || !("job_id" in (createParsed.data as Record<string, unknown>))) {
-      throw new Error(formatApiError("Create extract job failed", createParsed.data, createParsed.textBody, createParsed.requestId));
+      throw new Error(
+        formatApiError(
+          "Create extract job failed",
+          createParsed.data,
+          createParsed.textBody,
+          createParsed.requestId,
+          createParsed.statusCode,
+          createParsed.requestPath,
+        ),
+      );
     }
     const jobId = (createParsed.data as ExtractJobCreateResponse).job_id;
 
     for (let attempt = 0; attempt < 1800; attempt += 1) {
-      const res = await fetch(`/api/extract-jobs/${jobId}`, { cache: "no-store" });
+      let res: Response;
+      try {
+        res = await fetch(buildDirectApiUrl(`${DIRECT_EXTRACT_JOBS_PATH}/${encodeURIComponent(jobId)}`, new URLSearchParams()), {
+          cache: "no-store",
+        });
+      } catch (err) {
+        throw new Error(formatExtractJobNetworkError("poll", err));
+      }
       const parsed = await parseApiResponse<ExtractJob>(res);
       if (!res.ok || !parsed.data) {
         setWorkflowRequestId(parsed.requestId);
-        throw new Error(formatApiError("Load extract job failed", parsed.data, parsed.textBody, parsed.requestId));
+        throw new Error(
+          formatApiError("Load extract job failed", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath),
+        );
       }
       const job = parsed.data as ExtractJob;
       setWorkflowRequestId(parsed.requestId);
@@ -1292,6 +1401,9 @@ export default function IngestPage() {
               <input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} style={{ display: "block", width: "100%" }} />
             </label>
           </div>
+          <p style={{ margin: 0, fontSize: "12px", color: "#666" }}>
+            时间范围按 UTC 日期过滤，start_date / end_date 都是包含边界（inclusive）。
+          </p>
 
           <label>
             <input type="checkbox" checked={autoExtract} onChange={(event) => setAutoExtract(event.target.checked)} /> 导入后自动批量抽取（按 batch size 分批）

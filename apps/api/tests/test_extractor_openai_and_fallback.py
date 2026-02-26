@@ -523,6 +523,80 @@ def test_runtime_throttle_update_clamps_to_limits(monkeypatch: pytest.MonkeyPatc
     assert body["throttle"]["batch_sleep_ms"] == 100
 
 
+def test_runtime_default_base_throttle_is_aggressive_and_not_override() -> None:
+    client = TestClient(app)
+    response = client.get("/settings/runtime")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_overrides"]["throttle"] is False
+    assert body["throttle"] == {
+        "max_concurrency": 4,
+        "max_rpm": 120,
+        "batch_size": 50,
+        "batch_sleep_ms": 50,
+    }
+    assert body["effective_throttle"] == body["throttle"]
+    assert body["adaptive_throttle"]["last_reason"] != "manual throttle override updated"
+
+
+def test_runtime_adaptive_throttle_degrades_on_429_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("EXTRACT_RETRY_MAX", "1")
+    monkeypatch.setenv("REEXTRACT_RATE_LIMIT_MAX_ATTEMPTS", "100")
+    monkeypatch.setenv("EXTRACT_ADAPTIVE_RECOVERY_SUCCESSES", "2")
+
+    attempt_ref = {"count": 0}
+
+    def flaky_extract(self, raw_post: RawPost):  # noqa: ANN001
+        attempt_ref["count"] += 1
+        if attempt_ref["count"] == 1:
+            raise OpenAIRequestError(status_code=429, body_preview="rate_limited")
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 78,
+            "summary": "adaptive success",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-25",
+            "event_tags": [],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", flaky_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    first = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "force"})
+    assert first.status_code == 200
+    first_runtime = client.get("/settings/runtime")
+    assert first_runtime.status_code == 200
+    first_runtime_body = first_runtime.json()
+    assert first_runtime_body["runtime_overrides"]["adaptive_throttle"] is True
+    assert first_runtime_body["adaptive_throttle"]["enabled"] is True
+    assert first_runtime_body["adaptive_throttle"]["active"] is True
+    assert first_runtime_body["adaptive_throttle"]["last_reason"] == "http_429"
+    assert first_runtime_body["effective_throttle"]["max_rpm"] < first_runtime_body["throttle"]["max_rpm"]
+
+    # Two recovery steps are needed to restore sleep_ms to base after one degrade.
+    for _ in range(4):
+        recovery = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "force"})
+        assert recovery.status_code == 200
+
+    recovered_runtime = client.get("/settings/runtime")
+    app.dependency_overrides.clear()
+    assert recovered_runtime.status_code == 200
+    recovered_body = recovered_runtime.json()
+    assert recovered_body["adaptive_throttle"]["active"] is False
+    assert recovered_body["effective_throttle"] == recovered_body["throttle"]
+
+
 def test_confidence_69_auto_rejects_and_marks_raw_post_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = FakeAsyncSession()
     _seed_raw_post(fake_db)

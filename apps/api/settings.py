@@ -31,17 +31,19 @@ class Settings(BaseSettings):
     auto_approve_min_display_confidence: int = 50
     auto_approve_max_views: int = 10
     auto_reject_confidence_threshold: int = 50
-    extract_max_concurrency_default: int = 2
-    extract_max_rpm_default: int = 30
-    extract_batch_size_default: int = 20
-    extract_batch_sleep_ms_default: int = 250
+    extract_max_concurrency_default: int = 4
+    extract_max_rpm_default: int = 120
+    extract_batch_size_default: int = 50
+    extract_batch_sleep_ms_default: int = 50
     extract_retry_max: int = 5
     extract_retry_backoff_base_ms: int = 800
     extract_retry_backoff_max_ms: int = 20000
-    extract_max_concurrency_max: int = 4
-    extract_max_rpm_max: int = 60
-    extract_batch_size_max: int = 50
-    extract_batch_sleep_ms_min: int = 100
+    extract_max_concurrency_max: int = 8
+    extract_max_rpm_max: int = 240
+    extract_batch_size_max: int = 100
+    extract_batch_sleep_ms_min: int = 20
+    extract_adaptive_throttle_enabled: bool = True
+    extract_adaptive_recovery_successes: int = 12
 
 
 @lru_cache

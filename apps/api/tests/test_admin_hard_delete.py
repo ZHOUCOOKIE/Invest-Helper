@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -273,3 +273,125 @@ def test_admin_delete_asset_default_derived_only_deletes_related_views_only() ->
     assert 11 not in fake_db._data[KolView]
     assert 12 in fake_db._data[KolView]
     assert fake_db._data[PostExtraction][101].applied_kol_view_id is None
+
+
+def test_admin_cleanup_duplicate_pending_skips_rows_with_applied_views() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+
+    fake_db.seed(
+        RawPost(
+            id=11,
+            platform="x",
+            kol_id=None,
+            author_handle="alice",
+            external_id="a-11",
+            url="https://x.com/alice/11",
+            content_text="a11",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=12,
+            platform="x",
+            kol_id=None,
+            author_handle="bob",
+            external_id="b-12",
+            url="https://x.com/bob/12",
+            content_text="b12",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=101,
+            raw_post_id=11,
+            status=ExtractionStatus.pending,
+            extracted_json={},
+            model_name="dummy",
+            extractor_name="dummy",
+            applied_kol_view_id=None,
+            auto_applied_count=0,
+            auto_applied_kol_view_ids=None,
+            created_at=now - timedelta(minutes=2),
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=102,
+            raw_post_id=11,
+            status=ExtractionStatus.approved,
+            extracted_json={},
+            model_name="dummy",
+            extractor_name="dummy",
+            applied_kol_view_id=None,
+            auto_applied_count=0,
+            auto_applied_kol_view_ids=None,
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=103,
+            raw_post_id=12,
+            status=ExtractionStatus.pending,
+            extracted_json={},
+            model_name="dummy",
+            extractor_name="dummy",
+            applied_kol_view_id=201,
+            auto_applied_count=1,
+            auto_applied_kol_view_ids=[201],
+            created_at=now - timedelta(minutes=2),
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=104,
+            raw_post_id=12,
+            status=ExtractionStatus.approved,
+            extracted_json={},
+            model_name="dummy",
+            extractor_name="dummy",
+            applied_kol_view_id=201,
+            auto_applied_count=1,
+            auto_applied_kol_view_ids=[201],
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=201,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=80,
+            summary="applied",
+            source_url="https://x.com/bob/12",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+
+    client = _client_with_db(fake_db)
+    dry_run = client.post("/admin/extractions/cleanup-duplicate-pending?confirm=YES&dry_run=true")
+    assert dry_run.status_code == 200
+    dry_body = dry_run.json()
+    assert dry_body["duplicates_found"] == 1
+    assert 101 in dry_body["would_delete_ids"]
+    assert 103 not in dry_body["would_delete_ids"]
+    assert any("skip_unsafe_extraction:103" in item for item in dry_body["errors"])
+
+    execute = client.post("/admin/extractions/cleanup-duplicate-pending?confirm=YES&dry_run=false")
+    app.dependency_overrides.clear()
+
+    assert execute.status_code == 200
+    body = execute.json()
+    assert body["deleted_count"] == 1
+    assert 101 not in fake_db._data[PostExtraction]
+    assert 103 in fake_db._data[PostExtraction]

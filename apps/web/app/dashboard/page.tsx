@@ -39,12 +39,31 @@ type DashboardActiveKol = {
   }>;
 };
 
+type DashboardClarityContributor = {
+  handle: string;
+  contribution: number;
+};
+
+type DashboardClarityRankingItem = {
+  asset_id: number;
+  symbol: string;
+  name: string | null;
+  market: string | null;
+  direction: "bull" | "bear" | "neutral" | string;
+  s_raw: number;
+  clarity_score: number;
+  n: number;
+  k: number;
+  top_contributors: DashboardClarityContributor[];
+};
+
 type DashboardResponse = {
   pending_extractions_count: number;
   new_views_24h: number;
   new_views_7d: number;
   assets: DashboardAsset[];
   active_kols_7d: DashboardActiveKol[];
+  clarity_ranking: DashboardClarityRankingItem[];
 };
 
 type WindowKey = "24h" | "7d";
@@ -64,13 +83,16 @@ export default function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [windowKey, setWindowKey] = useState<WindowKey>("24h");
+  const [clarityWindow, setClarityWindow] = useState<WindowKey>("7d");
   const todayDigestDate = new Date().toISOString().slice(0, 10);
 
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/dashboard?days=7", { cache: "no-store" });
+      const res = await fetch(`/api/dashboard?days=7&profile_id=1&window=${clarityWindow}&limit=10`, {
+        cache: "no-store",
+      });
       const body = (await res.json()) as DashboardResponse | { detail?: string };
       if (!res.ok) {
         throw new Error("detail" in body ? (body.detail ?? "Load failed") : "Load failed");
@@ -85,7 +107,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [clarityWindow]);
 
   const visibleAssets = useMemo(() => {
     const assets = data?.assets ?? [];
@@ -135,6 +157,59 @@ export default function DashboardPage() {
 
       {!loading && !error && (
         <>
+          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", alignItems: "center" }}>
+              <h2 style={{ marginTop: 0, marginBottom: "8px" }}>交易清晰度排行</h2>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button type="button" onClick={() => setClarityWindow("24h")} disabled={clarityWindow === "24h"}>
+                  24h
+                </button>
+                <button type="button" onClick={() => setClarityWindow("7d")} disabled={clarityWindow === "7d"}>
+                  7d
+                </button>
+              </div>
+            </div>
+            {(!data?.clarity_ranking || data.clarity_ranking.length === 0) && <p>暂无清晰度数据。</p>}
+            {data?.clarity_ranking && data.clarity_ranking.length > 0 && (
+              <div style={{ display: "grid", gap: "6px" }}>
+                {data.clarity_ranking.map((item, index) => (
+                  <Link
+                    key={item.asset_id}
+                    href={`/assets/${item.asset_id}`}
+                    style={{
+                      border: "1px solid #eee",
+                      borderRadius: "8px",
+                      padding: "8px 10px",
+                      textDecoration: "none",
+                      color: "inherit",
+                      display: "grid",
+                      gridTemplateColumns: "40px 1fr auto auto auto",
+                      gap: "8px",
+                      alignItems: "center",
+                    }}
+                  >
+                    <strong>#{index + 1}</strong>
+                    <span>
+                      <strong>{item.symbol}</strong>
+                      {item.name ? ` - ${item.name}` : ""}
+                    </span>
+                    <span
+                      style={{
+                        color: item.direction === "bull" ? "green" : item.direction === "bear" ? "crimson" : "#666",
+                      }}
+                    >
+                      {item.direction}
+                    </span>
+                    <span>score: {item.clarity_score.toFixed(4)}</span>
+                    <span>
+                      N/K: {item.n}/{item.k}
+                    </span>
+                  </Link>
+                ))}
+              </div>
+            )}
+          </section>
+
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
             <h2 style={{ marginTop: 0 }}>资产列表</h2>
             {visibleAssets.length === 0 ? (

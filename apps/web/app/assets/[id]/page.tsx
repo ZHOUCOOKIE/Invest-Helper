@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { AssetViewsTimeline } from "./views-timeline";
 
 type KolView = {
   id: number;
@@ -42,6 +43,14 @@ type AssetViewsFeedResponse = {
   limit: number;
   offset: number;
   has_more: boolean;
+  items: KolView[];
+};
+
+type AssetViewsTimelineResponse = {
+  asset_id: number;
+  days: number;
+  since_date: string;
+  generated_at: string;
   items: KolView[];
 };
 
@@ -86,6 +95,9 @@ export default function AssetDetailPage() {
   const [feedError, setFeedError] = useState<string | null>(null);
   const [feedHorizon, setFeedHorizon] = useState<"all" | "intraday" | "1w" | "1m" | "3m" | "1y">("all");
   const [feedOffset, setFeedOffset] = useState(0);
+  const [timeline, setTimeline] = useState<AssetViewsTimelineResponse | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>({
     kol_id: "",
     stance: "bull",
@@ -132,6 +144,23 @@ export default function AssetDetailPage() {
       setFeedError(err instanceof Error ? err.message : "Load feed failed");
     } finally {
       setFeedLoading(false);
+    }
+  };
+
+  const loadTimeline = async () => {
+    setTimelineLoading(true);
+    setTimelineError(null);
+    try {
+      const res = await fetch(`/api/assets/${assetId}/views/timeline?days=30`, { cache: "no-store" });
+      const body = (await res.json()) as AssetViewsTimelineResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error("detail" in body ? (body.detail ?? "Load timeline failed") : "Load timeline failed");
+      }
+      setTimeline(body as AssetViewsTimelineResponse);
+    } catch (err) {
+      setTimelineError(err instanceof Error ? err.message : "Load timeline failed");
+    } finally {
+      setTimelineLoading(false);
     }
   };
 
@@ -185,6 +214,11 @@ export default function AssetDetailPage() {
     if (Number.isNaN(assetId)) return;
     void loadFeed(feedOffset, feedHorizon);
   }, [assetId, feedOffset, feedHorizon]);
+
+  useEffect(() => {
+    if (Number.isNaN(assetId)) return;
+    void loadTimeline();
+  }, [assetId]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -246,6 +280,7 @@ export default function AssetDetailPage() {
 
       {!loading && !error && data && (
         <div style={{ display: "grid", gap: "12px", marginTop: "12px" }}>
+          <AssetViewsTimeline data={timeline} loading={timelineLoading} error={timelineError} />
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
             <h2 style={{ marginTop: 0 }}>新增观点</h2>
             <form onSubmit={handleSubmit} style={{ display: "grid", gap: "8px", maxWidth: "720px" }}>

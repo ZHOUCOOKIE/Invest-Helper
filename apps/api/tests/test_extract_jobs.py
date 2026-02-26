@@ -589,6 +589,74 @@ def test_frontend_job_creation_guard_or_backend_idempotency(monkeypatch) -> None
     app.dependency_overrides.clear()
 
 
+def test_extract_job_deduplicates_inflight_raw_post_ids_without_idempotency_key(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    _seed_kol(fake_db)
+    _seed_raw_post(fake_db, raw_post_id=1)
+    _seed_raw_post(fake_db, raw_post_id=2)
+
+    async def _fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        await asyncio.sleep(0.15)
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            model_name="dummy",
+            extractor_name="dummy",
+            prompt_version="extract_v1",
+            prompt_text=None,
+            prompt_hash=None,
+            raw_model_output=None,
+            parsed_model_output=None,
+            model_latency_ms=None,
+            model_input_tokens=None,
+            model_output_tokens=None,
+            last_error=None,
+            reviewed_at=None,
+            reviewed_by=None,
+            review_note=None,
+            applied_kol_view_id=None,
+            auto_applied_count=0,
+            auto_policy=None,
+            auto_applied_kol_view_ids=None,
+            created_at=datetime.now(UTC),
+        )
+        db.add(extraction)
+        await db.flush()
+        return extraction
+
+    async def override_get_db():
+        yield fake_db
+
+    monkeypatch.setattr(main_module, "create_pending_extraction", _fake_create_pending_extraction)
+    monkeypatch.setattr(main_module, "_check_reextract_rate_limit", lambda raw_post_id: None)
+    monkeypatch.setattr(
+        main_module,
+        "_get_runtime_throttle",
+        lambda settings: {"max_concurrency": 1, "max_rpm": 100000, "batch_size": 100, "batch_sleep_ms": 0},
+    )
+    monkeypatch.setattr(main_module, "EXTRACT_JOB_SESSION_FACTORY", lambda: _SessionCtx(fake_db))
+
+    app.dependency_overrides[get_db] = override_get_db
+    main_module.EXTRACT_JOBS.clear()
+    main_module.EXTRACT_JOB_TASKS.clear()
+    main_module.EXTRACT_JOB_IDEMPOTENCY.clear()
+    client = TestClient(app)
+
+    first = client.post(
+        "/extract-jobs",
+        json={"raw_post_ids": [1, 2], "mode": "pending_or_failed", "batch_size": 2, "batch_sleep_ms": 0},
+    )
+    second = client.post(
+        "/extract-jobs",
+        json={"raw_post_ids": [1], "mode": "pending_or_failed", "batch_size": 1, "batch_sleep_ms": 0},
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["job_id"] == second.json()["job_id"]
+    app.dependency_overrides.clear()
+
+
 def test_exception_handler_returns_json_and_frontend_can_render_text_fallback(monkeypatch) -> None:  # noqa: ANN001
     def _boom():
         raise RuntimeError("boom-json")

@@ -270,3 +270,79 @@ def test_extractions_bad_only_and_stats() -> None:
     stats_payload = stats.json()
     assert stats_payload["bad_count"] == 2
     assert stats_payload["total_count"] == 3
+
+
+def test_extractions_status_all_does_not_filter_by_status() -> None:
+    get_settings.cache_clear()
+    reset_runtime_counters()
+    fake_db = _FakeSession()
+    now = datetime.now(UTC)
+    fake_db.raw_posts[1] = RawPost(
+        id=1,
+        platform="x",
+        kol_id=1,
+        author_handle="kol_1",
+        external_id="111",
+        url="https://x.com/kol_1/status/111",
+        content_text="post 1",
+        posted_at=now,
+        fetched_at=now,
+        review_status=ReviewStatus.unreviewed,
+        reviewed_at=None,
+        reviewed_by=None,
+        raw_json=None,
+    )
+    fake_db.raw_posts[2] = RawPost(
+        id=2,
+        platform="x",
+        kol_id=2,
+        author_handle="kol_2",
+        external_id="222",
+        url="https://x.com/kol_2/status/222",
+        content_text="post 2",
+        posted_at=now,
+        fetched_at=now,
+        review_status=ReviewStatus.unreviewed,
+        reviewed_at=None,
+        reviewed_by=None,
+        raw_json=None,
+    )
+    fake_db.extractions[31] = PostExtraction(
+        id=31,
+        raw_post_id=1,
+        status=ExtractionStatus.pending,
+        extracted_json={"summary": "pending"},
+        model_name="test-model",
+        extractor_name="openai_structured",
+        last_error=None,
+        auto_applied_count=0,
+        auto_policy=None,
+        auto_applied_kol_view_ids=None,
+        created_at=now,
+    )
+    fake_db.extractions[32] = PostExtraction(
+        id=32,
+        raw_post_id=2,
+        status=ExtractionStatus.approved,
+        extracted_json={"summary": "approved"},
+        model_name="test-model",
+        extractor_name="openai_structured",
+        last_error=None,
+        auto_applied_count=0,
+        auto_policy=None,
+        auto_applied_kol_view_ids=None,
+        created_at=now,
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/extractions?status=all&limit=20&offset=0")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 2
+    assert {item["status"] for item in payload} == {"pending", "approved"}

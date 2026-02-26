@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from enums import ExtractionStatus, Horizon, Stance
 
+ExtractionListStatus = Literal["pending", "approved", "rejected", "all", ""]
+
 
 class AssetCreate(BaseModel):
     symbol: str = Field(min_length=1, max_length=32)
@@ -338,6 +340,16 @@ class AdminDeletePendingExtractionsRead(BaseModel):
     scoped_author_handle: str | None
 
 
+class AdminCleanupDuplicatePendingRead(BaseModel):
+    scanned: int
+    duplicates_found: int
+    dry_run: bool
+    would_delete_ids: list[int] = Field(default_factory=list)
+    would_keep_ids: list[int] = Field(default_factory=list)
+    deleted_count: int = 0
+    errors: list[str] = Field(default_factory=list)
+
+
 class AutoReviewBackfillErrorRead(BaseModel):
     extraction_id: int | None = None
     raw_post_id: int | None = None
@@ -352,6 +364,13 @@ class AdminBackfillAutoReviewRead(BaseModel):
     skipped_no_confidence_count: int
     skipped_already_terminal_count: int
     errors: list[AutoReviewBackfillErrorRead] = Field(default_factory=list)
+
+
+class AdminRefreshWrongExtractedJsonRead(BaseModel):
+    scanned: int
+    updated: int
+    dry_run: bool
+    updated_ids: list[int] = Field(default_factory=list)
 
 
 class AdminHardDeleteRead(BaseModel):
@@ -483,6 +502,26 @@ class DashboardClarityRead(BaseModel):
     clarity: float
 
 
+class DashboardClarityContributorRead(BaseModel):
+    handle: str
+    contribution: float
+
+
+class DashboardClarityRankingRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    asset_id: int
+    symbol: str
+    name: str | None
+    market: str | None
+    direction: Stance
+    s_raw: float
+    clarity_score: float
+    n: int
+    k: int
+    top_contributors: list[DashboardClarityContributorRead] = []
+
+
 class DashboardExtractionStatsRead(BaseModel):
     window_hours: int
     extraction_count: int
@@ -538,6 +577,7 @@ class DashboardRead(BaseModel):
     latest_pending_extractions: list[DashboardPendingExtractionRead]
     top_assets: list[DashboardTopAssetRead]
     clarity: list[DashboardClarityRead]
+    clarity_ranking: list[DashboardClarityRankingRead]
     extraction_stats: DashboardExtractionStatsRead
     new_views_24h: int
     new_views_7d: int
@@ -571,6 +611,35 @@ class AssetViewsFeedRead(BaseModel):
     offset: int
     has_more: bool
     items: list[AssetViewFeedItemRead]
+
+
+class AssetViewsTimelineItemRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id: int
+    kol_id: int
+    kol_display_name: str | None
+    kol_handle: str | None
+    stance: Stance
+    horizon: Horizon
+    confidence: int
+    summary: str
+    source_url: str
+    as_of: date
+    created_at: datetime
+
+
+class AssetViewsTimelineRead(BaseModel):
+    asset_id: int
+    days: int
+    since_date: date
+    generated_at: datetime
+    items: list[AssetViewsTimelineItemRead]
+
+
+class ExtractionsStatsRead(BaseModel):
+    bad_count: int
+    total_count: int
 
 
 class DailyDigestTopAssetRead(BaseModel):
@@ -711,8 +780,10 @@ class RuntimeSettingsRead(BaseModel):
     max_output_tokens: int
     auto_reject_confidence_threshold: int
     throttle: dict[str, int]
+    effective_throttle: dict[str, int]
     burst: dict[str, bool | datetime | str | None]
     runtime_overrides: dict[str, bool]
+    adaptive_throttle: dict[str, bool | int | str | datetime | None]
 
 
 class RuntimeCallBudgetUpdateRequest(BaseModel):

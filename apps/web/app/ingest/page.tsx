@@ -224,6 +224,12 @@ type RuntimeSettings = {
     batch_size: number;
     batch_sleep_ms: number;
   };
+  effective_throttle: {
+    max_concurrency: number;
+    max_rpm: number;
+    batch_size: number;
+    batch_sleep_ms: number;
+  };
   burst: {
     enabled: boolean;
     mode: string | null;
@@ -233,6 +239,16 @@ type RuntimeSettings = {
     call_budget: boolean;
     burst: boolean;
     throttle: boolean;
+    adaptive_throttle: boolean;
+  };
+  adaptive_throttle: {
+    enabled: boolean;
+    active: boolean;
+    degrade_level: number;
+    consecutive_successes: number;
+    recovery_success_target: number;
+    last_reason: string | null;
+    last_changed_at: string | null;
   };
 };
 
@@ -787,6 +803,35 @@ export default function IngestPage() {
       }
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : "Update throttle failed");
+    } finally {
+      setThrottleSaving(false);
+    }
+  };
+
+  const clearRuntimeThrottleOverride = async () => {
+    setThrottleSaving(true);
+    setStatusError(null);
+    try {
+      const res = await fetch("/api/settings/runtime/throttle/clear", {
+        method: "POST",
+      });
+      const body = (await res.json()) as RuntimeSettings | { detail?: string };
+      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Clear throttle override failed") : "Clear throttle override failed");
+      const refreshRes = await fetch("/api/settings/runtime", { cache: "no-store" });
+      const refreshBody = (await refreshRes.json()) as RuntimeSettings | { detail?: string };
+      if (!refreshRes.ok) {
+        throw new Error("detail" in refreshBody ? (refreshBody.detail ?? "Refresh runtime settings failed") : "Refresh runtime settings failed");
+      }
+      const updated = refreshBody as RuntimeSettings;
+      setRuntimeSettings(updated);
+      setThrottleInput({
+        max_concurrency: String(updated.throttle.max_concurrency),
+        max_rpm: String(updated.throttle.max_rpm),
+        batch_size: String(updated.throttle.batch_size),
+        batch_sleep_ms: String(updated.throttle.batch_sleep_ms),
+      });
+    } catch (err) {
+      setStatusError(err instanceof Error ? err.message : "Clear throttle override failed");
     } finally {
       setThrottleSaving(false);
     }
@@ -1766,14 +1811,31 @@ export default function IngestPage() {
 
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "760px" }}>
         <h2 style={{ marginTop: 0 }}>Runtime Throttle</h2>
+        <p style={{ margin: "0 0 8px 0", color: "#666" }}>
+          Adaptive throttle telemetry + Clear Throttle Override
+        </p>
         {runtimeSettings ? (
           <div style={{ display: "grid", gap: "8px" }}>
             <p style={{ margin: 0 }}>
-              max_rpm={runtimeSettings.throttle.max_rpm}, max_concurrency={runtimeSettings.throttle.max_concurrency},
-              batch_size={runtimeSettings.throttle.batch_size}, batch_sleep_ms={runtimeSettings.throttle.batch_sleep_ms}
+              Base throttle ({runtimeSettings.runtime_overrides.throttle ? "manually overridden" : "default aggressive"}):
+              {" "}max_rpm={runtimeSettings.throttle.max_rpm}, max_concurrency={runtimeSettings.throttle.max_concurrency},
+              {" "}batch_size={runtimeSettings.throttle.batch_size}, batch_sleep_ms={runtimeSettings.throttle.batch_sleep_ms}
+            </p>
+            <p style={{ margin: 0 }}>
+              Effective throttle (current): max_rpm={runtimeSettings.effective_throttle.max_rpm}, max_concurrency=
+              {runtimeSettings.effective_throttle.max_concurrency}, batch_size={runtimeSettings.effective_throttle.batch_size},
+              batch_sleep_ms={runtimeSettings.effective_throttle.batch_sleep_ms}
             </p>
             <p style={{ margin: 0, color: "#8a5800" }}>
               默认是付费模型的保守配置；若 429 增多，建议降低 rpm/并发或增大 sleep。
+            </p>
+            <p style={{ margin: 0 }}>
+              Adaptive throttle: {runtimeSettings.adaptive_throttle.enabled ? "enabled" : "disabled"} | active=
+              {runtimeSettings.adaptive_throttle.active ? "true" : "false"} | level={runtimeSettings.adaptive_throttle.degrade_level}
+              {" "}({runtimeSettings.adaptive_throttle.consecutive_successes}/
+              {runtimeSettings.adaptive_throttle.recovery_success_target} successes toward recovery) | reason=
+              {runtimeSettings.adaptive_throttle.last_reason ?? "-"} | changed_at=
+              {runtimeSettings.adaptive_throttle.last_changed_at ?? "-"}
             </p>
             <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
               <input
@@ -1806,6 +1868,13 @@ export default function IngestPage() {
               />
               <button type="button" onClick={() => void updateRuntimeThrottle()} disabled={throttleSaving}>
                 {throttleSaving ? "Saving..." : "Update Throttle"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void clearRuntimeThrottleOverride()}
+                disabled={throttleSaving || !runtimeSettings.runtime_overrides.throttle}
+              >
+                {throttleSaving ? "Saving..." : "Clear Throttle Override"}
               </button>
             </div>
           </div>

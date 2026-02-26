@@ -16,6 +16,8 @@ type RawPost = {
   raw_json: Record<string, unknown> | null;
 };
 
+type ExtractionFilterStatus = "all" | "pending" | "approved" | "rejected";
+
 type Extraction = {
   id: number;
   raw_post_id: number;
@@ -62,7 +64,20 @@ type BackfillAutoReviewResponse = {
   }>;
 };
 
+type ExtractionsStats = {
+  bad_count: number;
+  total_count: number;
+};
+
+type RefreshWrongJsonResponse = {
+  scanned: number;
+  updated: number;
+  dry_run: boolean;
+  updated_ids: number[];
+};
+
 const PAGE_SIZE = 20;
+const statusOptions: ExtractionFilterStatus[] = ["all", "pending", "approved", "rejected"];
 
 function summarizeExtraction(extracted: Record<string, unknown>): string {
   if (typeof extracted.summary === "string" && extracted.summary.trim()) {
@@ -91,10 +106,49 @@ function autoRejectInfo(extracted: Record<string, unknown>): { reason: string; t
   };
 }
 
+function parseUrlNumericId(url: string): string | null {
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  try {
+    const { pathname } = new URL(trimmed);
+    const segments = pathname.split("/").filter(Boolean);
+    for (let i = segments.length - 1; i >= 0; i -= 1) {
+      if (/^\d+$/.test(segments[i])) return segments[i];
+    }
+    return null;
+  } catch {
+    const segments = trimmed.split(/[/?#]/).filter(Boolean);
+    for (let i = segments.length - 1; i >= 0; i -= 1) {
+      if (/^\d+$/.test(segments[i])) return segments[i];
+    }
+    return null;
+  }
+}
+
+function buildPublicId(item: Extraction): string {
+  const platform = (item.raw_post.platform || "unknown").trim().toLowerCase() || "unknown";
+  const externalId = (item.raw_post.external_id || "").trim();
+  const parsedId = parseUrlNumericId(item.raw_post.url || "");
+  const fallbackId = String(item.raw_post_id || item.id);
+  const stableId = externalId || parsedId || fallbackId || String(item.id);
+  return `${platform}:${stableId}`;
+}
+
+function getInitialStatus(searchStatus: string | null): ExtractionFilterStatus {
+  if (searchStatus === "pending" || searchStatus === "approved" || searchStatus === "rejected" || searchStatus === "all") {
+    return searchStatus;
+  }
+  return "all";
+}
+
 export default function ExtractionsPage() {
   const searchParams = useSearchParams();
-  const initialStatus = (searchParams.get("status") as Extraction["status"] | null) ?? "pending";
-  const [status, setStatus] = useState<Extraction["status"]>(initialStatus);
+  const initialStatus = getInitialStatus(searchParams.get("status"));
+  const initialQ = searchParams.get("q") ?? "";
+  const initialBadOnly = searchParams.get("bad_only") === "true";
+  const [status, setStatus] = useState<ExtractionFilterStatus>(initialStatus);
+  const [q, setQ] = useState(initialQ);
+  const [badOnly, setBadOnly] = useState(initialBadOnly);
   const [offset, setOffset] = useState(0);
   const [items, setItems] = useState<Extraction[]>([]);
   const [loading, setLoading] = useState(true);
@@ -104,6 +158,8 @@ export default function ExtractionsPage() {
   const [progress, setProgress] = useState<XProgress | null>(null);
   const [backfillBusy, setBackfillBusy] = useState(false);
   const [backfillResult, setBackfillResult] = useState<BackfillAutoReviewResponse | null>(null);
+  const [stats, setStats] = useState<ExtractionsStats | null>(null);
+  const [refreshWrongBusy, setRefreshWrongBusy] = useState(false);
   const requestSeqRef = useRef(0);
 
   const canPrev = useMemo(() => offset > 0, [offset]);
@@ -115,7 +171,14 @@ export default function ExtractionsPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/extractions?status=${status}&limit=${PAGE_SIZE}&offset=${offset}`, {
+      const params = new URLSearchParams({
+        status,
+        limit: String(PAGE_SIZE),
+        offset: String(offset),
+        q: q.trim(),
+        bad_only: badOnly ? "true" : "false",
+      });
+      const res = await fetch(`/api/extractions?${params.toString()}`, {
         cache: "no-store",
       });
       const body = (await res.json()) as Extraction[] | { detail?: string };
@@ -144,7 +207,16 @@ export default function ExtractionsPage() {
 
   useEffect(() => {
     void load();
-  }, [status, offset]);
+  }, [status, offset, q, badOnly]);
+
+  const refreshStats = async () => {
+    const res = await fetch("/api/extractions/stats", { cache: "no-store" });
+    const body = (await res.json()) as ExtractionsStats | { detail?: string };
+    if (!res.ok) {
+      throw new Error("detail" in body ? (body.detail ?? "Load stats failed") : "Load stats failed");
+    }
+    setStats(body as ExtractionsStats);
+  };
 
   const refreshProgress = async () => {
     const res = await fetch("/api/ingest/x/progress", { cache: "no-store" });
@@ -157,6 +229,7 @@ export default function ExtractionsPage() {
 
   useEffect(() => {
     void refreshProgress();
+    void refreshStats();
   }, []);
 
   const rejectInline = async (extractionId: number) => {
@@ -237,6 +310,36 @@ export default function ExtractionsPage() {
     }
   };
 
+  const refreshWrongExtractedJson = async () => {
+    const confirmText = window.prompt(
+      "This refreshes approved wrong extracted_json from applied views. Type YES to continue.",
+      "",
+    );
+    if (confirmText !== "YES") return;
+    setRefreshWrongBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(
+        "/api/admin/extractions/refresh-wrong-extracted-json?confirm=YES&days=365&limit=2000&dry_run=false",
+        { method: "POST" },
+      );
+      const body = (await res.json()) as RefreshWrongJsonResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error("detail" in body ? (body.detail ?? "Refresh wrong extracted_json failed") : "Refresh wrong extracted_json failed");
+      }
+      const done = body as RefreshWrongJsonResponse;
+      setMessage(
+        `Refresh done: scanned=${done.scanned}, updated=${done.updated}, ids=${done.updated_ids.slice(0, 10).join(",") || "-"}.`,
+      );
+      await Promise.all([load(), refreshStats(), refreshProgress()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Refresh wrong extracted_json failed");
+    } finally {
+      setRefreshWrongBusy(false);
+    }
+  };
+
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
       <h1>Extractions Review</h1>
@@ -244,24 +347,52 @@ export default function ExtractionsPage() {
         默认展示 pending，可切换状态；Approve 进入详情页，Reject 可直接操作。
       </p>
 
-      <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "12px" }}>
+      <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "12px", flexWrap: "wrap" }}>
         <label>
           status
           <select
             value={status}
             onChange={(event) => {
-              setStatus(event.target.value as Extraction["status"]);
+              setStatus(event.target.value as ExtractionFilterStatus);
               setOffset(0);
             }}
             style={{ marginLeft: "8px" }}
           >
-            <option value="pending">pending</option>
-            <option value="approved">approved</option>
-            <option value="rejected">rejected</option>
+            {statusOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
           </select>
+        </label>
+        <label>
+          q
+          <input
+            value={q}
+            onChange={(event) => {
+              setQ(event.target.value);
+              setOffset(0);
+            }}
+            placeholder="keyword"
+            style={{ marginLeft: "8px" }}
+          />
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={badOnly}
+            onChange={(event) => {
+              setBadOnly(event.target.checked);
+              setOffset(0);
+            }}
+          />{" "}
+          Show bad only
         </label>
         <button type="button" onClick={() => void load()} disabled={loading}>
           {loading ? "Loading..." : "Refresh"}
+        </button>
+        <button type="button" onClick={() => void refreshStats()} disabled={loading}>
+          Refresh Stats
         </button>
         {status === "pending" && (
           <>
@@ -279,6 +410,9 @@ export default function ExtractionsPage() {
             <button type="button" onClick={() => void clearPending()} disabled={loading}>
               Clear Pending (Delete)
             </button>
+            <button type="button" onClick={() => void refreshWrongExtractedJson()} disabled={loading || refreshWrongBusy}>
+              {refreshWrongBusy ? "Running..." : "Refresh Wrong Extracted JSON"}
+            </button>
           </>
         )}
       </div>
@@ -291,6 +425,7 @@ export default function ExtractionsPage() {
           {progress.pending_count}, failed={progress.failed_count}, no_extraction={progress.no_extraction_count}
         </p>
       )}
+      {stats && <p style={{ color: "#555" }}>bad_json_count={stats.bad_count} / total={stats.total_count}</p>}
       {backfillResult && (
         <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px", marginBottom: "10px" }}>
           <div>
@@ -319,13 +454,18 @@ export default function ExtractionsPage() {
       {!loading && items.length === 0 && <p>No extractions.</p>}
 
       <div style={{ display: "grid", gap: "10px" }}>
-        {items.map((item) => {
+        {items.map((item, idx) => {
           const autoRejected = autoRejectInfo(item.extracted_json);
+          const serialNo = offset + idx + 1;
+          const publicId = buildPublicId(item);
           return (
             <article key={item.id} style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", marginBottom: "6px" }}>
-                <strong>#{item.id} [{item.status}]</strong>
+                <strong>No.{serialNo} [{item.status}] public_id={publicId}</strong>
                 <small>created_at: {item.created_at}</small>
+              </div>
+              <div>
+                <small>extraction_id={item.id}</small>
               </div>
               <div>
                 {item.raw_post.platform} / @{item.raw_post.author_handle}

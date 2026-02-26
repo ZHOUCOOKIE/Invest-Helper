@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -33,10 +33,14 @@ from schemas import (
     AssetViewFeedItemRead,
     AssetViewsGroupRead,
     AssetViewsFeedRead,
+    AssetViewsTimelineItemRead,
+    AssetViewsTimelineRead,
     AssetViewsMetaRead,
     AssetRead,
     AdminDeletePendingExtractionsRead,
+    AdminCleanupDuplicatePendingRead,
     AdminBackfillAutoReviewRead,
+    AdminRefreshWrongExtractedJsonRead,
     AdminHardDeleteRead,
     AssetViewsRead,
     AutoAppliedViewRead,
@@ -45,6 +49,8 @@ from schemas import (
     DashboardAssetLatestViewRead,
     DashboardAssetRead,
     DashboardClarityRead,
+    DashboardClarityContributorRead,
+    DashboardClarityRankingRead,
     DashboardExtractionStatsRead,
     DashboardPendingExtractionRead,
     DashboardRead,
@@ -56,6 +62,7 @@ from schemas import (
     ExtractorStatusRead,
     ExtractionApproveRequest,
     ExtractionApproveBatchRequest,
+    ExtractionListStatus,
     ExtractionRejectRequest,
     KolCreate,
     KolRead,
@@ -77,6 +84,7 @@ from schemas import (
     RuntimeBurstUpdateRequest,
     RuntimeThrottleUpdateRequest,
     RuntimeSettingsRead,
+    ExtractionsStatsRead,
     XImportItemCreate,
     XConvertResponseRead,
     XConvertErrorRead,
@@ -137,6 +145,14 @@ RUNTIME_BURST_STATE: dict[str, Any] = {
     "expires_at": None,
 }
 RUNTIME_THROTTLE_OVERRIDE: dict[str, int] = {}
+RUNTIME_ADAPTIVE_THROTTLE_STATE: dict[str, Any] = {
+    "current": None,
+    "degrade_level": 0,
+    "consecutive_successes": 0,
+    "last_changed_at": None,
+    "last_reason": None,
+}
+ADAPTIVE_THROTTLE_LOCK = asyncio.Lock()
 RUNTIME_BUDGET_WINDOW_START: datetime | None = None
 RUNTIME_BUDGET_WINDOW_END: datetime | None = None
 EXTRACT_JOBS: dict[str, dict[str, Any]] = {}
@@ -289,6 +305,279 @@ def build_external_id(url: str) -> str:
 def calc_clarity(bull_count: int, bear_count: int) -> float:
     total = bull_count + bear_count
     return abs(bull_count - bear_count) / max(1, total)
+
+
+def _is_bad_extracted_json(extraction: PostExtraction) -> bool:
+    if (extraction.last_error or "").strip():
+        return True
+    payload = extraction.extracted_json
+    if not isinstance(payload, dict):
+        return True
+    required_keys = {"asset_views", "reasoning", "summary", "stance", "horizon", "confidence", "as_of"}
+    if not required_keys.issubset(payload.keys()):
+        return True
+    if not isinstance(payload.get("asset_views"), list):
+        return True
+    return False
+
+
+def _extraction_matches_keyword(extraction: PostExtraction, keyword: str) -> bool:
+    needle = keyword.strip().lower()
+    if not needle:
+        return True
+    haystack = [
+        extraction.raw_post.author_handle if extraction.raw_post else "",
+        extraction.raw_post.content_text if extraction.raw_post else "",
+        extraction.raw_post.url if extraction.raw_post else "",
+        extraction.last_error or "",
+    ]
+    if isinstance(extraction.extracted_json, dict):
+        for key in ("summary", "reasoning", "stance", "horizon", "source_url"):
+            value = extraction.extracted_json.get(key)
+            if isinstance(value, str):
+                haystack.append(value)
+    return needle in "\n".join(haystack).lower()
+
+
+async def _compute_dashboard_clarity_ranking(
+    db: AsyncSession,
+    *,
+    now: datetime,
+    profile_id: int,
+    window: str,
+    limit: int,
+) -> list[DashboardClarityRankingRead]:
+    window_hours = 24 if window == "24h" else 24 * 7
+    half_life_days = 0.5 if window == "24h" else 2.0
+    window_start = now - timedelta(hours=window_hours)
+
+    clarity_sql = text(
+        """
+        WITH profile_context AS (
+            SELECT EXISTS(
+                SELECT 1
+                FROM profile_kol_weights
+                WHERE profile_id = :profile_id
+            ) AS has_profile_kols
+        ),
+        views_in_window AS (
+            SELECT
+                kv.asset_id AS asset_id,
+                kv.kol_id AS kol_id,
+                kv.stance AS stance,
+                kv.confidence AS confidence,
+                COALESCE(rp.posted_at, (kv.as_of::timestamp AT TIME ZONE 'UTC'), kv.created_at) AS business_ts,
+                COALESCE(pkw.weight, 1.0) AS kol_weight
+            FROM kol_views kv
+            JOIN assets a ON a.id = kv.asset_id
+            CROSS JOIN profile_context pc
+            LEFT JOIN profile_kol_weights pkw
+                ON pkw.profile_id = :profile_id
+                AND pkw.kol_id = kv.kol_id
+                AND pkw.enabled = TRUE
+            LEFT JOIN raw_posts rp
+                ON rp.url = kv.source_url
+            WHERE
+                COALESCE(rp.posted_at, (kv.as_of::timestamp AT TIME ZONE 'UTC'), kv.created_at) >= :window_start
+                AND (pc.has_profile_kols = FALSE OR pkw.id IS NOT NULL)
+        ),
+        scored_views AS (
+            SELECT
+                asset_id,
+                kol_id,
+                (
+                    CASE
+                        WHEN stance = 'bull' THEN 1.0
+                        WHEN stance = 'bear' THEN -1.0
+                        ELSE 0.0
+                    END
+                    * kol_weight
+                    * (0.5 + (confidence::float / 200.0))
+                    * EXP(
+                        -LN(2.0)
+                        * GREATEST(EXTRACT(EPOCH FROM (:as_of_ts - business_ts)) / 86400.0, 0.0)
+                        / :half_life_days
+                    )
+                ) AS signed_weight
+            FROM views_in_window
+        ),
+        asset_scores AS (
+            SELECT
+                sv.asset_id AS asset_id,
+                SUM(sv.signed_weight) AS s_raw,
+                COUNT(*)::int AS n_views,
+                COUNT(DISTINCT sv.kol_id)::int AS k_unique
+            FROM scored_views sv
+            GROUP BY sv.asset_id
+        )
+        SELECT
+            a.id AS asset_id,
+            a.symbol AS symbol,
+            a.name AS name,
+            a.market AS market,
+            asset_scores.s_raw AS s_raw,
+            ABS(asset_scores.s_raw) * LN(1 + asset_scores.n_views) * LN(1 + asset_scores.k_unique) AS clarity_score,
+            asset_scores.n_views AS n_views,
+            asset_scores.k_unique AS k_unique
+        FROM asset_scores
+        JOIN assets a ON a.id = asset_scores.asset_id
+        ORDER BY
+            clarity_score DESC,
+            ABS(asset_scores.s_raw) DESC,
+            a.id ASC
+        LIMIT :limit
+        """
+    )
+
+    clarity_rows = (
+        await db.execute(
+            clarity_sql,
+            {
+                "profile_id": profile_id,
+                "window_start": window_start,
+                "as_of_ts": now,
+                "half_life_days": half_life_days,
+                "limit": limit,
+            },
+        )
+    ).mappings().all()
+    if not clarity_rows:
+        return []
+
+    asset_ids = [int(row["asset_id"]) for row in clarity_rows]
+    contributors_sql = text(
+        """
+        WITH profile_context AS (
+            SELECT EXISTS(
+                SELECT 1
+                FROM profile_kol_weights
+                WHERE profile_id = :profile_id
+            ) AS has_profile_kols
+        ),
+        views_in_window AS (
+            SELECT
+                kv.asset_id AS asset_id,
+                kv.kol_id AS kol_id,
+                kv.stance AS stance,
+                kv.confidence AS confidence,
+                k.handle AS kol_handle,
+                COALESCE(rp.posted_at, (kv.as_of::timestamp AT TIME ZONE 'UTC'), kv.created_at) AS business_ts,
+                COALESCE(pkw.weight, 1.0) AS kol_weight
+            FROM kol_views kv
+            JOIN kols k ON k.id = kv.kol_id
+            CROSS JOIN profile_context pc
+            LEFT JOIN profile_kol_weights pkw
+                ON pkw.profile_id = :profile_id
+                AND pkw.kol_id = kv.kol_id
+                AND pkw.enabled = TRUE
+            LEFT JOIN raw_posts rp
+                ON rp.url = kv.source_url
+            WHERE
+                kv.asset_id IN :asset_ids
+                AND COALESCE(rp.posted_at, (kv.as_of::timestamp AT TIME ZONE 'UTC'), kv.created_at) >= :window_start
+                AND (pc.has_profile_kols = FALSE OR pkw.id IS NOT NULL)
+        ),
+        scored_views AS (
+            SELECT
+                asset_id,
+                kol_id,
+                kol_handle,
+                (
+                    CASE
+                        WHEN stance = 'bull' THEN 1.0
+                        WHEN stance = 'bear' THEN -1.0
+                        ELSE 0.0
+                    END
+                    * kol_weight
+                    * (0.5 + (confidence::float / 200.0))
+                    * EXP(
+                        -LN(2.0)
+                        * GREATEST(EXTRACT(EPOCH FROM (:as_of_ts - business_ts)) / 86400.0, 0.0)
+                        / :half_life_days
+                    )
+                ) AS signed_weight
+            FROM views_in_window
+        ),
+        kol_contrib AS (
+            SELECT
+                asset_id,
+                kol_id,
+                kol_handle,
+                SUM(signed_weight) AS contribution
+            FROM scored_views
+            GROUP BY asset_id, kol_id, kol_handle
+        ),
+        ranked_contrib AS (
+            SELECT
+                asset_id,
+                kol_id,
+                kol_handle,
+                contribution,
+                ROW_NUMBER() OVER (
+                    PARTITION BY asset_id
+                    ORDER BY ABS(contribution) DESC, kol_handle ASC
+                ) AS rank_no
+            FROM kol_contrib
+        )
+        SELECT
+            asset_id,
+            kol_id,
+            kol_handle,
+            contribution
+        FROM ranked_contrib
+        WHERE rank_no <= 3
+        ORDER BY asset_id ASC, rank_no ASC
+        """
+    ).bindparams(bindparam("asset_ids", expanding=True))
+
+    contrib_rows = (
+        await db.execute(
+            contributors_sql,
+            {
+                "profile_id": profile_id,
+                "asset_ids": asset_ids,
+                "window_start": window_start,
+                "as_of_ts": now,
+                "half_life_days": half_life_days,
+            },
+        )
+    ).mappings().all()
+    contributors_map: dict[int, list[DashboardClarityContributorRead]] = defaultdict(list)
+    for row in contrib_rows:
+        asset_id = int(row["asset_id"])
+        kol_id = int(row["kol_id"] or 0)
+        handle = str(row["kol_handle"] or f"kol-{kol_id}")
+        contributors_map[asset_id].append(
+            DashboardClarityContributorRead(
+                handle=handle,
+                contribution=round(float(row["contribution"] or 0.0), 6),
+            )
+        )
+
+    ranking: list[DashboardClarityRankingRead] = []
+    for row in clarity_rows:
+        s_raw = float(row["s_raw"] or 0.0)
+        direction = Stance.neutral
+        if s_raw > 0:
+            direction = Stance.bull
+        elif s_raw < 0:
+            direction = Stance.bear
+        asset_id = int(row["asset_id"])
+        ranking.append(
+            DashboardClarityRankingRead(
+                asset_id=asset_id,
+                symbol=str(row["symbol"]),
+                name=row["name"],
+                market=row["market"],
+                direction=direction,
+                s_raw=round(s_raw, 6),
+                clarity_score=round(float(row["clarity_score"] or 0.0), 6),
+                n=int(row["n_views"] or 0),
+                k=int(row["k_unique"] or 0),
+                top_contributors=contributors_map.get(asset_id, []),
+            )
+        )
+    return ranking
 
 
 def _build_last_error(exc: Exception) -> str:
@@ -624,6 +913,11 @@ def reset_runtime_counters() -> None:
     RUNTIME_BURST_STATE["call_budget"] = None
     RUNTIME_BURST_STATE["expires_at"] = None
     RUNTIME_THROTTLE_OVERRIDE.clear()
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = None
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["degrade_level"] = 0
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = 0
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["last_changed_at"] = None
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["last_reason"] = None
     RUNTIME_BUDGET_WINDOW_START = None
     RUNTIME_BUDGET_WINDOW_END = None
     EXTRACT_JOB_IDEMPOTENCY.clear()
@@ -774,7 +1068,159 @@ def _set_runtime_throttle(settings, *, max_concurrency: int, max_rpm: int, batch
     )
     RUNTIME_THROTTLE_OVERRIDE.clear()
     RUNTIME_THROTTLE_OVERRIDE.update(clamped)
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = None
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["degrade_level"] = 0
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = 0
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["last_changed_at"] = _utc_now()
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["last_reason"] = "manual throttle override updated"
     return clamped
+
+
+def _adaptive_recovery_success_threshold(settings) -> int:
+    return max(1, int(getattr(settings, "extract_adaptive_recovery_successes", 12)))
+
+
+def _adaptive_throttle_enabled(settings) -> bool:
+    return bool(getattr(settings, "extract_adaptive_throttle_enabled", True))
+
+
+def _normalize_adaptive_throttle_state(*, settings, base: dict[str, int], current: dict[str, int]) -> dict[str, int]:
+    return _clamp_runtime_throttle(
+        settings,
+        max_concurrency=max(1, min(int(current["max_concurrency"]), base["max_concurrency"])),
+        max_rpm=max(1, min(int(current["max_rpm"]), base["max_rpm"])),
+        batch_size=max(1, min(int(current["batch_size"]), base["batch_size"])),
+        batch_sleep_ms=max(int(base["batch_sleep_ms"]), int(current["batch_sleep_ms"])),
+    )
+
+
+def _get_effective_runtime_throttle(settings) -> dict[str, int]:
+    base = _get_runtime_throttle(settings)
+    if not _adaptive_throttle_enabled(settings) or bool(RUNTIME_THROTTLE_OVERRIDE):
+        return base
+    current = RUNTIME_ADAPTIVE_THROTTLE_STATE.get("current")
+    if not isinstance(current, dict):
+        return base
+    try:
+        return _normalize_adaptive_throttle_state(settings=settings, base=base, current=current)
+    except Exception:  # noqa: BLE001
+        return base
+
+
+def _adaptive_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        return f"http_{exc.status_code}"
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return f"http_{status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    message = str(exc).lower()
+    if "429" in message:
+        return "http_429"
+    if "503" in message:
+        return "http_503"
+    if "timeout" in message:
+        return "timeout"
+    return type(exc).__name__
+
+
+def _degrade_throttle_once(*, settings, current: dict[str, int], base: dict[str, int]) -> dict[str, int]:
+    sleep_step = max(50, settings.extract_batch_sleep_ms_min // 2)
+    degraded = {
+        "max_concurrency": max(1, current["max_concurrency"] - 1),
+        "max_rpm": max(1, int(current["max_rpm"] * 0.8)),
+        "batch_size": max(1, int(current["batch_size"] * 0.85)),
+        "batch_sleep_ms": max(current["batch_sleep_ms"] + sleep_step, int(current["batch_sleep_ms"] * 1.25)),
+    }
+    return _normalize_adaptive_throttle_state(settings=settings, base=base, current=degraded)
+
+
+def _upgrade_throttle_once(*, settings, current: dict[str, int], base: dict[str, int]) -> dict[str, int]:
+    sleep_step = max(50, settings.extract_batch_sleep_ms_min // 2)
+    upgraded = {
+        "max_concurrency": min(base["max_concurrency"], current["max_concurrency"] + 1),
+        "max_rpm": min(base["max_rpm"], current["max_rpm"] + max(1, int(base["max_rpm"] * 0.2))),
+        "batch_size": min(base["batch_size"], current["batch_size"] + max(1, int(base["batch_size"] * 0.2))),
+        "batch_sleep_ms": max(base["batch_sleep_ms"], current["batch_sleep_ms"] - sleep_step),
+    }
+    return _normalize_adaptive_throttle_state(settings=settings, base=base, current=upgraded)
+
+
+async def _adaptive_throttle_degrade(settings, exc: Exception) -> None:
+    if not _adaptive_throttle_enabled(settings) or bool(RUNTIME_THROTTLE_OVERRIDE):
+        return
+    base = _get_runtime_throttle(settings)
+    reason = _adaptive_failure_reason(exc)
+    async with ADAPTIVE_THROTTLE_LOCK:
+        current = RUNTIME_ADAPTIVE_THROTTLE_STATE.get("current")
+        if not isinstance(current, dict):
+            current = base
+        current = _normalize_adaptive_throttle_state(settings=settings, base=base, current=current)
+        degraded = _degrade_throttle_once(settings=settings, current=current, base=base)
+        RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = 0
+        RUNTIME_ADAPTIVE_THROTTLE_STATE["last_reason"] = reason
+        if degraded != current:
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = degraded
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["degrade_level"] = int(RUNTIME_ADAPTIVE_THROTTLE_STATE.get("degrade_level", 0)) + 1
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["last_changed_at"] = _utc_now()
+        else:
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = current
+
+
+async def _adaptive_throttle_maybe_upgrade(settings) -> None:
+    if not _adaptive_throttle_enabled(settings) or bool(RUNTIME_THROTTLE_OVERRIDE):
+        return
+    base = _get_runtime_throttle(settings)
+    threshold = _adaptive_recovery_success_threshold(settings)
+    async with ADAPTIVE_THROTTLE_LOCK:
+        current = RUNTIME_ADAPTIVE_THROTTLE_STATE.get("current")
+        if not isinstance(current, dict):
+            return
+        current = _normalize_adaptive_throttle_state(settings=settings, base=base, current=current)
+        if current == base:
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = None
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["degrade_level"] = 0
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = 0
+            return
+        successes = int(RUNTIME_ADAPTIVE_THROTTLE_STATE.get("consecutive_successes", 0)) + 1
+        if successes < threshold:
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = successes
+            return
+        upgraded = _upgrade_throttle_once(settings=settings, current=current, base=base)
+        RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = 0
+        RUNTIME_ADAPTIVE_THROTTLE_STATE["last_reason"] = f"{threshold} consecutive successes"
+        if upgraded != current:
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = upgraded if upgraded != base else None
+            next_level = max(0, int(RUNTIME_ADAPTIVE_THROTTLE_STATE.get("degrade_level", 0)) - 1)
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["degrade_level"] = next_level if upgraded != base else 0
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["last_changed_at"] = _utc_now()
+        else:
+            RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = current
+
+
+def _build_adaptive_throttle_runtime_state(settings, base: dict[str, int], effective: dict[str, int]) -> dict[str, bool | int | str | datetime | None]:
+    enabled = _adaptive_throttle_enabled(settings)
+    override_enabled = bool(RUNTIME_THROTTLE_OVERRIDE)
+    active = enabled and not override_enabled and effective != base
+    state_reason = RUNTIME_ADAPTIVE_THROTTLE_STATE.get("last_reason")
+    if override_enabled:
+        reason = state_reason or "manual_override"
+    elif not enabled:
+        reason = "adaptive_disabled"
+    elif active:
+        reason = state_reason or "adaptive_active"
+    else:
+        reason = "adaptive_inactive"
+    return {
+        "enabled": enabled,
+        "active": active,
+        "degrade_level": int(RUNTIME_ADAPTIVE_THROTTLE_STATE.get("degrade_level", 0)),
+        "consecutive_successes": int(RUNTIME_ADAPTIVE_THROTTLE_STATE.get("consecutive_successes", 0)),
+        "recovery_success_target": _adaptive_recovery_success_threshold(settings),
+        "last_reason": reason,
+        "last_changed_at": RUNTIME_ADAPTIVE_THROTTLE_STATE.get("last_changed_at"),
+    }
 
 
 def _check_reextract_rate_limit(raw_post_id: int) -> None:
@@ -1474,6 +1920,53 @@ async def postprocess_auto_review(
     return "approved"
 
 
+def _is_safe_pending_cleanup_candidate(extraction: PostExtraction) -> bool:
+    if _extraction_status_key(extraction) != ExtractionStatus.pending.value:
+        return False
+    if extraction.applied_kol_view_id is not None:
+        return False
+    if int(getattr(extraction, "auto_applied_count", 0) or 0) > 0:
+        return False
+    auto_ids = extraction.auto_applied_kol_view_ids
+    if isinstance(auto_ids, list) and len(auto_ids) > 0:
+        return False
+    return True
+
+
+async def _cleanup_stale_pending_extractions_for_raw_post(
+    db: AsyncSession,
+    *,
+    raw_post: RawPost,
+    keep_extraction_id: int | None = None,
+) -> list[int]:
+    result = await db.execute(select(PostExtraction).where(PostExtraction.raw_post_id == raw_post.id))
+    rows = list(result.scalars().all())
+    rows.sort(
+        key=lambda item: (
+            item.created_at or datetime.min.replace(tzinfo=UTC),
+            item.id or 0,
+        ),
+        reverse=True,
+    )
+    has_result = any(_is_result_available_extraction(item, raw_post) for item in rows)
+    deleted_ids: list[int] = []
+    for item in rows:
+        if item.id == keep_extraction_id:
+            continue
+        if _extraction_status_key(item) != ExtractionStatus.pending.value:
+            continue
+        # If there is no result yet, keep the newest pending and drop older pending duplicates only.
+        if not has_result and rows and item.id == rows[0].id:
+            continue
+        if not _is_safe_pending_cleanup_candidate(item):
+            continue
+        deleted_ids.append(item.id)
+        await db.delete(item)
+    if deleted_ids:
+        await db.flush()
+    return deleted_ids
+
+
 async def create_pending_extraction(
     db: AsyncSession,
     raw_post: RawPost,
@@ -1663,6 +2156,11 @@ async def create_pending_extraction(
     except Exception as exc:  # noqa: BLE001
         auto_error = _build_last_error(exc)
         extraction.last_error = auto_error if not extraction.last_error else f"{extraction.last_error}; auto_apply={auto_error}"
+    await _cleanup_stale_pending_extractions_for_raw_post(
+        db,
+        raw_post=raw_post,
+        keep_extraction_id=extraction.id,
+    )
     _attach_extraction_auto_approve_settings(extraction)
     return extraction
 
@@ -2078,6 +2576,53 @@ async def get_asset_views_feed(
         limit=limit,
         offset=offset,
         has_more=(offset + len(items)) < total,
+        items=items,
+    )
+
+
+@app.get("/assets/{asset_id}/views/timeline", response_model=AssetViewsTimelineRead)
+async def get_asset_views_timeline(
+    asset_id: int,
+    days: int = Query(default=30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    asset = await db.get(Asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    now = datetime.now(UTC)
+    since_date = (now - timedelta(days=days)).date()
+    result = await db.execute(
+        select(KolView)
+        .where(KolView.asset_id == asset_id)
+        .order_by(KolView.as_of.desc(), KolView.created_at.desc(), KolView.id.desc())
+    )
+    all_views = list(result.scalars().all())
+    filtered = [item for item in all_views if item.as_of and item.as_of >= since_date]
+
+    kol_result = await db.execute(select(Kol))
+    kol_map = {item.id: item for item in kol_result.scalars().all()}
+    items = [
+        AssetViewsTimelineItemRead(
+            id=item.id,
+            kol_id=item.kol_id,
+            kol_display_name=kol_map.get(item.kol_id).display_name if item.kol_id in kol_map else None,
+            kol_handle=kol_map.get(item.kol_id).handle if item.kol_id in kol_map else None,
+            stance=item.stance,
+            horizon=item.horizon,
+            confidence=item.confidence,
+            summary=item.summary,
+            source_url=item.source_url,
+            as_of=item.as_of,
+            created_at=item.created_at,
+        )
+        for item in filtered
+    ]
+    return AssetViewsTimelineRead(
+        asset_id=asset_id,
+        days=days,
+        since_date=since_date,
+        generated_at=now,
         items=items,
     )
 
@@ -2729,7 +3274,7 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
     resumed_skipped = 0
 
     settings = get_settings()
-    throttle = _get_runtime_throttle(settings)
+    throttle = _get_effective_runtime_throttle(settings)
     retry_max = max(0, settings.extract_retry_max)
     max_resume_retries = max(1, retry_max)
     backoff_base_ms = max(1, settings.extract_retry_backoff_base_ms)
@@ -2799,12 +3344,16 @@ async def _extract_raw_posts_batch_core(payload: RawPostsExtractBatchRequest, db
                     await local_db.commit()
                     if _is_failed_extraction(extraction, raw_post):
                         return ("failed_existing", (extraction.last_error or "extraction_failed"), resume_candidate, None)
+                    await _adaptive_throttle_maybe_upgrade(settings)
                     auto_outcome = "rejected" if bool(getattr(extraction, "auto_rejected", False)) else (
                         "approved" if bool(getattr(extraction, "auto_approved", False)) else None
                     )
                     return ("success", None, resume_candidate, auto_outcome)
                 except Exception as exc:  # noqa: BLE001
-                    if not _is_retryable_extraction_error(exc) or attempt > retry_max:
+                    retryable = _is_retryable_extraction_error(exc)
+                    if retryable:
+                        await _adaptive_throttle_degrade(settings, exc)
+                    if not retryable or attempt > retry_max:
                         await local_db.rollback()
                         return ("failed", _build_last_error(exc), resume_candidate, None)
                     await local_db.rollback()
@@ -3059,6 +3608,21 @@ async def create_extract_job(payload: ExtractJobCreateRequest):
             existing_state = EXTRACT_JOBS.get(existing_job_id or "")
             if existing_state is not None and existing_state["status"] in {"queued", "running"}:
                 return ExtractJobCreateRead(job_id=existing_job_id)
+        in_flight_raw_post_to_job: dict[int, str] = {}
+        first_in_flight_job_id: str | None = None
+        for state in EXTRACT_JOBS.values():
+            if state["status"] not in {"queued", "running"}:
+                continue
+            if first_in_flight_job_id is None:
+                first_in_flight_job_id = state["job_id"]
+            for raw_post_id in state["raw_post_ids"]:
+                in_flight_raw_post_to_job.setdefault(raw_post_id, state["job_id"])
+        filtered_raw_post_ids = [raw_post_id for raw_post_id in raw_post_ids if raw_post_id not in in_flight_raw_post_to_job]
+        if not filtered_raw_post_ids and raw_post_ids:
+            reused_job_id = in_flight_raw_post_to_job.get(raw_post_ids[0]) or first_in_flight_job_id
+            if reused_job_id is not None:
+                return ExtractJobCreateRead(job_id=reused_job_id)
+        raw_post_ids = filtered_raw_post_ids
         job_id = uuid4().hex
         counters = _empty_extract_counters(requested_count=len(raw_post_ids))
         state: dict[str, Any] = {
@@ -3201,6 +3765,82 @@ async def retry_failed_x_extractions(
         failed_count=failed_count,
         skipped_count=skipped_count,
         failure_reasons=dict(reason_counter),
+    )
+
+
+async def _plan_duplicate_pending_cleanup(
+    db: AsyncSession,
+    *,
+    limit: int,
+) -> tuple[int, list[int], list[int], list[str]]:
+    result = await db.execute(select(PostExtraction))
+    rows = list(result.scalars().all())
+    rows.sort(
+        key=lambda item: (
+            item.created_at or datetime.min.replace(tzinfo=UTC),
+            item.id or 0,
+        ),
+        reverse=True,
+    )
+    by_raw_post_id: dict[int, list[PostExtraction]] = defaultdict(list)
+    for item in rows:
+        by_raw_post_id[item.raw_post_id].append(item)
+
+    scanned = 0
+    keep_ids: list[int] = []
+    delete_ids: list[int] = []
+    errors: list[str] = []
+    for raw_post_id, items in by_raw_post_id.items():
+        pending_rows = [item for item in items if _extraction_status_key(item) == ExtractionStatus.pending.value]
+        if not pending_rows:
+            continue
+        scanned += len(pending_rows)
+        has_terminal = any(
+            _extraction_status_key(item) in {ExtractionStatus.approved.value, ExtractionStatus.rejected.value}
+            for item in items
+        )
+        if has_terminal:
+            candidates = pending_rows
+        else:
+            keep_ids.append(pending_rows[0].id)
+            candidates = pending_rows[1:]
+        for candidate in candidates:
+            if not _is_safe_pending_cleanup_candidate(candidate):
+                errors.append(f"skip_unsafe_extraction:{candidate.id}:raw_post:{raw_post_id}")
+                continue
+            delete_ids.append(candidate.id)
+            if len(delete_ids) >= limit:
+                return scanned, keep_ids, delete_ids, errors[:50]
+    return scanned, keep_ids, delete_ids, errors[:50]
+
+
+@app.post("/admin/extractions/cleanup-duplicate-pending", response_model=AdminCleanupDuplicatePendingRead)
+async def cleanup_duplicate_pending_extractions(
+    confirm: str = Query(...),
+    dry_run: bool = Query(default=True),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    scanned, keep_ids, delete_ids, errors = await _plan_duplicate_pending_cleanup(db, limit=limit)
+    duplicates_found = len(delete_ids)
+    deleted_count = 0
+    if not dry_run and delete_ids:
+        for extraction_id in delete_ids:
+            extraction = await db.get(PostExtraction, extraction_id)
+            if extraction is None:
+                continue
+            await db.delete(extraction)
+            deleted_count += 1
+        await db.commit()
+    return AdminCleanupDuplicatePendingRead(
+        scanned=scanned,
+        duplicates_found=duplicates_found,
+        dry_run=dry_run,
+        would_delete_ids=delete_ids,
+        would_keep_ids=keep_ids,
+        deleted_count=deleted_count,
+        errors=errors,
     )
 
 
@@ -3729,6 +4369,8 @@ def _build_runtime_settings_read(settings) -> RuntimeSettingsRead:
     default_budget_total = _get_default_call_budget_total(settings)
     runtime_budget_total = _get_runtime_openai_call_budget_total(settings)
     throttle = _get_runtime_throttle(settings)
+    effective_throttle = _get_effective_runtime_throttle(settings)
+    adaptive_throttle = _build_adaptive_throttle_runtime_state(settings, throttle, effective_throttle)
     provider_detected = detect_provider_from_base_url(settings.openai_base_url)
     extraction_output_mode = resolve_extraction_output_mode(settings.openai_base_url)
     return RuntimeSettingsRead(
@@ -3749,6 +4391,7 @@ def _build_runtime_settings_read(settings) -> RuntimeSettingsRead:
         max_output_tokens=max(1, settings.openai_max_output_tokens),
         auto_reject_confidence_threshold=max(0, min(100, settings.auto_reject_confidence_threshold)),
         throttle=throttle,
+        effective_throttle=effective_throttle,
         burst={
             "enabled": bool(RUNTIME_BURST_STATE["enabled"]),
             "mode": RUNTIME_BURST_STATE.get("mode"),
@@ -3758,7 +4401,9 @@ def _build_runtime_settings_read(settings) -> RuntimeSettingsRead:
             "call_budget": RUNTIME_OPENAI_CALL_BUDGET_OVERRIDE is not None,
             "burst": bool(RUNTIME_BURST_STATE["enabled"]),
             "throttle": bool(RUNTIME_THROTTLE_OVERRIDE),
+            "adaptive_throttle": _adaptive_throttle_enabled(settings),
         },
+        adaptive_throttle=adaptive_throttle,
     )
 
 
@@ -3836,9 +4481,23 @@ def set_runtime_throttle(payload: RuntimeThrottleUpdateRequest):
     return get_runtime_settings()
 
 
+@app.post("/settings/runtime/throttle/clear", response_model=RuntimeSettingsRead)
+def clear_runtime_throttle_override():
+    RUNTIME_THROTTLE_OVERRIDE.clear()
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["current"] = None
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["degrade_level"] = 0
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["consecutive_successes"] = 0
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["last_changed_at"] = None
+    RUNTIME_ADAPTIVE_THROTTLE_STATE["last_reason"] = "default"
+    return get_runtime_settings()
+
+
 @app.get("/dashboard", response_model=DashboardRead)
 async def get_dashboard(
     days: int = Query(default=7, ge=1, le=90),
+    window: str = Query(default="7d", pattern="^(24h|7d)$"),
+    limit: int = Query(default=10, ge=1, le=100),
+    profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     now = datetime.now(UTC)
@@ -4035,6 +4694,14 @@ async def get_dashboard(
                 )
             )
 
+    clarity_ranking = await _compute_dashboard_clarity_ranking(
+        db,
+        now=now,
+        profile_id=profile_id,
+        window=window,
+        limit=limit,
+    )
+
     new_views_24h = sum(asset_counts_24h.values())
     new_views_7d = sum(asset_counts_7d.values())
     return DashboardRead(
@@ -4042,6 +4709,7 @@ async def get_dashboard(
         latest_pending_extractions=latest_pending_extractions,
         top_assets=top_assets,
         clarity=clarity,
+        clarity_ranking=clarity_ranking,
         extraction_stats=DashboardExtractionStatsRead(
             window_hours=24,
             extraction_count=len(window_items),
@@ -4106,23 +4774,143 @@ async def get_daily_digest_by_id(
 
 @app.get("/extractions", response_model=list[PostExtractionWithRawPostRead])
 async def list_extractions(
-    status: ExtractionStatus = Query(default=ExtractionStatus.pending),
+    status: ExtractionListStatus = Query(default="all"),
+    q: str = Query(default=""),
+    bad_only: bool = Query(default=False),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
+    normalized_status = status.strip().lower()
+    query = (
         select(PostExtraction)
         .options(selectinload(PostExtraction.raw_post))
-        .where(PostExtraction.status == status)
         .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
-        .offset(offset)
-        .limit(limit)
     )
+    if normalized_status in {
+        ExtractionStatus.pending.value,
+        ExtractionStatus.approved.value,
+        ExtractionStatus.rejected.value,
+    }:
+        query = query.where(PostExtraction.status == ExtractionStatus(normalized_status))
+    result = await db.execute(query)
     items = list(result.scalars().all())
+    if normalized_status in {
+        ExtractionStatus.pending.value,
+        ExtractionStatus.approved.value,
+        ExtractionStatus.rejected.value,
+    }:
+        items = [item for item in items if _extraction_status_key(item) == normalized_status]
+    keyword = q.strip()
+    if keyword:
+        items = [item for item in items if _extraction_matches_keyword(item, keyword)]
+    if bad_only:
+        items = [item for item in items if _is_bad_extracted_json(item)]
+    items = items[offset : offset + limit]
     for extraction in items:
         _attach_extraction_auto_approve_settings(extraction)
     return items
+
+
+@app.get("/extractions/stats", response_model=ExtractionsStatsRead)
+async def get_extractions_stats(
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(PostExtraction))
+    items = list(result.scalars().all())
+    bad_count = sum(1 for item in items if _is_bad_extracted_json(item))
+    return ExtractionsStatsRead(
+        bad_count=bad_count,
+        total_count=len(items),
+    )
+
+
+@app.post("/admin/extractions/refresh-wrong-extracted-json", response_model=AdminRefreshWrongExtractedJsonRead)
+async def refresh_wrong_extracted_json(
+    confirm: str = Query(...),
+    days: int = Query(default=365, ge=1, le=3650),
+    limit: int = Query(default=2000, ge=1, le=10000),
+    dry_run: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+
+    now = datetime.now(UTC)
+    since_ts = now - timedelta(days=days)
+    result = await db.execute(
+        select(PostExtraction)
+        .where(PostExtraction.status == ExtractionStatus.approved)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(limit)
+    )
+    candidates = [
+        item
+        for item in result.scalars().all()
+        if item.created_at is None or item.created_at >= since_ts
+    ]
+
+    scanned = len(candidates)
+    updated_ids: list[int] = []
+    for extraction in candidates:
+        view_ids = extraction.auto_applied_kol_view_ids or []
+        if not view_ids:
+            continue
+        if not isinstance(extraction.extracted_json, dict):
+            continue
+
+        payload = dict(extraction.extracted_json)
+        raw_asset_views = payload.get("asset_views")
+        if isinstance(raw_asset_views, list) and len(raw_asset_views) > 0:
+            continue
+
+        rebuilt_views: list[dict[str, Any]] = []
+        for view_id in view_ids:
+            view = await db.get(KolView, int(view_id))
+            if view is None:
+                continue
+            asset = await db.get(Asset, view.asset_id)
+            symbol = asset.symbol if asset is not None else str(view.asset_id)
+            rebuilt_views.append(
+                {
+                    "symbol": symbol,
+                    "stance": view.stance.value if hasattr(view.stance, "value") else str(view.stance),
+                    "horizon": view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon),
+                    "confidence": int(view.confidence),
+                    "reasoning": None,
+                    "summary": view.summary,
+                    "as_of": view.as_of.isoformat() if view.as_of else None,
+                    "drivers": [],
+                }
+            )
+
+        if not rebuilt_views:
+            continue
+
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        next_payload = {
+            **payload,
+            "asset_views": rebuilt_views,
+            "meta": {
+                **meta,
+                "asset_views_original_count": len(rebuilt_views),
+                "asset_views_final_count": len(rebuilt_views),
+                "asset_views_cap_reason": None,
+            },
+        }
+        if next_payload == extraction.extracted_json:
+            continue
+        updated_ids.append(extraction.id)
+        if not dry_run:
+            extraction.extracted_json = next_payload
+
+    if not dry_run:
+        await db.commit()
+    return AdminRefreshWrongExtractedJsonRead(
+        scanned=scanned,
+        updated=len(updated_ids),
+        dry_run=dry_run,
+        updated_ids=updated_ids,
+    )
 
 
 @app.get("/extractions/{extraction_id}", response_model=PostExtractionWithRawPostRead)

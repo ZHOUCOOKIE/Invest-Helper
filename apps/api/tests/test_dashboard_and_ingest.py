@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from db import get_db
 from enums import ExtractionStatus, Horizon, ReviewStatus, Stance
 from main import app, reset_runtime_counters
-from models import Asset, Kol, KolView, PostExtraction, RawPost
+from models import Asset, Kol, KolView, PostExtraction, ProfileKolWeight, RawPost
 from services.extraction import OpenAIRequestError
 from settings import get_settings
 
@@ -47,6 +48,15 @@ class FakeResult:
     def scalar_one_or_none(self) -> object | None:
         return self._items[0] if self._items else None
 
+    def mappings(self) -> "FakeResult":
+        mapped_items: list[object] = []
+        for item in self._items:
+            if isinstance(item, dict):
+                mapped_items.append(item)
+            else:
+                mapped_items.append(vars(item))
+        return FakeResult(items=mapped_items, scalar_value=self._scalar_value)
+
 
 class FakeAsyncSession:
     def __init__(self) -> None:
@@ -56,6 +66,7 @@ class FakeAsyncSession:
             Asset: {},
             Kol: {},
             KolView: {},
+            ProfileKolWeight: {},
         }
         self._new: list[object] = []
 
@@ -96,7 +107,7 @@ class FakeAsyncSession:
             for eid in to_remove:
                 extraction_bucket.pop(eid, None)
 
-    async def execute(self, query) -> FakeResult:  # noqa: ANN001
+    async def execute(self, query, params=None) -> FakeResult:  # noqa: ANN001
         sql = str(query).lower()
         extractions = self._data[PostExtraction]
 
@@ -111,6 +122,12 @@ class FakeAsyncSession:
 
         if "group by kol_views.horizon, kol_views.stance" in sql:
             return FakeResult(items=self._build_clarity_rows())
+
+        if "with profile_context as" in sql and "asset_scores" in sql and "clarity_score" in sql:
+            return FakeResult(items=self._build_clarity_ranking_rows(params or {}))
+
+        if "with profile_context as" in sql and "ranked_contrib" in sql and "where rank_no <= 3" in sql:
+            return FakeResult(items=self._build_clarity_contributor_rows(params or {}))
 
         entity = query.column_descriptions[0]["entity"]
         if entity is PostExtraction:
@@ -201,6 +218,121 @@ class FakeAsyncSession:
                 setattr(obj, "fetched_at", now)
             bucket[getattr(obj, "id")] = obj
         self._new.clear()
+
+    def _view_business_ts(self, view: KolView) -> datetime:
+        posts = self._data[RawPost].values()
+        for post in posts:
+            if (post.url or "").strip() == (view.source_url or "").strip():
+                return post.posted_at
+        if view.as_of is not None:
+            return datetime.combine(view.as_of, datetime.min.time(), tzinfo=UTC)
+        return view.created_at
+
+    def _profile_weight_map(self, profile_id: int) -> tuple[bool, dict[int, float]]:
+        rows = [item for item in self._data[ProfileKolWeight].values() if item.profile_id == profile_id]
+        has_profile_kols = len(rows) > 0
+        enabled_weights = {item.kol_id: float(item.weight) for item in rows if item.enabled}
+        return has_profile_kols, enabled_weights
+
+    def _iter_scored_views(self, params: dict) -> list[dict[str, object]]:
+        now = params.get("as_of_ts")
+        window_start = params.get("window_start")
+        half_life_days = float(params.get("half_life_days", 2.0))
+        profile_id = int(params.get("profile_id", 1))
+        asset_ids = set(params.get("asset_ids") or [])
+        has_asset_filter = len(asset_ids) > 0
+        has_profile_kols, enabled_weights = self._profile_weight_map(profile_id)
+        kols = self._data[Kol]
+
+        scored_rows: list[dict[str, object]] = []
+        for view in self._data[KolView].values():
+            if has_asset_filter and view.asset_id not in asset_ids:
+                continue
+            if has_profile_kols and view.kol_id not in enabled_weights:
+                continue
+            business_ts = self._view_business_ts(view)
+            if business_ts < window_start:
+                continue
+
+            age_days = max(0.0, (now - business_ts).total_seconds() / 86400.0)
+            decay = math.exp(-math.log(2.0) * age_days / half_life_days)
+            conf_weight = 0.5 + (view.confidence / 200.0)
+            kol_weight = enabled_weights.get(view.kol_id, 1.0)
+            sign = 1.0 if view.stance == Stance.bull else -1.0 if view.stance == Stance.bear else 0.0
+            signed_weight = sign * kol_weight * conf_weight * decay
+            kol = kols.get(view.kol_id)
+            scored_rows.append(
+                {
+                    "asset_id": view.asset_id,
+                    "kol_id": view.kol_id,
+                    "kol_handle": kol.handle if kol is not None else f"kol-{view.kol_id}",
+                    "signed_weight": signed_weight,
+                }
+            )
+        return scored_rows
+
+    def _build_clarity_ranking_rows(self, params: dict) -> list[SimpleNamespace]:
+        assets = self._data[Asset]
+        grouped: dict[int, dict[str, object]] = {}
+        for row in self._iter_scored_views(params):
+            asset_id = int(row["asset_id"])
+            bucket = grouped.setdefault(asset_id, {"s_raw": 0.0, "n": 0, "kols": set()})
+            bucket["s_raw"] = float(bucket["s_raw"]) + float(row["signed_weight"])
+            bucket["n"] = int(bucket["n"]) + 1
+            bucket["kols"].add(int(row["kol_id"]))
+
+        rows: list[SimpleNamespace] = []
+        for asset_id, item in grouped.items():
+            asset = assets.get(asset_id)
+            if asset is None:
+                continue
+            n = int(item["n"])
+            k = len(item["kols"])
+            s_raw = float(item["s_raw"])
+            clarity_score = abs(s_raw) * math.log1p(n) * math.log1p(k)
+            rows.append(
+                SimpleNamespace(
+                    asset_id=asset_id,
+                    symbol=asset.symbol,
+                    name=asset.name,
+                    market=asset.market,
+                    s_raw=s_raw,
+                    clarity_score=clarity_score,
+                    n_views=n,
+                    k_unique=k,
+                )
+            )
+
+        rows.sort(key=lambda item: (-item.clarity_score, -abs(item.s_raw), item.asset_id))
+        limit = int(params.get("limit", 10))
+        return rows[:limit]
+
+    def _build_clarity_contributor_rows(self, params: dict) -> list[SimpleNamespace]:
+        grouped: dict[tuple[int, int, str], float] = {}
+        for row in self._iter_scored_views(params):
+            key = (int(row["asset_id"]), int(row["kol_id"]), str(row["kol_handle"]))
+            grouped[key] = grouped.get(key, 0.0) + float(row["signed_weight"])
+
+        rows = [
+            SimpleNamespace(
+                asset_id=asset_id,
+                kol_id=kol_id,
+                kol_handle=kol_handle,
+                contribution=contribution,
+            )
+            for (asset_id, kol_id, kol_handle), contribution in grouped.items()
+        ]
+        rows.sort(key=lambda item: (item.asset_id, -abs(item.contribution), item.kol_handle))
+
+        by_asset: dict[int, int] = {}
+        top_rows: list[SimpleNamespace] = []
+        for row in rows:
+            count = by_asset.get(row.asset_id, 0)
+            if count >= 3:
+                continue
+            by_asset[row.asset_id] = count + 1
+            top_rows.append(row)
+        return top_rows
 
 
 def test_manual_ingest_creates_raw_post_and_pending_extraction(monkeypatch) -> None:  # noqa: ANN001
@@ -309,6 +441,130 @@ def test_dashboard_returns_top_assets_and_pending_count() -> None:
     assert body["assets"][0]["latest_views_by_horizon"][0]["horizon"] == "1w"
     assert body["active_kols_7d"][0]["handle"] == "alice"
 
+
+def test_dashboard_clarity_ranking_applies_weight_confidence_and_decay() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+
+    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Asset(id=2, symbol="ETH", name="Ethereum", market="CRYPTO", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(Kol(id=2, platform="x", handle="bob", display_name="Bob", enabled=True, created_at=now))
+    fake_db.seed(Kol(id=3, platform="x", handle="carol", display_name="Carol", enabled=True, created_at=now))
+
+    fake_db.seed(ProfileKolWeight(id=11, profile_id=1, kol_id=1, weight=2.0, enabled=True, created_at=now))
+    fake_db.seed(ProfileKolWeight(id=12, profile_id=1, kol_id=2, weight=0.5, enabled=True, created_at=now))
+    fake_db.seed(ProfileKolWeight(id=13, profile_id=1, kol_id=3, weight=1.0, enabled=True, created_at=now))
+
+    fresh = now - timedelta(hours=1)
+    stale = now - timedelta(days=6)
+
+    fake_db.seed(
+        RawPost(
+            id=101,
+            platform="x",
+            author_handle="alice",
+            external_id="p-101",
+            url="https://x.com/alice/status/101",
+            content_text="fresh bull",
+            posted_at=fresh,
+            fetched_at=fresh,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=102,
+            platform="x",
+            author_handle="bob",
+            external_id="p-102",
+            url="https://x.com/bob/status/102",
+            content_text="stale bear",
+            posted_at=stale,
+            fetched_at=stale,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=103,
+            platform="x",
+            author_handle="carol",
+            external_id="p-103",
+            url="https://x.com/carol/status/103",
+            content_text="fresh bull eth",
+            posted_at=fresh,
+            fetched_at=fresh,
+            raw_json=None,
+        )
+    )
+
+    fake_db.seed(
+        KolView(
+            id=201,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=90,
+            summary="btc bull strong",
+            source_url="https://x.com/alice/status/101",
+            as_of=fresh.date(),
+            created_at=fresh,
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=202,
+            kol_id=2,
+            asset_id=1,
+            stance=Stance.bear,
+            horizon=Horizon.one_week,
+            confidence=80,
+            summary="btc bear stale",
+            source_url="https://x.com/bob/status/102",
+            as_of=stale.date(),
+            created_at=stale,
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=203,
+            kol_id=3,
+            asset_id=2,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=40,
+            summary="eth bull medium",
+            source_url="https://x.com/carol/status/103",
+            as_of=fresh.date(),
+            created_at=fresh,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/dashboard?days=7&window=7d&limit=5&profile_id=1")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    ranking = body["clarity_ranking"]
+    assert len(ranking) >= 2
+    assert ranking[0]["asset_id"] == 1
+    assert ranking[0]["direction"] == "bull"
+    assert ranking[0]["clarity_score"] > ranking[1]["clarity_score"]
+
+    btc = next(item for item in ranking if item["asset_id"] == 1)
+    eth = next(item for item in ranking if item["asset_id"] == 2)
+    assert btc["k"] == 2
+    assert btc["n"] == 2
+    assert btc["s_raw"] > eth["s_raw"]
+    assert btc["top_contributors"][0]["handle"] == "alice"
+    assert abs(btc["top_contributors"][0]["contribution"]) > abs(btc["top_contributors"][1]["contribution"])
 
 def test_asset_views_feed_supports_horizon_and_pagination() -> None:
     fake_db = FakeAsyncSession()

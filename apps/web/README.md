@@ -5,17 +5,9 @@ Reference
 TL;DR
 - Next.js frontend for dashboard, ingest, review, assets, profile, and digest pages.
 - For repository-level authoritative docs, use `docs/INDEX.md`.
-- Post-change acceptance command is `make verify` from repo root.
-
-## Start Web
-
-```bash
-cd apps/web
-pnpm install
-pnpm dev
-```
-
-Default URL: `http://localhost:3000`
+- Runtime/test commands are maintained in:
+  - `docs/RUNBOOK.md` (run/replay)
+  - `docs/DEV_WORKFLOW.md` (test/lint/migrate/verify)
 
 ## API Binding
 

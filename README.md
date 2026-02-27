@@ -3,59 +3,31 @@
 Authoritative
 
 TL;DR
-- InvestPulse aggregates investment views from X posts, then serves dashboard and versioned daily digests.
-- Core guarantees: traceability, replay/versioning, strict test DB isolation, docs aligned to code.
-- Single acceptance command after changes: `make verify`.
-- Full documentation navigation: `docs/INDEX.md`.
+- InvestPulse 从帖子中抽取结构化投资观点，提供可追溯、可回放的看板与 Daily Digest。
+- 文档单一入口：`docs/INDEX.md`。
+- 统一验收命令：`make verify`。
 
-## What This Repo Does
-
-- Ingest and normalize posts (`/ingest/manual`, `/ingest/x/*`, `/raw-posts`).
-- Extract structured asset views and support review flows.
-- Serve dashboard metrics and clarity ranking.
-- Generate and replay profile-scoped, versioned daily digests.
-
-## Current Capability Boundary
+## Product Scope (Code-Verified)
 
 Implemented
-- X import/convert/import-preview/retry flows.
-- Extraction: single, batch, async jobs.
-- Review lifecycle: approve/reject/re-extract.
-- Profile-scoped rules: KOL weights + market filters.
-- Versioned digest replay by date/profile/version/id.
-- Traceability fields across raw post, extraction, view, digest.
+- X 导入与原始帖子入库（manual/convert/import/following/retry）。
+- 抽取与审核流程（single/batch/async jobs，approve/reject/re-extract）。
+- Profile 规则（KOL 权重、market 过滤）。
+- 按 `profile_id + digest_date + version` 的 Digest 版本化生成与回放。
+- 证据链字段贯通 `raw_posts -> post_extractions -> kol_views -> daily_digests`。
 
 Not Implemented
-- Event reminder/scheduler and lead-time notifications.
-- Prediction-market data fusion.
+- Event reminder scheduling/triggering。
+- Prediction-market integration。
 
 Non-goal (current)
-- Reddit is not a core product pipeline.
+- Reddit 不是当前核心产品流水线。
 
-## Quickstart
+## Start Here
 
-1. `cp apps/api/.env.example apps/api/.env`
-2. `docker compose up -d db db_test redis`
-3. `cd apps/api && uv sync && uv run alembic upgrade head`
-4. `cd apps/api && uv run uvicorn main:app --reload --port 8000`
-5. `cd apps/web && pnpm install && pnpm dev`
-6. Run verification: `make verify`
-
-## Common Commands
-
-- Full verification: `make verify`
-- API tests (test DB guarded): `./scripts/test_api.sh`
-- Web tests: `pnpm test:web`
-- Lint: `pnpm lint`
-- API migration: `cd apps/api && uv run alembic upgrade head`
-
-## Documentation
-
-- [Documentation Index](docs/INDEX.md)
-- [Status](docs/STATUS.md)
-- [Runbook](docs/RUNBOOK.md)
-- [Dev Workflow](docs/DEV_WORKFLOW.md)
-- [API](docs/API.md)
-- [Traceability And Replay](docs/TRACEABILITY_AND_REPLAY.md)
-- [Glossary](docs/GLOSSARY.md)
-- [Prompt/Flow Snapshot (ZH)](docs/PROMPT_AND_FLOW_REASONING_ZH.md)
+- 本地运行与回放：`docs/RUNBOOK.md`
+- 开发/测试/lint/迁移：`docs/DEV_WORKFLOW.md`
+- API 端点与示例：`docs/API.md`
+- 可追溯与回放策略：`docs/TRACEABILITY_AND_REPLAY.md`
+- 能力边界账本：`docs/STATUS.md`
+- 术语：`docs/GLOSSARY.md`

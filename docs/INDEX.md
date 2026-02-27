@@ -1,47 +1,41 @@
 # Documentation Index
 
+Authoritative
+
 TL;DR
-- This is the single navigation entry for repository docs.
-- Use `make verify` as the authoritative acceptance command after any change.
-- If documents conflict, trust files marked `Authoritative`.
-- `RUNBOOK_LOCAL*.txt` are local notes, not repository source of truth.
+- 本文件是仓库文档导航与权限分层的单一入口。
+- `make verify` 是变更后的统一验收命令。
+- 若文档冲突，以本文件声明的权威文档为准。
 
-## Authority Levels
+## SSOT Map
 
-- Authoritative: normative and must stay aligned with code.
-- Reference: factual deep-dive or API details; may be narrower in scope.
-- Notes: local context or supplementary discussion.
+- `README.md`（Authoritative）
+  - 项目目标、能力边界、文档入口。
+- `docs/RUNBOOK.md`（Authoritative）
+  - 本地运行、端口/URL、端到端操作与回放命令。
+- `docs/DEV_WORKFLOW.md`（Authoritative）
+  - 开发流程、测试/迁移/lint/verify 命令与 test DB 规则。
+- `docs/API.md`（Authoritative）
+  - API 端点族与可执行示例。
+- `docs/TRACEABILITY_AND_REPLAY.md`（Authoritative）
+  - 证据链、版本化回放约束与数据语义。
+- `docs/STATUS.md`（Authoritative）
+  - 已实现/未实现能力账本（仅代码事实）。
+- `docs/GLOSSARY.md`（Reference）
+  - 统一术语定义。
+- `docs/DOC_AUDIT.md`（Authoritative）
+  - 文档合并审计与决策记录。
 
-## Core Paths
+## Local Runbook Compatibility
 
-- Authoritative: [README](../README.md)
-  - Project overview, quickstart, high-level boundaries.
-- Authoritative: [Dev Workflow](./DEV_WORKFLOW.md)
-  - Development lifecycle, verify command, failure handling.
-- Authoritative: [Runbook](./RUNBOOK.md)
-  - End-to-end operational steps to produce and replay daily outputs.
-- Authoritative: [Status](./STATUS.md)
-  - Current capabilities, boundaries, implemented/non-implemented map.
-- Authoritative: [Traceability And Replay](./TRACEABILITY_AND_REPLAY.md)
-  - Evidence chain and replay/version policy.
+- `RUNBOOK_LOCAL.example.txt`（Stub, tracked）
+- `RUNBOOK_LOCAL.txt`（Local private note, gitignored）
 
-## API And Technical Reference
+以上路径仅为兼容历史用法，权威内容已合并到 `docs/RUNBOOK.md`。
 
-- Reference: [API](./API.md)
-  - Endpoint families, curl examples, OpenAPI usage.
-- Reference (ZH): [Prompt And Flow Reasoning](./PROMPT_AND_FLOW_REASONING_ZH.md)
-  - Extraction prompt/runtime reasoning compliance snapshot.
-- Reference: [Glossary](./GLOSSARY.md)
-  - Canonical terminology.
+## Additional References
 
-## Governance And Audit
-
-- Authoritative: [Doc Audit](./DOC_AUDIT.md)
-  - File-level audit findings and actions.
-- Reference: [Public Checklist](./public_checklist.md)
-  - Checklist before publishing repository.
-
-## Local Notes Policy
-
-- Notes (Deprecated as authority): `RUNBOOK_LOCAL.txt`, `RUNBOOK_LOCAL.example.txt`
-- These files can keep machine/local examples, but must not be used as authoritative repository docs.
+- `docs/PROMPT_AND_FLOW_REASONING_ZH.md`（Reference）
+- `docs/public_checklist.md`（Reference）
+- `apps/api/README.md`（Service-local Reference）
+- `apps/web/README.md`（Service-local Reference）

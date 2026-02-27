@@ -3,18 +3,9 @@
 Authoritative
 
 TL;DR
-- This document is the code-based capability ledger.
-- It defines implemented vs non-implemented scope.
-- If another doc conflicts with this file, update that doc.
-
-Last verified: 2026-02-27
-
-## Runtime Deliverables
-
-- Infra: `docker compose up -d db db_test redis`
-- API: `cd apps/api && uv sync && uv run alembic upgrade head && uv run uvicorn main:app --reload --port 8000`
-- Web: `cd apps/web && pnpm install && pnpm dev`
-- Acceptance: `make verify`
+- 本文是代码事实级能力账本。
+- 只记录“已实现/未实现/非目标”，不承载运行步骤。
+- 最后核对日期：2026-02-27。
 
 ## Implemented Capability Map
 
@@ -28,45 +19,38 @@ Ingest
 - `POST /ingest/x/retry-failed`
 - `POST /raw-posts`
 
-Normalize / Extract / Review
-- Extraction: single, batch, async job modes.
-- Review endpoints: approve/reject/re-extract and batch approve.
-- Runtime extraction audit persistence (`prompt_*`, model IO/tokens/latency).
-- Admin repair endpoints for operational recovery.
+Extract / Review
+- 单条、批量、异步任务抽取。
+- 审核：approve/reject/re-extract/approve-batch。
+- 抽取审计元数据持久化（prompt/model IO/tokens/latency）。
+- 管理端修复与清理接口（admin endpoints）。
 
 Serve
-- Assets/KOLs/profiles endpoints.
-- Dashboard with clarity ranking and contributor evidence.
-- Digest generate/read/list dates, versioned per profile+date.
+- Assets/KOLs/Profiles APIs。
+- Dashboard（包含 clarity ranking 与 contributor evidence）。
+- Digest 生成、读取、日期列表、按 profile+date 版本化回放。
 
 Storage
-- PostgreSQL + SQLAlchemy + Alembic.
-- Core entities: `raw_posts`, `post_extractions`, `kol_views`, `daily_digests`, profile tables.
+- PostgreSQL + SQLAlchemy + Alembic。
+- 核心实体：`raw_posts`, `post_extractions`, `kol_views`, `daily_digests`, profile 相关表。
 
 User Config
-- Profile KOL weight/enabled controls.
-- Profile market filters.
+- Profile KOL 权重与启停。
+- Profile market filters。
 
 Observability
 - `/health`
-- Request id middleware.
-- Extraction status/job counters.
-
-## Higher-Standard Behaviors Already Implemented
-
-- Digest replay includes explicit version fetch and date list.
-- Digest time-field fallback chain: `as_of -> posted_at -> created_at`.
-- Clarity ranking includes score and top contributors.
-- Batch extraction includes skip/resume semantics.
+- request id middleware
+- extraction status/job counters
 
 ## Not Implemented
 
-- Event calendar entity.
-- Reminder scheduling/triggering.
-- Notification delivery channels.
-- Prediction-market integration.
+- Event calendar entity。
+- Reminder scheduling/triggering。
+- Notification delivery channels。
+- Prediction-market integration。
 
 ## Non-goal / Legacy
 
-- Reddit is not a core target pipeline in current scope.
-- Any remaining Reddit UI/wording is legacy and should be removed gradually.
+- Reddit 不是当前核心目标流水线。
+- 相关遗留字段/UI 文案仅按“待移除遗留”处理。

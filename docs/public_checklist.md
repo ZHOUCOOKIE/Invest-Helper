@@ -22,7 +22,7 @@ Expected: no real secrets, no personal/local data exports, and no machine-specif
 Verify root `.gitignore` includes:
 
 - `.env`, `.env.*`, keep only `.env.example`
-- local runbook files (`RUNBOOK_LOCAL.private.txt` or machine-specific variants; tracked `RUNBOOK_LOCAL.txt` must stay sanitized)
+- local runbook files (`RUNBOOK_LOCAL.txt`, `RUNBOOK_LOCAL.private.txt`, and machine-specific variants)
 - local datasets/exports (`twitter-*.json`, `raw_posts*.json`)
 - local DB/log/runtime files (`*.db`, `*.sqlite*`, `*.log`, `tmp/`, `logs/`)
 

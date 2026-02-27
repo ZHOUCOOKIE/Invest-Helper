@@ -1,73 +1,60 @@
 # API
 
-Reference
+Authoritative
 
 TL;DR
-- OpenAPI is available at `/openapi.json`, Swagger UI at `/docs`.
-- This file provides executable curl examples for core workflows.
-- For capability boundary, trust `docs/STATUS.md`.
+- 本文是 API 端点与示例请求的权威入口。
+- 本地启动与回放流程以 `docs/RUNBOOK.md` 为准。
+- 能力边界以 `docs/STATUS.md` 为准。
 
-## How To Inspect API Contract
+## Contract Entry
 
 - OpenAPI JSON: `http://localhost:8000/openapi.json`
 - Swagger UI: `http://localhost:8000/docs`
 
 ## Health
 
-Request
 ```bash
 curl -s "http://localhost:8000/health" | jq
 ```
 
-Sample response
-```json
-{"ok": true}
-```
-
 ## Dashboard
 
-Request
 ```bash
 curl -s "http://localhost:8000/dashboard?days=7&window=7d&limit=10&assets_window=24h&profile_id=1" | jq
 ```
 
-Response fields (top-level, abbreviated)
+Top-level fields include:
 - `pending_extractions_count`
 - `assets`
 - `active_kols_7d`
 - `clarity_ranking`
 - `top_assets`
 
-## Digest Generate / Replay
+## Digest Endpoints
 
-Generate
+- Generate: `POST /digests/generate`
+- Get latest/version by query: `GET /digests`
+- List digest dates: `GET /digests/dates`
+- Get by id: `GET /digests/{digest_id}`
+
+Example (generate):
 ```bash
 curl -s -X POST "http://localhost:8000/digests/generate?date=2026-02-24&days=7&profile_id=1" | jq
 ```
 
-Get latest digest by date
-```bash
-curl -s "http://localhost:8000/digests?date=2026-02-24&profile_id=1" | jq
-```
+## Ingest Endpoints
 
-Get specific version
-```bash
-curl -s "http://localhost:8000/digests?date=2026-02-24&profile_id=1&version=1" | jq
-```
+- `POST /ingest/manual`
+- `POST /ingest/x/convert`
+- `POST /ingest/x/import`
+- `POST /ingest/x/following/import`
+- `GET /ingest/x/raw-posts/preview`
+- `GET /ingest/x/progress`
+- `POST /ingest/x/retry-failed`
+- `POST /raw-posts`
 
-List available digest dates
-```bash
-curl -s "http://localhost:8000/digests/dates?profile_id=1" | jq
-```
-
-Get by digest id
-```bash
-curl -s "http://localhost:8000/digests/1" | jq
-```
-
-## Ingest And Extraction
-
-Manual ingest
+Example (`/ingest/manual`):
 ```bash
 curl -s -X POST "http://localhost:8000/ingest/manual" \
   -H "Content-Type: application/json" \
@@ -79,74 +66,39 @@ curl -s -X POST "http://localhost:8000/ingest/manual" \
   }' | jq
 ```
 
-Extract batch
+## Extraction And Review Endpoints
+
+- `POST /raw-posts/{raw_post_id}/extract`
+- `POST /raw-posts/extract-batch`
+- `POST /extract-jobs`
+- `GET /extract-jobs/{job_id}`
+- `GET /extractions`
+- `GET /extractions/{extraction_id}`
+- `POST /extractions/{extraction_id}/approve`
+- `POST /extractions/{extraction_id}/approve-batch`
+- `POST /extractions/{extraction_id}/reject`
+- `POST /extractions/{extraction_id}/re-extract`
+
+Example (`/raw-posts/extract-batch`):
 ```bash
 curl -s -X POST "http://localhost:8000/raw-posts/extract-batch" \
   -H "Content-Type: application/json" \
   --data '{"raw_post_ids":[1,2,3],"mode":"pending_only"}' | jq
 ```
 
-Create async extract job
-```bash
-curl -s -X POST "http://localhost:8000/extract-jobs" \
-  -H "Content-Type: application/json" \
-  --data '{"raw_post_ids":[1,2,3],"mode":"pending_or_failed"}' | jq
-```
+## Profile / Asset / KOL Endpoints
 
-Get job status
-```bash
-curl -s "http://localhost:8000/extract-jobs/<job_id>" | jq
-```
+- Profiles: `GET /profiles`, `GET /profiles/{profile_id}`, `PUT /profiles/{profile_id}/kols`, `PUT /profiles/{profile_id}/markets`
+- Assets: `GET /assets`, `POST /assets`, `POST /assets/upsert`, aliases endpoints
+- KOLs: `GET /kols`, `POST /kols`
+- Views: `POST /kol-views`, `GET /assets/{asset_id}/views`, feed/timeline endpoints
 
-## Review Endpoints
+## Admin Endpoints (Dev/Ops)
 
-Approve
-```bash
-curl -s -X POST "http://localhost:8000/extractions/1/approve" \
-  -H "Content-Type: application/json" \
-  --data '{
-    "kol_id":1,
-    "asset_id":1,
-    "stance":"bull",
-    "horizon":"1w",
-    "confidence":70,
-    "summary":"momentum improving",
-    "source_url":"https://x.com/alice/status/1",
-    "as_of":"2026-02-24"
-  }' | jq
-```
+- Extraction repair/cleanup under `/admin/extractions/*`
+- Hard delete endpoints under `/admin/*`
 
-Reject
-```bash
-curl -s -X POST "http://localhost:8000/extractions/1/reject" \
-  -H "Content-Type: application/json" \
-  --data '{"reason":"noise"}' | jq
-```
+## Not Implemented
 
-Re-extract
-```bash
-curl -s -X POST "http://localhost:8000/extractions/1/re-extract" | jq
-```
-
-## Profile Rules
-
-List profiles
-```bash
-curl -s "http://localhost:8000/profiles" | jq
-```
-
-Get profile detail
-```bash
-curl -s "http://localhost:8000/profiles/1" | jq
-```
-
-Update profile markets
-```bash
-curl -s -X PUT "http://localhost:8000/profiles/1/markets" \
-  -H "Content-Type: application/json" \
-  --data '{"markets":["CRYPTO","STOCK"]}' | jq
-```
-
-## Non-goal Note
-
-- Reddit-specific API pipeline is not part of current core scope.
+- Event reminder scheduling/triggering API.
+- Prediction-market integration API.

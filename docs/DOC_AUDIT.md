@@ -3,45 +3,43 @@
 Authoritative
 
 TL;DR
-- This file tracks document-level quality issues and resolutions.
-- Goal: single source of truth, no conflicting run/test/replay instructions.
-- Last full audit: 2026-02-27.
+- 本次审计目标：把重复文档收敛为更少的 SSOT 文档，保留历史路径兼容。
+- 合并日期：2026-02-27。
+- 合并后 `README/AGENTS/RUNBOOK/DEV_WORKFLOW/API` 不再各自维护重复流程。
 
-## Audit Matrix
+## Consolidation Summary
 
-| File | Issues Found | Action |
-|---|---|---|
-| `README.md` | Quickstart and docs navigation not fully centralized; no authority label/TL;DR | Rewritten with authority label, concise boundary, links to `docs/INDEX.md` |
-| `docs/STATUS.md` | Lacked clear authority marker and concise scope framing | Rewritten as authoritative capability ledger |
-| `docs/RUNBOOK.md` | Missing full minimal chain and preconditions | Expanded with end-to-end flow, replay, and evidence checks |
-| `docs/DEV_WORKFLOW.md` | Verify command existed but doc discipline/triage incomplete | Consolidated around `make verify` + failure handling |
-| `docs/API.md` | Endpoint families only, insufficient executable examples | Added runnable curl examples + sample response notes |
-| `docs/TRACEABILITY_AND_REPLAY.md` | Good baseline but no TL;DR/authority and fewer executable checks | Rewritten with clear chain, replay commands, version policy |
-| `docs/PROMPT_AND_FLOW_REASONING_ZH.md` | Scope boundary not explicit as specialized reference | Kept as reference; linked from index with explicit positioning |
-| `apps/api/README.md` | Partial overlap with root/docs | Retained as service-local reference; should defer to docs index |
-| `apps/web/README.md` | Partial overlap with root/docs | Retained as app-local reference; should defer to docs index |
-| `RUNBOOK_LOCAL.txt` / `RUNBOOK_LOCAL.example.txt` | Local-note semantics may conflict with SSoT usage | Marked as non-authoritative in `docs/INDEX.md` and README flow |
-| `docs/public_checklist.md` | Needed consistency with local-runbook policy | Kept, with local note policy wording aligned |
+| Source | Action | SSOT Target | Reason |
+|---|---|---|---|
+| `RUNBOOK_LOCAL.txt` | Kept local-only (gitignored) | `docs/RUNBOOK.md` | 仓库安全策略禁止提交该文件，避免敏感内容入库 |
+| `RUNBOOK_LOCAL.example.txt` | Retained as stub | `docs/RUNBOOK.md` | 保留示例文件路径，避免引用失效 |
+| `README.md` quickstart details | Merged by reference | `docs/RUNBOOK.md` + `docs/DEV_WORKFLOW.md` | 避免启动/测试命令多点维护 |
+| `AGENTS.md` command duplicates | Normalized | `docs/INDEX.md` + SSOT docs | 消除与 runbook/workflow 的冲突风险 |
+| `docs/TRACEABILITY_AND_REPLAY.md` replay curls | De-duplicated | `docs/RUNBOOK.md` | 回放操作命令只保留一处权威版本 |
+| `docs/STATUS.md` runtime commands | De-duplicated | `docs/RUNBOOK.md` + `docs/DEV_WORKFLOW.md` | `STATUS` 仅保留能力账本 |
 
-## Top Conflict Themes Resolved
+## SSOT Ownership After Merge
 
-1. No docs index entry point.
-2. Missing authority levels.
-3. Quickstart duplication across files.
-4. Inconsistent run/test verification entry.
-5. API docs lacking executable examples.
-6. Replay/traceability fragmented across docs.
-7. Not Implemented markers not centralized.
-8. Local runbook ambiguity.
-9. Prompt deep-dive scope ambiguity.
-10. Terminology inconsistency.
+- `README.md`: 项目目标与边界、文档入口。
+- `docs/RUNBOOK.md`: 本地启动、端到端流程、回放命令、运维清理。
+- `docs/DEV_WORKFLOW.md`: 开发测试流程、`make verify`、test DB 安全护栏。
+- `docs/API.md`: API 端点与请求示例。
+- `docs/TRACEABILITY_AND_REPLAY.md`: 证据链与版本化回放语义。
+- `docs/STATUS.md`: 仅记录实现状态与非目标。
+- `docs/GLOSSARY.md`: 统一术语。
+- `docs/INDEX.md`: 导航与权威分层。
 
-## Outcome Rules
+## Validation Performed
 
-- `make verify` is authoritative post-change acceptance command.
-- Capability boundary lives in `docs/STATUS.md`.
-- Operational execution lives in `docs/RUNBOOK.md`.
-- Development lifecycle lives in `docs/DEV_WORKFLOW.md`.
-- Replay/evidence rules live in `docs/TRACEABILITY_AND_REPLAY.md`.
-- API examples live in `docs/API.md`.
-- Terms live in `docs/GLOSSARY.md`.
+- 全仓引用检查：`git grep -n "RUNBOOK_LOCAL"`
+- 导航检查：`docs/INDEX.md` 包含全部 SSOT 文档路径。
+- 随机流程抽检（单一权威）：
+  - 本地启动：仅 `docs/RUNBOOK.md`
+  - API 测试：仅 `docs/DEV_WORKFLOW.md`
+  - Digest 回放命令：仅 `docs/RUNBOOK.md`
+
+## Notes
+
+- 本次仅做文档整理与引用更新，不涉及代码重构。
+- 未实现能力继续使用 `Not Implemented` 标注，不做能力扩写。
+- `RUNBOOK_LOCAL.txt` 受仓库提交钩子保护，不作为可跟踪权威文档。

@@ -1,5 +1,12 @@
 # PROMPT & FLOW Snapshot: Reasoning 必须中文
 
+Reference (ZH)
+
+TL;DR
+- 本文是抽取推理链路专项快照，不是运行手册。
+- 仅覆盖“reasoning 中文约束”相关代码路径与保障。
+- 通用开发/运行/验收请使用 `docs/DEV_WORKFLOW.md` 与 `docs/RUNBOOK.md`。
+
 > 目标：只做代码核对快照，说明“reasoning 必须中文”在本仓库中的端到端约束与保障。以下内容全部来自仓库现有代码（未改业务逻辑）。
 
 ## A) 端到端链路图（真实调用顺序）
@@ -259,6 +266,11 @@ f"{json_mode_hard_rules if response_mode == EXTRACTION_OUTPUT_TEXT_JSON else ''}
 6. 若 `cjk_count <= 1 and en_word_count >= 12`：返回 `"non_zh"`
 7. 否则返回 `"zh"`
 
+约束范围说明：
+
+1. 当前中文检测仅对 top-level `extracted_json.reasoning` 生效（调用形态：`_detect_reasoning_language(extracted_json.get("reasoning"))`）。
+2. 当前代码不会单独检测 `asset_views[*].reasoning` 的语言。
+
 ### D2. “最多一次纠正重试”实现位置
 
 函数：`apps/api/main.py` -> `create_pending_extraction(...)`。
@@ -351,9 +363,9 @@ rg -n "PostExtraction\(|extracted_json=|last_error=|await db\.flush\(|await db\.
 ### F2. 建议测试命令
 
 ```bash
-uv run pytest -q tests/test_extractor_openai_and_fallback.py -k "reasoning_non_zh_retries_once"
-uv run pytest -q tests/test_extractor_openai_and_fallback.py -k "reasoning_non_zh_twice_marks_failed"
-uv run pytest -q tests/test_extract_jobs.py
-uv run pytest -q tests/test_dashboard_and_ingest.py -k "extract_batch"
-uv run pytest -q
+cd /home/zhoucookie/code/investpulse
+./scripts/test_api.sh -k "reasoning_non_zh_retries_once or reasoning_non_zh_twice_marks_failed"
+./scripts/test_api.sh tests/test_extract_jobs.py
+./scripts/test_api.sh tests/test_dashboard_and_ingest.py -k "extract_batch"
+./scripts/test_api.sh
 ```

@@ -1,24 +1,28 @@
 # InvestPulse Public Repo Checklist
 
-Use this checklist before changing repository visibility to Public.
+Reference
+
+TL;DR
+- Use this checklist before changing repository visibility to Public.
+- This file is governance-oriented, not runtime/runbook source of truth.
 
 ## 1) Secrets and privacy scan
 
 - Search tracked files for secret patterns:
   - `git grep -n -I -E "OPENAI_API_KEY|OPENAI_BASE_URL|ADMIN_TOKEN|Bearer [A-Za-z0-9._-]{10,}|sk-[A-Za-z0-9_-]{10,}|or-[A-Za-z0-9_-]{10,}|xoxb-[A-Za-z0-9-]{10,}"`
 - Search for privacy/data exports and local files:
-  - `git ls-files | rg -n "(^|/)\\.env($|\\.)|RUNBOOK_LOCAL|twitter-.*\\.json|raw_posts|\\.db$|\\.sqlite3?$|\\.log$|dump"`
+  - `git ls-files | rg -n "(^|/)\\.env($|\\.)|RUNBOOK_LOCAL(?!\\.example)|twitter-.*\\.json|raw_posts|\\.db$|\\.sqlite3?$|\\.log$|dump"`
 - Confirm nothing sensitive is staged:
   - `git status --short`
 
-Expected: no real secrets, no personal/local data exports, no local-only runbooks in tracked files.
+Expected: no real secrets, no personal/local data exports, and no machine-specific runbook content in tracked files.
 
 ## 2) Required ignore policy
 
 Verify root `.gitignore` includes:
 
 - `.env`, `.env.*`, keep only `.env.example`
-- local runbook files (`RUNBOOK_LOCAL*`, keep only example template)
+- local runbook files (`RUNBOOK_LOCAL.private.txt` or machine-specific variants; tracked `RUNBOOK_LOCAL.txt` must stay sanitized)
 - local datasets/exports (`twitter-*.json`, `raw_posts*.json`)
 - local DB/log/runtime files (`*.db`, `*.sqlite*`, `*.log`, `tmp/`, `logs/`)
 

@@ -1,0 +1,164 @@
+repo_tree.txt generated metadata
+Generated command: find + awk fallback (tree command not available)
+Generated at (UTC): 2026-02-27T04:19:56Z
+Excluded directories: node_modules/ .git/ dist/ build/ .next/ coverage/ .venv/ __pycache__/ .pytest_cache/ .mypy_cache/ .turbo/ .cache/ .idea/ .vscode/ logs/
+
+.
+|- .gitignore
+|- AGENTS.md
+|- LICENSE
+|- Makefile
+|- README.md
+|- RUNBOOK_LOCAL.example.txt
+|- RUNBOOK_LOCAL.txt
+|- apps
+|   |- api
+|   |   |- .env
+|   |   |- .env.example
+|   |   |- .python-version
+|   |   |- .ruff_cache
+|   |   |   |- .gitignore
+|   |   |   |- 0.15.2
+|   |   |   |   |- 11057181966371615671
+|   |   |   |   |- 14256089489352661687
+|   |   |   |   |- 14275284303308481378
+|   |   |   |   |- 15760290860591581618
+|   |   |   |   |- 16734875878270980981
+|   |   |   |   |- 18211433330018277407
+|   |   |   |   |- 2104738142414540617
+|   |   |   |   |- 5512094033267872856
+|   |   |   |   |- 7226095766082691416
+|   |   |   |   |- 7448385294066775503
+|   |   |   |   |- 7763387256397175092
+|   |   |   |   |- 7946030611569978750
+|   |   |   |   |- 8769703031120499822
+|   |   |   |   |- 8863364090870526001
+|   |   |   |- CACHEDIR.TAG
+|   |   |- README.md
+|   |   |- alembic
+|   |   |- alembic.ini
+|   |   |   |- README
+|   |   |   |- env.py
+|   |   |   |- script.py.mako
+|   |   |   |- versions
+|   |   |   |   |- 1f3e2d4c5b6a_add_raw_posts_kol_id.py
+|   |   |   |   |- 5a2e3c1b9d4f_add_extraction_review_fields.py
+|   |   |   |   |- 6e4f8a9b2c1d_add_raw_post_review_status.py
+|   |   |   |   |- 708527c13f5f_merge_heads_6e4f8a9b2c1d_and_.py
+|   |   |   |   |- 7c91b6e5a211_add_extractor_name_and_last_error.py
+|   |   |   |   |- 8d9f20b4e4be_add_kols_and_kol_views.py
+|   |   |   |   |- 9d013009192b_init_assets.py
+|   |   |   |   |- a7e1c2d4f9b0_add_daily_digests.py
+|   |   |   |   |- b81f4d2d9d2f_add_partial_unique_index_active_extractions.py
+|   |   |   |   |- c4b1f8d7a9e2_add_extraction_prompt_and_model_debug_fields.py
+|   |   |   |   |- c8b4f0e5a123_add_extractions_search_indexes.py
+|   |   |   |   |- c9f3e1a7b2d0_add_profiles_and_digest_profile_scope.py
+|   |   |   |   |- d71a6b9a5f2c_enforce_kol_view_enums.py
+|   |   |   |   |- e13c9b44a2de_add_raw_posts_and_post_extractions.py
+|   |   |   |   |- f2d9c4a77b1a_add_asset_aliases_and_auto_apply_fields.py
+|   |   |   |   |- f34c577c633e_merge_heads.py
+|   |   |- db.py
+|   |   |- enums.py
+|   |   |- main.py
+|   |   |- models.py
+|   |   |- pyproject.toml
+|   |   |- schemas.py
+|   |   |- scripts
+|   |   |   |- __init__.py
+|   |   |   |- examples
+|   |   |   |   |- x_export_sample.csv
+|   |   |   |- x_import_converter.py
+|   |   |- services
+|   |   |   |- digests.py
+|   |   |   |- extraction.py
+|   |   |   |- profiles.py
+|   |   |   |- prompts
+|   |   |   |   |- __init__.py
+|   |   |   |   |- extract_v1.py
+|   |   |- settings.py
+|   |   |- tests
+|   |   |   |- conftest.py
+|   |   |   |- test_admin_backfill_auto_review.py
+|   |   |   |- test_admin_fix_approved_missing_views.py
+|   |   |   |- test_admin_hard_delete.py
+|   |   |   |- test_admin_reextract_pending_bulk.py
+|   |   |   |- test_admin_refresh_wrong_extracted_json.py
+|   |   |   |- test_daily_digests.py
+|   |   |   |- test_dashboard_and_ingest.py
+|   |   |   |- test_extract_jobs.py
+|   |   |   |- test_extraction_runtime_limits_and_rules.py
+|   |   |   |- test_extractions_review_flow.py
+|   |   |   |- test_extractions_search.py
+|   |   |   |- test_extractor_openai_and_fallback.py
+|   |   |   |- test_kol_views.py
+|   |   |   |- test_x_import_converter.py
+|   |   |- uv.lock
+|   |- web
+|   |   |- .gitignore
+|   |   |- README.md
+|   |   |- app
+|   |   |   |- assets
+|   |   |   |   |- [id]
+|   |   |   |   |   |- page.tsx
+|   |   |   |   |   |- timeline-layout.js
+|   |   |   |   |   |- views-timeline.tsx
+|   |   |   |   |- page.tsx
+|   |   |   |- dashboard
+|   |   |   |   |- page.tsx
+|   |   |   |- digests
+|   |   |   |   |- [date]
+|   |   |   |   |   |- page.tsx
+|   |   |   |- extractions
+|   |   |   |   |- [id]
+|   |   |   |   |   |- page.tsx
+|   |   |   |   |- page.tsx
+|   |   |   |- favicon.ico
+|   |   |   |- globals.css
+|   |   |   |- health
+|   |   |   |   |- page.tsx
+|   |   |   |- ingest
+|   |   |   |   |- page.tsx
+|   |   |   |- kols
+|   |   |   |   |- page.tsx
+|   |   |   |- layout.tsx
+|   |   |   |- page.tsx
+|   |   |   |- profile
+|   |   |   |   |- page.tsx
+|   |   |- eslint.config.mjs
+|   |   |- next-env.d.ts
+|   |   |- next.config.ts
+|   |   |- package.json
+|   |   |- pnpm-lock.yaml
+|   |   |- pnpm-workspace.yaml
+|   |   |- postcss.config.mjs
+|   |   |- public
+|   |   |   |- file.svg
+|   |   |   |- globe.svg
+|   |   |   |- next.svg
+|   |   |   |- vercel.svg
+|   |   |   |- window.svg
+|   |   |- tests
+|   |   |   |- timeline-layout.test.mjs
+|   |   |- tsconfig.json
+|   |   |- tsconfig.tsbuildinfo
+|- docker-compose.yml
+|- docs
+|   |- API.md
+|   |- DEV_WORKFLOW.md
+|   |- DOC_AUDIT.md
+|   |- GLOSSARY.md
+|   |- INDEX.md
+|   |- PROMPT_AND_FLOW_REASONING_ZH.md
+|   |- RUNBOOK.md
+|   |- STATUS.md
+|   |- TRACEABILITY_AND_REPLAY.md
+|   |- public_checklist.md
+|- package.json
+|- pnpm-workspace.yaml
+|- repo_tree.txt
+|- scripts
+|   |- reset_db_local.sh
+|   |- test_api.sh
+|- twitter-1771881372213.json
+|- twitter-主页时间线-1771919939553.json
+|- twitter-正在关注-1771920108322.json

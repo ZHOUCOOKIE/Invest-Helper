@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
 import json
+import logging
 import re
 from threading import Lock
 from time import perf_counter
@@ -25,12 +26,14 @@ OPENAI_PROVIDER_OPENROUTER = "openrouter"
 OPENAI_PROVIDER_COMPATIBLE = "openai_compatible"
 EXTRACTION_OUTPUT_STRUCTURED = "structured"
 EXTRACTION_OUTPUT_TEXT_JSON = "text_json"
+logger = logging.getLogger("uvicorn.error")
 
 
 class OpenAIRequestError(RuntimeError):
-    def __init__(self, *, status_code: int, body_preview: str):
+    def __init__(self, *, status_code: int, body_preview: str, retry_after_seconds: float | None = None):
         self.status_code = status_code
         self.body_preview = body_preview
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(f"OpenAI request failed: status={status_code}, body={body_preview}")
 
 
@@ -38,6 +41,48 @@ class OpenAIFallbackError(RuntimeError):
     def __init__(self, message: str, *, fallback_reason: str):
         self.fallback_reason = fallback_reason
         super().__init__(message)
+
+
+def _parse_retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return max(0.0, seconds)
+
+
+class TextJsonParseError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_content: str,
+        parse_strategy_used: str,
+        repaired: bool,
+        parse_error_reason: str,
+        suspected_truncated: bool,
+        finish_reason: str | None = None,
+    ) -> None:
+        self.raw_content = raw_content
+        self.parse_strategy_used = parse_strategy_used
+        self.repaired = repaired
+        self.parse_error_reason = parse_error_reason
+        self.suspected_truncated = suspected_truncated
+        self.finish_reason = finish_reason
+        super().__init__(message)
+
+    def to_meta(self, *, truncated_retry_used: bool) -> dict[str, Any]:
+        return {
+            "parse_error": True,
+            "parse_error_reason": self.parse_error_reason,
+            "parse_strategy_used": self.parse_strategy_used,
+            "repaired": self.repaired,
+            "truncated_retry_used": truncated_retry_used,
+            "finish_reason": self.finish_reason,
+            "finish_reason_best_effort": True,
+        }
 
 
 @dataclass
@@ -63,7 +108,7 @@ class ExtractedAsset(BaseModel):
 class ExtractionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assets: list[ExtractedAsset] = Field(default_factory=list)
+    assets: list[ExtractedAsset | Literal["NoneAny"]] = Field(default_factory=list)
     reasoning: str | None = Field(default=None, max_length=1024)
     stance: Literal["bull", "bear", "neutral"] | None = None
     horizon: Literal["intraday", "1w", "1m", "3m", "1y"] | None = None
@@ -167,14 +212,19 @@ EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
         "assets": {
             "type": "array",
             "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["symbol"],
-                "properties": {
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": 32},
-                    "name": {"type": ["string", "null"], "maxLength": 255},
-                    "market": {"type": ["string", "null"], "enum": MARKET_VALUES + [None]},
-                },
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["symbol"],
+                        "properties": {
+                            "symbol": {"type": "string", "minLength": 1, "maxLength": 32},
+                            "name": {"type": ["string", "null"], "maxLength": 255},
+                            "market": {"type": ["string", "null"], "enum": MARKET_VALUES + [None]},
+                        },
+                    },
+                    {"type": "string", "enum": ["NoneAny"]},
+                ],
             },
         },
         "reasoning": {"type": ["string", "null"], "maxLength": 1024},
@@ -338,6 +388,14 @@ def _coerce_call_result(
     return (model_json, json.dumps(model_json, ensure_ascii=False), None, None, None)
 
 
+def _unwrap_extracted_json_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    # Some upstreams may wrap model content as {"extracted_json": {...}}.
+    inner = payload.get("extracted_json")
+    if isinstance(inner, dict):
+        return inner
+    return payload
+
+
 def _normalize_stance(value: Any) -> str | None:
     if value is None:
         return None
@@ -419,7 +477,7 @@ def _normalize_confidence(value: Any) -> int:
     return rounded
 
 
-def _normalize_assets(value: Any) -> list[dict[str, Any]]:
+def _normalize_assets(value: Any) -> list[dict[str, Any] | str]:
     if value is None:
         return []
 
@@ -430,7 +488,7 @@ def _normalize_assets(value: Any) -> list[dict[str, Any]]:
     else:
         return []
 
-    normalized_assets: list[dict[str, Any]] = []
+    normalized_assets: list[dict[str, Any] | str] = []
     for candidate in candidates:
         parsed_asset = _normalize_asset_item(candidate)
         if parsed_asset is not None:
@@ -562,6 +620,8 @@ def _derive_asset_views_from_global(normalized: dict[str, Any]) -> list[dict[str
     reasoning = _normalize_reasoning(normalized.get("reasoning"))
     summary = _normalize_reasoning(normalized.get("summary"))
     for asset in normalized.get("assets", []):
+        if not isinstance(asset, dict):
+            continue
         symbol = asset.get("symbol")
         if not isinstance(symbol, str) or not symbol.strip():
             continue
@@ -579,11 +639,13 @@ def _derive_asset_views_from_global(normalized: dict[str, Any]) -> list[dict[str
     return views
 
 
-def _normalize_asset_item(value: Any) -> dict[str, Any] | None:
+def _normalize_asset_item(value: Any) -> dict[str, Any] | str | None:
     if isinstance(value, str):
         symbol = value.strip()
         if not symbol:
             return None
+        if symbol == "NoneAny":
+            return "NoneAny"
         return {"symbol": symbol.upper(), "market": "AUTO"}
 
     if not isinstance(value, dict):
@@ -728,15 +790,48 @@ class OpenAIExtractor(Extractor):
         self.provider_detected = detect_provider_from_base_url(self.base_url)
         self.output_mode = resolve_extraction_output_mode(self.base_url)
         self.reasoning_language_retry_hint = False
+        self.truncated_retry_hint = False
+        self._last_parse_error_meta: dict[str, Any] = {}
+        self._truncated_retry_used = False
         self._audit = ExtractionAudit()
 
     def set_reasoning_language_retry_hint(self, enabled: bool) -> None:
         self.reasoning_language_retry_hint = bool(enabled)
 
+    def _reset_parse_error_context(self) -> None:
+        self._last_parse_error_meta = {}
+        self._truncated_retry_used = False
+
+    def get_last_parse_error_meta(self) -> dict[str, Any]:
+        return dict(self._last_parse_error_meta)
+
     def extract(self, raw_post: RawPost) -> dict[str, Any]:
+        self._reset_parse_error_context()
         if self.output_mode == EXTRACTION_OUTPUT_TEXT_JSON:
-            model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_TEXT_JSON)
+            try:
+                model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_TEXT_JSON)
+            except TextJsonParseError as exc:
+                self._last_parse_error_meta = exc.to_meta(truncated_retry_used=False)
+                if exc.parse_error_reason != "truncated_output":
+                    raise
+                self._truncated_retry_used = True
+                self.truncated_retry_hint = True
+                try:
+                    model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_TEXT_JSON)
+                except TextJsonParseError as retry_exc:
+                    self._last_parse_error_meta = retry_exc.to_meta(truncated_retry_used=True)
+                    raise RuntimeError("parse_error_truncated_output_after_retry") from retry_exc
+                finally:
+                    self.truncated_retry_hint = False
+            if self._truncated_retry_used:
+                self._last_parse_error_meta = {
+                    "parse_error": False,
+                    "parse_error_reason": None,
+                    "truncated_retry_used": True,
+                    "finish_reason_best_effort": True,
+                }
             parsed_content, raw_content, latency_ms, input_tokens, output_tokens = _coerce_call_result(model_json)
+            parsed_content = _unwrap_extracted_json_envelope(parsed_content)
             self._record_model_output(
                 raw_model_output=raw_content,
                 parsed_model_output=parsed_content,
@@ -754,12 +849,15 @@ class OpenAIExtractor(Extractor):
                 "parse_strategy_used": model_json.get("parse_strategy_used"),
                 "raw_len": model_json.get("raw_len"),
                 "repaired": bool(model_json.get("repaired")),
+                "parse_error_reason": model_json.get("parse_error_reason"),
+                "truncated_retry_used": bool(self._truncated_retry_used),
             }
             return parsed
 
         try:
             model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_STRUCTURED)
             parsed_content, raw_content, latency_ms, input_tokens, output_tokens = _coerce_call_result(model_json)
+            parsed_content = _unwrap_extracted_json_envelope(parsed_content)
             self._record_model_output(
                 raw_model_output=raw_content,
                 parsed_model_output=parsed_content,
@@ -786,6 +884,7 @@ class OpenAIExtractor(Extractor):
             try:
                 model_json = self._call_openai(raw_post, response_mode=EXTRACTION_OUTPUT_TEXT_JSON)
                 parsed_content, raw_content, latency_ms, input_tokens, output_tokens = _coerce_call_result(model_json)
+                parsed_content = _unwrap_extracted_json_envelope(parsed_content)
                 self._record_model_output(
                     raw_model_output=raw_content,
                     parsed_model_output=parsed_content,
@@ -828,6 +927,12 @@ class OpenAIExtractor(Extractor):
             "Correction retry: previous output had non-Chinese reasoning. "
             "Now strictly ensure extracted_json.reasoning is Chinese narrative."
         )
+        retry_truncated_rule = (
+            "Correction retry: previous output was truncated JSON. "
+            "Must output exactly one complete JSON object with all closing braces/quotes. "
+            "Keep output shorter: asset_views max 2 items, each reasoning sentence very short. "
+            "reasoning must remain Chinese."
+        )
         json_mode_hard_rules = (
             "JSON mode hard rules (中英都适用): "
             "only return one JSON object. "
@@ -836,7 +941,9 @@ class OpenAIExtractor(Extractor):
             "confidence should be integer 0-100. "
             "include reasoning (1-3 short sentences). "
             "include event_tags as string array. "
-            "assets should be array of objects with symbol/name/market, symbol is required. "
+            "assets must exist and be array. "
+            "if no investment asset exists, use assets=[\"NoneAny\"] and asset_views=[]. "
+            "otherwise assets should be array of objects with symbol/name/market, symbol is required. "
             "assets[*].market must be one of CRYPTO/STOCK/ETF/FOREX/OTHER/AUTO. "
             "asset_views must be array of per-asset views, each contains "
             "symbol/stance/horizon/confidence/reasoning/summary and optional drivers; "
@@ -848,9 +955,11 @@ class OpenAIExtractor(Extractor):
             "You extract structured investment-view signals from a single post. "
             "Only output fields required by schema. "
             "If stance/horizon/confidence cannot be inferred, return null. "
-            "Do not guess symbols; keep assets empty when unknown. "
+            "Do not guess symbols; assets must exist. "
+            "If no investment asset exists, output assets=[\"NoneAny\"] and asset_views=[]. "
             f"{reasoning_language_rule} "
             f"{retry_reasoning_rule if self.reasoning_language_retry_hint else ''} "
+            f"{retry_truncated_rule if self.truncated_retry_hint else ''} "
             f"{strict_json_hint} "
             f"{json_mode_hard_rules if response_mode == EXTRACTION_OUTPUT_TEXT_JSON else ''}"
         )
@@ -884,6 +993,13 @@ class OpenAIExtractor(Extractor):
             headers["X-Title"] = self.openrouter_app_name
 
         started = perf_counter()
+        logger.info(
+            "openai_request_start provider=%s output_mode=%s model=%s url=%s",
+            self.provider_detected,
+            response_mode,
+            self.model_name,
+            f"{self.base_url}/chat/completions",
+        )
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(
                 f"{self.base_url}/chat/completions",
@@ -891,11 +1007,23 @@ class OpenAIExtractor(Extractor):
                 json=request_payload,
             )
         latency_ms = int((perf_counter() - started) * 1000)
+        logger.info(
+            "openai_request_end provider=%s output_mode=%s model=%s status_code=%s latency_ms=%s",
+            self.provider_detected,
+            response_mode,
+            self.model_name,
+            response.status_code,
+            latency_ms,
+        )
 
         if response.status_code >= 400:
             body_preview = response.text[:500]
             self._record_model_output(raw_model_output=body_preview, model_latency_ms=latency_ms)
-            raise OpenAIRequestError(status_code=response.status_code, body_preview=body_preview)
+            raise OpenAIRequestError(
+                status_code=response.status_code,
+                body_preview=body_preview,
+                retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
+            )
 
         body = response.json()
         choices = body.get("choices")
@@ -903,6 +1031,8 @@ class OpenAIExtractor(Extractor):
             raise RuntimeError("OpenAI response missing choices")
 
         message = choices[0].get("message", {})
+        # OpenRouter may omit finish_reason on some upstreams; treat it as best-effort telemetry only.
+        finish_reason = choices[0].get("finish_reason")
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             refusal = message.get("refusal")
@@ -922,13 +1052,33 @@ class OpenAIExtractor(Extractor):
                 raise RuntimeError(f"OpenAI content is not valid JSON: {exc}") from exc
         else:
             try:
-                parsed, parse_strategy_used, repaired = parse_text_json_object(content)
+                parsed, parse_strategy_used, repaired = parse_text_json_object(content, finish_reason=finish_reason)
+            except TextJsonParseError as exc:
+                self._record_model_output(raw_model_output=content, model_latency_ms=latency_ms)
+                token_budget_hit = isinstance(completion_tokens, int) and completion_tokens >= self.max_output_tokens
+                suspected_truncated = (
+                    exc.suspected_truncated or token_budget_hit or (str(finish_reason).lower() == "length")
+                )
+                parse_error_reason = "truncated_output" if suspected_truncated else exc.parse_error_reason
+                parse_strategy = (
+                    "text_json_repair_failed_truncated" if parse_error_reason == "truncated_output" else exc.parse_strategy_used
+                )
+                raise TextJsonParseError(
+                    "OpenAI content is not valid JSON object text",
+                    raw_content=content,
+                    parse_strategy_used=parse_strategy,
+                    repaired=exc.repaired,
+                    parse_error_reason=parse_error_reason,
+                    suspected_truncated=suspected_truncated,
+                    finish_reason=str(finish_reason) if finish_reason is not None else None,
+                ) from exc
             except RuntimeError:
                 self._record_model_output(raw_model_output=content, model_latency_ms=latency_ms)
                 raise
 
         if not isinstance(parsed, dict):
             raise RuntimeError("OpenAI content is not a JSON object")
+        parsed = _unwrap_extracted_json_envelope(parsed)
         return {
             "raw_content": content,
             "parsed_content": parsed,
@@ -938,6 +1088,8 @@ class OpenAIExtractor(Extractor):
             "parse_strategy_used": parse_strategy_used,
             "raw_len": len(content),
             "repaired": repaired,
+            "parse_error_reason": None,
+            "finish_reason": finish_reason,
         }
 
     def _build_user_prompt(self, raw_post: RawPost) -> str:
@@ -976,7 +1128,7 @@ def resolve_extraction_output_mode(base_url: str) -> str:
     return EXTRACTION_OUTPUT_STRUCTURED
 
 
-def parse_text_json_object(content: str) -> tuple[dict[str, Any], str, bool]:
+def parse_text_json_object(content: str, *, finish_reason: str | None = None) -> tuple[dict[str, Any], str, bool]:
     if not isinstance(content, str):
         raise RuntimeError("OpenAI content is not text")
 
@@ -1000,7 +1152,54 @@ def parse_text_json_object(content: str) -> tuple[dict[str, Any], str, bool]:
         if isinstance(parsed, dict):
             return parsed, strategy, repaired
         raise RuntimeError("OpenAI content is not a JSON object")
-    raise RuntimeError("OpenAI content is not valid JSON object text")
+    suspected_truncated = _looks_like_truncated_json_text(cleaned) or str(finish_reason).lower() == "length"
+    parse_error_reason = "truncated_output" if suspected_truncated else "invalid_json"
+    parse_strategy_used = "text_json_repair_failed_truncated" if suspected_truncated else "text_json_repair_failed_invalid"
+    raise TextJsonParseError(
+        "OpenAI content is not valid JSON object text",
+        raw_content=cleaned,
+        parse_strategy_used=parse_strategy_used,
+        repaired=True,
+        parse_error_reason=parse_error_reason,
+        suspected_truncated=suspected_truncated,
+        finish_reason=finish_reason,
+    )
+
+
+def _looks_like_truncated_json_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped[-1] in {'"', "\\", "{", "[", ":", ","}:
+        return True
+
+    obj_depth = 0
+    arr_depth = 0
+    in_string = False
+    escape = False
+    for ch in stripped:
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            obj_depth += 1
+        elif ch == "}":
+            obj_depth = max(0, obj_depth - 1)
+        elif ch == "[":
+            arr_depth += 1
+        elif ch == "]":
+            arr_depth = max(0, arr_depth - 1)
+    return in_string or obj_depth > 0 or arr_depth > 0
 
 
 def _extract_json_codeblock(text: str) -> str | None:

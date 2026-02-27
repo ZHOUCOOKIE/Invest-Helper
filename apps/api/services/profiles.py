@@ -38,7 +38,6 @@ async def ensure_default_profile(db: AsyncSession) -> UserProfile:
 async def _build_profile_read(db: AsyncSession, profile: UserProfile) -> ProfileRead:
     kols_result = await db.execute(select(Kol).order_by(Kol.id.asc()))
     kols = list(kols_result.scalars().all())
-    kol_map = {item.id: item for item in kols}
 
     weight_result = await db.execute(
         select(ProfileKolWeight)

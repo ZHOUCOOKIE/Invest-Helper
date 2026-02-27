@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -14,6 +16,8 @@ from enums import ExtractionStatus, ReviewStatus
 from main import app, reset_runtime_counters
 from models import Asset, AssetAlias, Kol, KolView, PostExtraction, RawPost
 from services.extraction import OpenAIExtractor, OpenAIRequestError, parse_text_json_object, normalize_extracted_json
+from services.prompts import build_extract_prompt
+from services.prompts.extract_v1 import PromptBundle
 from settings import get_settings
 
 
@@ -461,8 +465,6 @@ def test_long_content_gets_truncated_with_meta(monkeypatch: pytest.MonkeyPatch) 
     app.dependency_overrides[get_db] = override_get_db
     client = TestClient(app)
     response = client.post("/raw-posts/1/extract")
-    extraction_id = response.json()["id"] if response.status_code == 201 else 0
-    detail = client.get(f"/extractions/{extraction_id}") if extraction_id else None
     app.dependency_overrides.clear()
 
     assert response.status_code == 201
@@ -523,10 +525,11 @@ def test_openai_call_budget_falls_back_to_dummy_after_budget_exhausted(
 
 
 def test_extractor_status_includes_openrouter_and_budget_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    model_name = "minimax/minimax-m2.5"
     monkeypatch.setenv("EXTRACTOR_MODE", "auto")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("OPENAI_MODEL", "qwen/qwen-2.5-72b-instruct")
+    monkeypatch.setenv("OPENAI_MODEL", model_name)
     monkeypatch.setenv("OPENAI_CALL_BUDGET", "3")
     monkeypatch.setenv("OPENAI_MAX_OUTPUT_TOKENS", "888")
 
@@ -537,252 +540,10 @@ def test_extractor_status_includes_openrouter_and_budget_fields(monkeypatch: pyt
     body = response.json()
     assert body["mode"] == "auto"
     assert body["has_api_key"] is True
-    assert body["default_model"] == "qwen/qwen-2.5-72b-instruct"
+    assert body["default_model"] == model_name
     assert body["base_url"] == "https://openrouter.ai/api/v1"
     assert body["call_budget_remaining"] == 3
     assert body["max_output_tokens"] == 888
-
-
-def test_runtime_settings_budget_get_and_post(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EXTRACTOR_MODE", "auto")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_CALL_BUDGET", "5")
-    monkeypatch.setenv("OPENAI_MODEL", "qwen/qwen-2.5-72b-instruct")
-
-    client = TestClient(app)
-
-    initial = client.get("/settings/runtime")
-    assert initial.status_code == 200
-    initial_body = initial.json()
-    assert initial_body["extractor_mode"] == "auto"
-    assert initial_body["model"] == "qwen/qwen-2.5-72b-instruct"
-    assert initial_body["has_api_key"] is True
-    assert initial_body["budget_total"] == 5
-    assert initial_body["budget_remaining"] == 5
-    assert initial_body["auto_reject_confidence_threshold"] == 50
-    assert "runtime_overrides" in initial_body
-
-    updated = client.post("/settings/runtime/call-budget", json={"call_budget": 12})
-    assert updated.status_code == 200
-    updated_body = updated.json()
-    assert updated_body["budget_total"] == 12
-    assert updated_body["budget_remaining"] == 12
-    assert updated_body["runtime_overrides"]["call_budget"] is True
-
-
-def test_runtime_default_budget_is_30_per_hour(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
-    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "30")
-
-    client = TestClient(app)
-    response = client.get("/settings/runtime")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["default_budget_total"] == 30
-    assert body["budget_total"] == 30
-
-
-def test_runtime_budget_resets_on_new_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_db = FakeAsyncSession()
-    _seed_raw_post(fake_db)
-    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
-    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "2")
-    monkeypatch.setenv("CALL_BUDGET_WINDOW_MINUTES", "60")
-    now_ref = {"value": datetime(2026, 2, 23, 10, 0, tzinfo=UTC)}
-
-    def fake_now():
-        return now_ref["value"]
-
-    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
-        return {
-            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
-            "stance": "bull",
-            "horizon": "1w",
-            "confidence": 78,
-            "summary": "window test",
-            "source_url": raw_post.url,
-            "as_of": "2026-02-23",
-            "event_tags": [],
-        }
-
-    monkeypatch.setattr("main._utc_now", fake_now)
-    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
-
-    async def override_get_db():
-        yield fake_db
-
-    app.dependency_overrides[get_db] = override_get_db
-    client = TestClient(app)
-
-    initial = client.get("/settings/runtime")
-    assert initial.status_code == 200
-    assert initial.json()["budget_remaining"] == 2
-
-    extracted = client.post("/raw-posts/1/extract")
-    assert extracted.status_code == 201
-    after_extract = client.get("/settings/runtime")
-    assert after_extract.status_code == 200
-    assert after_extract.json()["budget_remaining"] == 1
-
-    now_ref["value"] = now_ref["value"] + timedelta(minutes=61)
-    after_window = client.get("/settings/runtime")
-    app.dependency_overrides.clear()
-
-    assert after_window.status_code == 200
-    body = after_window.json()
-    assert body["budget_total"] == 2
-    assert body["budget_remaining"] == 2
-
-
-def test_runtime_burst_enable_and_expire_restores_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
-    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "5")
-    now_ref = {"value": datetime(2026, 2, 23, 12, 0, tzinfo=UTC)}
-
-    def fake_now():
-        return now_ref["value"]
-
-    monkeypatch.setattr("main._utc_now", fake_now)
-    client = TestClient(app)
-
-    burst_on = client.post(
-        "/settings/runtime/burst",
-        json={"enabled": True, "call_budget": 500, "duration_minutes": 10},
-    )
-    assert burst_on.status_code == 200
-    on_body = burst_on.json()
-    assert on_body["burst"]["enabled"] is True
-    assert on_body["budget_total"] == 500
-
-    now_ref["value"] = now_ref["value"] + timedelta(minutes=11)
-    after_expire = client.get("/settings/runtime")
-    assert after_expire.status_code == 200
-    expired_body = after_expire.json()
-    assert expired_body["burst"]["enabled"] is False
-    assert expired_body["budget_total"] == 5
-
-    burst_off = client.post(
-        "/settings/runtime/burst",
-        json={"enabled": False, "call_budget": 0, "duration_minutes": 1},
-    )
-    assert burst_off.status_code == 200
-    assert burst_off.json()["burst"]["enabled"] is False
-
-
-def test_runtime_burst_unlimited_safe_sets_large_budget_and_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
-    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "30")
-    client = TestClient(app)
-
-    response = client.post(
-        "/settings/runtime/burst",
-        json={"enabled": True, "mode": "unlimited_safe", "call_budget": 1, "duration_minutes": 30},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["budget_total"] == 100000
-    assert body["burst"]["enabled"] is True
-    assert body["burst"]["mode"] == "unlimited_safe"
-
-
-def test_runtime_throttle_update_clamps_to_limits(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EXTRACT_MAX_CONCURRENCY_MAX", "4")
-    monkeypatch.setenv("EXTRACT_MAX_RPM_MAX", "60")
-    monkeypatch.setenv("EXTRACT_BATCH_SIZE_MAX", "50")
-    monkeypatch.setenv("EXTRACT_BATCH_SLEEP_MS_MIN", "100")
-
-    client = TestClient(app)
-    response = client.post(
-        "/settings/runtime/throttle",
-        json={
-            "max_concurrency": 999,
-            "max_rpm": 9999,
-            "batch_size": 999,
-            "batch_sleep_ms": 1,
-        },
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["throttle"]["max_concurrency"] == 4
-    assert body["throttle"]["max_rpm"] == 60
-    assert body["throttle"]["batch_size"] == 50
-    assert body["throttle"]["batch_sleep_ms"] == 100
-
-
-def test_runtime_default_base_throttle_is_aggressive_and_not_override() -> None:
-    client = TestClient(app)
-    response = client.get("/settings/runtime")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["runtime_overrides"]["throttle"] is False
-    assert body["throttle"] == {
-        "max_concurrency": 4,
-        "max_rpm": 120,
-        "batch_size": 50,
-        "batch_sleep_ms": 50,
-    }
-    assert body["effective_throttle"] == body["throttle"]
-    assert body["adaptive_throttle"]["last_reason"] != "manual throttle override updated"
-
-
-def test_runtime_adaptive_throttle_degrades_on_429_and_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_db = FakeAsyncSession()
-    _seed_raw_post(fake_db)
-    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("EXTRACT_RETRY_MAX", "1")
-    monkeypatch.setenv("REEXTRACT_RATE_LIMIT_MAX_ATTEMPTS", "100")
-    monkeypatch.setenv("EXTRACT_ADAPTIVE_RECOVERY_SUCCESSES", "2")
-
-    attempt_ref = {"count": 0}
-
-    def flaky_extract(self, raw_post: RawPost):  # noqa: ANN001
-        attempt_ref["count"] += 1
-        if attempt_ref["count"] == 1:
-            raise OpenAIRequestError(status_code=429, body_preview="rate_limited")
-        return {
-            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
-            "stance": "bull",
-            "horizon": "1w",
-            "confidence": 78,
-            "summary": "adaptive success",
-            "source_url": raw_post.url,
-            "as_of": "2026-02-25",
-            "event_tags": [],
-        }
-
-    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", flaky_extract)
-
-    async def override_get_db():
-        yield fake_db
-
-    app.dependency_overrides[get_db] = override_get_db
-    client = TestClient(app)
-
-    first = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "force"})
-    assert first.status_code == 200
-    first_runtime = client.get("/settings/runtime")
-    assert first_runtime.status_code == 200
-    first_runtime_body = first_runtime.json()
-    assert first_runtime_body["runtime_overrides"]["adaptive_throttle"] is True
-    assert first_runtime_body["adaptive_throttle"]["enabled"] is True
-    assert first_runtime_body["adaptive_throttle"]["active"] is True
-    assert first_runtime_body["adaptive_throttle"]["last_reason"] == "http_429"
-    assert first_runtime_body["effective_throttle"]["max_rpm"] < first_runtime_body["throttle"]["max_rpm"]
-
-    # Two recovery steps are needed to restore sleep_ms to base after one degrade.
-    for _ in range(4):
-        recovery = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "force"})
-        assert recovery.status_code == 200
-
-    recovered_runtime = client.get("/settings/runtime")
-    app.dependency_overrides.clear()
-    assert recovered_runtime.status_code == 200
-    recovered_body = recovered_runtime.json()
-    assert recovered_body["adaptive_throttle"]["active"] is False
-    assert recovered_body["effective_throttle"] == recovered_body["throttle"]
 
 
 def test_confidence_69_auto_rejects_and_marks_raw_post_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -801,6 +562,15 @@ def test_confidence_69_auto_rejects_and_marks_raw_post_rejected(monkeypatch: pyt
             "summary": "low confidence",
             "source_url": raw_post.url,
             "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 69,
+                    "summary": "btc view",
+                }
+            ],
         }
 
     monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
@@ -822,6 +592,89 @@ def test_confidence_69_auto_rejects_and_marks_raw_post_rejected(monkeypatch: pyt
     assert body["extracted_json"]["meta"]["auto_review_threshold"] == 70
     assert body["extracted_json"]["meta"]["model_confidence"] == 69
     assert fake_db._data[RawPost][1].review_status == ReviewStatus.rejected
+
+
+def test_auto_review_skips_when_asset_views_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 80,
+            "summary": "no views",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == ExtractionStatus.pending.value
+    assert body["reviewed_by"] is None
+    assert body["extracted_json"]["meta"].get("auto_approved") is not True
+    assert body["extracted_json"]["meta"].get("auto_rejected") is not True
+    assert fake_db._data[RawPost][1].review_status in {None, ReviewStatus.unreviewed}
+
+
+def test_noneany_assets_auto_rejected_and_not_in_pending_latest(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": ["NoneAny"],
+            "stance": "neutral",
+            "horizon": "1w",
+            "confidence": 80,
+            "summary": "daily-life post",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    pending = client.get("/extractions?status=pending&limit=20&offset=0")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == ExtractionStatus.rejected.value
+    assert body["reviewed_by"] == "auto"
+    assert body["extracted_json"]["meta"]["auto_rejected"] is True
+    assert body["extracted_json"]["meta"]["auto_review_reason"] == "no_investment_asset_noneany"
+    assert body["extracted_json"]["meta"]["noneany_detected"] is True
+    assert body["extracted_json"]["meta"].get("auto_approved") is not True
+    assert body["extracted_json"]["meta"].get("model_confidence") is None
+    assert fake_db._data[RawPost][1].review_status == ReviewStatus.rejected
+
+    assert pending.status_code == 200
+    assert pending.json() == []
 
 
 @pytest.mark.parametrize("confidence", [70, 80])
@@ -924,6 +777,306 @@ def test_force_reextract_ignores_has_result_guard(monkeypatch: pytest.MonkeyPatc
     assert call_count["n"] == 2
 
 
+def test_manual_force_reextract_skips_threshold_auto_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    now = datetime.now(UTC)
+    fake_db.seed(
+        PostExtraction(
+            id=9,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "old pending", "asset_views": []},
+            model_name="test-model",
+            extractor_name="openai_structured",
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 95,
+            "summary": "manual force",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-21",
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 95,
+                    "summary": "manual review needed",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    forced = client.post("/extractions/9/re-extract")
+    app.dependency_overrides.clear()
+
+    assert forced.status_code == 201
+    body = forced.json()
+    assert body["status"] == ExtractionStatus.pending.value
+    assert body["reviewed_by"] is None
+    assert body["extracted_json"]["meta"]["force_reextract"] is True
+    assert body["extracted_json"]["meta"]["force_reextract_triggered_by"] == "user"
+    assert body["extracted_json"]["meta"].get("auto_approved") is not True
+    assert body["extracted_json"]["meta"].get("auto_rejected") is not True
+
+
+def test_text_json_unwraps_extracted_json_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "extracted_json": {
+                "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+                "stance": "bull",
+                "horizon": "1w",
+                "confidence": 88,
+                "reasoning": "中文",
+                "summary": "unwrap",
+                "source_url": raw_post.url,
+                "as_of": "2026-02-21",
+                "event_tags": [],
+                "asset_views": [
+                    {
+                        "symbol": "BTC",
+                        "stance": "bull",
+                        "horizon": "1w",
+                        "confidence": 88,
+                        "reasoning": "中文",
+                        "summary": "unwrap",
+                    }
+                ],
+            }
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    extracted = body["extracted_json"]
+    assert extracted["assets"][0]["symbol"] == "BTC"
+    assert extracted["stance"] == "bull"
+    assert extracted["source_url"] == "https://x.com/alice/status/post-1"
+    assert "extracted_json" not in extracted
+    assert extracted["meta"]["parse_unwrapped_extracted_json"] is True
+    assert extracted["meta"]["parse_unwrapped_key"] == "extracted_json"
+
+
+def test_force_reextract_reparses_and_persists_extracted_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    now = datetime.now(UTC)
+    fake_db.seed(
+        PostExtraction(
+            id=9,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={
+                "assets": [],
+                "reasoning": None,
+                "stance": None,
+                "horizon": None,
+                "confidence": None,
+                "summary": None,
+                "source_url": None,
+                "as_of": None,
+                "event_tags": [],
+                "asset_views": [],
+            },
+            model_name="dummy-v2",
+            extractor_name="dummy",
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "extracted_json": {
+                "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+                "stance": "bull",
+                "horizon": "1w",
+                "confidence": 92,
+                "reasoning": "中文",
+                "summary": "fresh parse",
+                "source_url": raw_post.url,
+                "as_of": "2026-02-21",
+                "event_tags": [],
+                "asset_views": [
+                    {
+                        "symbol": "BTC",
+                        "stance": "bull",
+                        "horizon": "1w",
+                        "confidence": 92,
+                        "reasoning": "中文",
+                        "summary": "fresh parse",
+                    }
+                ],
+            }
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    forced = client.post("/extractions/9/re-extract")
+    app.dependency_overrides.clear()
+
+    assert forced.status_code == 201
+    body = forced.json()
+    assert body["id"] != 9
+    assert body["extracted_json"]["summary"] == "fresh parse"
+    assert body["extracted_json"]["assets"][0]["symbol"] == "BTC"
+    assert "extracted_json" not in body["extracted_json"]
+    assert body["extracted_json"]["meta"]["parse_unwrapped_extracted_json"] is True
+
+
+def test_force_reextract_deactivates_previous_active_and_creates_new_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    now = datetime.now(UTC)
+    fake_db.seed(
+        PostExtraction(
+            id=9,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "old active pending", "asset_views": [], "meta": {}},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "market": "CRYPTO"}],
+            "stance": "bull",
+            "horizon": "1w",
+            "confidence": 88,
+            "summary": "new pending extraction",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-26",
+            "event_tags": [],
+            "asset_views": [],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/extractions/9/re-extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["id"] != 9
+
+    old_extraction = fake_db._data[PostExtraction].get(9)
+    new_extraction = fake_db._data[PostExtraction][body["id"]]
+    if old_extraction is not None:
+        assert (old_extraction.last_error or "").startswith("superseded_by_force_reextract:user")
+        assert old_extraction.extracted_json["meta"]["deactivated_by_force_reextract"] is True
+        assert old_extraction.extracted_json["meta"]["deactivated_reason"].startswith("superseded_by_force_reextract:user")
+    assert (new_extraction.last_error or "").strip() == ""
+
+    active_rows = [
+        row
+        for row in fake_db._data[PostExtraction].values()
+        if row.raw_post_id == 1 and row.status == ExtractionStatus.pending and not (row.last_error or "").strip()
+    ]
+    assert len(active_rows) <= 1
+    if active_rows:
+        assert active_rows[0].id == body["id"]
+
+
+def test_noneany_rejects_even_on_manual_force_reextract(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    now = datetime.now(UTC)
+    fake_db.seed(
+        PostExtraction(
+            id=9,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "old pending", "asset_views": []},
+            model_name="test-model",
+            extractor_name="openai_structured",
+            created_at=now - timedelta(minutes=1),
+        )
+    )
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "extracted_json": {
+                "assets": ["NoneAny"],
+                "stance": "neutral",
+                "horizon": "1w",
+                "confidence": 80,
+                "reasoning": "中文",
+                "summary": "no investment asset",
+                "source_url": raw_post.url,
+                "as_of": "2026-02-21",
+                "event_tags": [],
+                "asset_views": [],
+            }
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    forced = client.post("/extractions/9/re-extract")
+    app.dependency_overrides.clear()
+
+    assert forced.status_code == 201
+    body = forced.json()
+    assert body["status"] == ExtractionStatus.rejected.value
+    assert body["extracted_json"]["meta"]["noneany_detected"] is True
+    assert body["extracted_json"]["meta"]["auto_review_reason"] == "no_investment_asset_noneany"
+
+
 def test_extract_batch_auto_approved_count_increments(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = FakeAsyncSession()
     _seed_raw_post(fake_db)
@@ -962,28 +1115,6 @@ def test_extract_batch_auto_approved_count_increments(monkeypatch: pytest.Monkey
     assert body["auto_rejected_count"] == 0
 
 
-def test_runtime_call_budget_override_visibility_and_clear(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_CALL_BUDGET", raising=False)
-    monkeypatch.setenv("CALL_BUDGET_PER_HOUR", "50")
-
-    client = TestClient(app)
-    set_override = client.post("/settings/runtime/call-budget", json={"call_budget": 3})
-    assert set_override.status_code == 200
-    set_body = set_override.json()
-    assert set_body["budget_total"] == 3
-    assert set_body["default_budget_total"] == 50
-    assert set_body["call_budget_override_enabled"] is True
-    assert set_body["call_budget_override_value"] == 3
-
-    clear_resp = client.post("/settings/runtime/call-budget/clear")
-    assert clear_resp.status_code == 200
-    cleared = clear_resp.json()
-    assert cleared["call_budget_override_enabled"] is False
-    assert cleared["call_budget_override_value"] is None
-    assert cleared["default_budget_total"] == 50
-    assert cleared["budget_total"] == 50
-
-
 def test_openrouter_forces_text_json_mode_and_never_sends_json_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1015,7 +1146,7 @@ def test_openrouter_forces_text_json_mode_and_never_sends_json_schema(
     monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
     extractor = OpenAIExtractor(
         api_key="test-key",
-        model_name="qwen/qwen-2.5-72b-instruct",
+        model_name="minimax/minimax-m2.5",
         base_url="https://openrouter.ai/api/v1",
         timeout_seconds=10,
         max_output_tokens=256,
@@ -1034,9 +1165,174 @@ def test_openrouter_forces_text_json_mode_and_never_sends_json_schema(
     extracted = extractor.extract(raw_post)
 
     assert extractor.output_mode == "text_json"
+    assert extracted["meta"]["provider_detected"] == "openrouter"
     assert extracted["meta"]["output_mode_used"] == "text_json"
     assert len(captured_payloads) == 1
     assert "response_format" not in captured_payloads[0]
+
+
+def test_openrouter_wrapped_extracted_json_is_unwrapped_and_noneany_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):  # noqa: ANN001
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "{\"extracted_json\":{\"assets\":[\"NoneAny\"],\"asset_views\":[],\"stance\":\"neutral\","
+                                "\"horizon\":\"1w\",\"confidence\":30,\"reasoning\":\"中文\",\"summary\":\"x\",\"source_url\":\"x\","
+                                "\"as_of\":\"2026-02-21\",\"event_tags\":[]}}"
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def post(self, url: str, headers: dict, json: dict):  # noqa: A002
+            return _FakeResponse()
+
+    monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
+    extractor = OpenAIExtractor(
+        api_key="test-key",
+        model_name="minimax/minimax-m2.5",
+        base_url="https://openrouter.ai/api/v1",
+        timeout_seconds=10,
+        max_output_tokens=256,
+    )
+    raw_post = RawPost(
+        id=999,
+        platform="x",
+        author_handle="alice",
+        external_id="ext-999",
+        url="https://x.com/alice/status/999",
+        content_text="BTC trend",
+        posted_at=datetime(2026, 2, 21, 9, 0, tzinfo=UTC),
+        fetched_at=datetime.now(UTC),
+        raw_json=None,
+    )
+    extracted = extractor.extract(raw_post)
+
+    assert extracted["assets"] == ["NoneAny"]
+    assert extracted["asset_views"] == []
+    assert extracted["stance"] == "neutral"
+
+
+def test_build_extract_prompt_hash_matches_sha256_text_and_version_extract_v1() -> None:
+    bundle = build_extract_prompt(
+        prompt_version="extract_v1",
+        platform="x",
+        author_handle="alice",
+        url="https://x.com/alice/status/42",
+        posted_at=datetime(2026, 2, 25, 9, 0, tzinfo=UTC),
+        content_text="BTC trend remains constructive",
+        assets=[{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+        aliases=[{"alias": "大饼", "symbol": "BTC"}],
+        max_assets_in_prompt=50,
+    )
+
+    expected_hash = hashlib.sha256(bundle.text.encode("utf-8")).hexdigest()
+    assert bundle.version == "extract_v1"
+    assert bundle.hash == expected_hash
+
+
+def test_call_openai_payload_uses_prompt_bundle_and_mode_specific_system_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_payloads: list[dict] = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):  # noqa: ANN001
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "{\"assets\":[],\"reasoning\":\"中文推理\",\"stance\":null,"
+                                "\"horizon\":null,\"confidence\":null,\"summary\":null,"
+                                "\"source_url\":null,\"as_of\":null,\"event_tags\":[],\"asset_views\":[]}"
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+            }
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def post(self, url: str, headers: dict, json: dict):  # noqa: A002
+            captured_payloads.append(json)
+            return _FakeResponse()
+
+    monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
+    extractor = OpenAIExtractor(
+        api_key="test-key",
+        model_name="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        timeout_seconds=10,
+        max_output_tokens=256,
+    )
+    extractor.set_prompt_bundle(
+        PromptBundle(version="extract_v1", text="PROMPT_BUNDLE_USER_TEXT", hash="test-hash")
+    )
+    raw_post = RawPost(
+        id=1001,
+        platform="x",
+        author_handle="alice",
+        external_id="ext-1001",
+        url="https://x.com/alice/status/1001",
+        content_text="BTC trend",
+        posted_at=datetime(2026, 2, 25, 9, 0, tzinfo=UTC),
+        fetched_at=datetime.now(UTC),
+        raw_json=None,
+    )
+
+    extractor._call_openai(raw_post, response_mode="structured")
+    extractor.set_reasoning_language_retry_hint(True)
+    extractor._call_openai(raw_post, response_mode="text_json")
+
+    assert len(captured_payloads) == 2
+
+    structured_payload = captured_payloads[0]
+    assert structured_payload["messages"][1]["content"] == "PROMPT_BUNDLE_USER_TEXT"
+    assert "response_format" in structured_payload
+    assert "json_schema" in structured_payload["response_format"]
+    structured_system = structured_payload["messages"][0]["content"]
+    assert "extracted_json.reasoning must be written in Chinese." in structured_system
+    assert "Return exactly one JSON object." in structured_system
+    assert "Correction retry: previous output had non-Chinese reasoning." not in structured_system
+    assert "JSON mode hard rules (中英都适用):" not in structured_system
+
+    text_json_payload = captured_payloads[1]
+    assert text_json_payload["messages"][1]["content"] == "PROMPT_BUNDLE_USER_TEXT"
+    assert "response_format" not in text_json_payload
+    text_json_system = text_json_payload["messages"][0]["content"]
+    assert "Correction retry: previous output had non-Chinese reasoning." in text_json_system
+    assert "JSON mode hard rules (中英都适用):" in text_json_system
 
 
 def test_text_json_parser_handles_codeblock_and_prefix_suffix() -> None:
@@ -1126,6 +1422,404 @@ def test_parse_failure_marks_failed_and_no_dummy_by_default(
     assert "json" in body["last_error"].lower()
     assert body["extracted_json"]["meta"]["output_mode_used"] == "text_json"
     assert body["extracted_json"]["meta"]["parse_error"] is True
+
+
+def test_openrouter_truncated_text_json_retry_success_records_meta_and_keeps_json_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "4")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    captured_payloads: list[dict] = []
+    response_queue = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"assets\":[],\"asset_views\":[],\"reasoning\":\"市场偏强\",\"stance\":\"bull"
+                    },
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 800},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+                                "reasoning": "市场风险偏好回暖，短线延续偏多。",
+                                "stance": "bull",
+                                "horizon": "1w",
+                                "confidence": 77,
+                                "summary": "短线偏多",
+                                "source_url": "https://x.com/alice/status/post-1",
+                                "as_of": "2026-02-21",
+                                "event_tags": ["risk_on"],
+                                "asset_views": [],
+                            },
+                            ensure_ascii=False,
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 210},
+        },
+    ]
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self):  # noqa: ANN001
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def post(self, url: str, headers: dict, json: dict):  # noqa: A002
+            captured_payloads.append(json)
+            return _FakeResponse(response_queue.pop(0))
+
+    monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert body["last_error"] is None
+    assert body["extractor_name"] == "openrouter_json_mode"
+    assert len(captured_payloads) == 2
+    assert "response_format" not in captured_payloads[0]
+    assert "response_format" not in captured_payloads[1]
+    assert "previous output was truncated JSON" in captured_payloads[1]["messages"][0]["content"]
+    assert "extracted_json.reasoning must be written in Chinese." in captured_payloads[1]["messages"][0]["content"]
+    assert meta["output_mode_used"] == "text_json"
+    assert meta["truncated_retry_used"] is True
+    assert bool(meta.get("parse_error")) is False
+    assert meta["raw_len"] > 0
+    assert meta["raw_saved_len"] > 0
+    assert meta["extra_retry_budget_total"] == 1
+    assert meta["extra_retry_budget_used"] == 1
+    assert body["raw_model_output"] is not None and len(body["raw_model_output"]) > 0
+
+
+def test_openrouter_truncated_text_json_retry_still_fails_with_observable_meta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "4")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    response_queue = [
+        {
+            "choices": [
+                {
+                    "message": {"content": "{\"assets\":[],\"asset_views\":[],\"reasoning\":\"市场偏强\",\"stance\":\"bull"},
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 800},
+        },
+        {
+            "choices": [
+                {
+                    "message": {"content": "{\"assets\":[],\"asset_views\":[],\"reasoning\":\"继续截断\",\"stance\":\"bull"},
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 800},
+        },
+    ]
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self):  # noqa: ANN001
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def post(self, url: str, headers: dict, json: dict):  # noqa: A002
+            return _FakeResponse(response_queue.pop(0))
+
+    monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert body["extractor_name"] == "openrouter_json_mode"
+    assert "parse_error_truncated_output_after_retry" in (body["last_error"] or "")
+    assert meta["parse_error"] is True
+    assert meta["parse_error_reason"] == "truncated_output"
+    assert meta["truncated_retry_used"] is True
+    assert meta["parse_strategy_used"] == "text_json_repair_failed_truncated"
+    assert meta["raw_len"] > 0
+    assert meta["raw_saved_len"] > 0
+    assert meta["finish_reason"] == "length"
+    assert meta["finish_reason_best_effort"] is True
+    assert body["raw_model_output"] is not None and len(body["raw_model_output"]) > 0
+
+
+def test_first_output_truncated_and_english_reasoning_uses_single_extra_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENAI_CALL_BUDGET", "5")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    captured_payloads: list[dict] = []
+    response_queue = [
+        {
+            "choices": [
+                {
+                    "message": {"content": "{\"assets\":[],\"asset_views\":[],\"reasoning\":\"English reasoning starts but gets cut"},
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 800},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+                                "reasoning": "Momentum remains positive and upside can continue.",
+                                "stance": "bull",
+                                "horizon": "1w",
+                                "confidence": 74,
+                                "summary": "english reasoning",
+                                "source_url": "https://x.com/alice/status/post-1",
+                                "as_of": "2026-02-21",
+                                "event_tags": ["risk_on"],
+                                "asset_views": [],
+                            }
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 210},
+        },
+    ]
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self):  # noqa: ANN001
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def post(self, url: str, headers: dict, json: dict):  # noqa: A002
+            captured_payloads.append(json)
+            return _FakeResponse(response_queue.pop(0))
+
+    monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert len(captured_payloads) == 2
+    assert "reasoning_language_violation_no_retry_budget_after_truncated_retry" in (body["last_error"] or "")
+    assert meta["truncated_retry_used"] is True
+    assert meta["reasoning_language"] == "non_zh"
+    assert meta["reasoning_language_violation"] is True
+    assert meta["reasoning_language_retry_used"] is False
+    assert meta["extra_retry_budget_total"] == 1
+    assert meta["extra_retry_budget_used"] == 1
+
+
+def test_openrouter_finish_reason_best_effort_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("DUMMY_FALLBACK", raising=False)
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):  # noqa: ANN001
+            return {
+                "choices": [
+                    {
+                        "message": {"content": "{\"assets\":[],\"asset_views\":[],\"reasoning\":\"bad truncate\",\"stance\":\"bull"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 120},
+            }
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001
+            return False
+
+        def post(self, url: str, headers: dict, json: dict):  # noqa: A002
+            return _FakeResponse()
+
+    monkeypatch.setattr("services.extraction.httpx.Client", _FakeClient)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert meta["parse_error"] is True
+    assert meta["parse_error_reason"] == "truncated_output"
+    assert meta["finish_reason"] is None
+    assert meta["finish_reason_best_effort"] is True
+
+
+def test_raw_model_output_cap_sets_len_meta_without_breaking_extracted_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_db = FakeAsyncSession()
+    _seed_raw_post(fake_db)
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("RAW_MODEL_OUTPUT_MAX_CHARS", "80")
+    monkeypatch.setenv("AUTO_APPROVE_ENABLED", "false")
+
+    long_summary = "x" * 500
+
+    def fake_call_openai(self, raw_post: RawPost, *, response_mode: str):  # noqa: ANN001
+        assert response_mode == "text_json"
+        raw_content = json.dumps(
+            {
+                "assets": [{"symbol": "BTC", "name": "Bitcoin", "market": "CRYPTO"}],
+                "reasoning": "中文推理",
+                "stance": "bull",
+                "horizon": "1w",
+                "confidence": 70,
+                "summary": long_summary,
+                "source_url": raw_post.url,
+                "as_of": "2026-02-21",
+                "event_tags": [],
+                "asset_views": [],
+            },
+            ensure_ascii=False,
+        )
+        return {
+            "raw_content": raw_content,
+            "parsed_content": json.loads(raw_content),
+            "latency_ms": 10,
+            "input_tokens": 10,
+            "output_tokens": 300,
+            "parse_strategy_used": "direct_json",
+            "raw_len": len(raw_content),
+            "repaired": False,
+            "parse_error_reason": None,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor._call_openai", fake_call_openai)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/raw-posts/1/extract")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    body = response.json()
+    meta = body["extracted_json"]["meta"]
+    assert meta["raw_len"] > meta["raw_saved_len"]
+    assert meta["raw_truncated"] is True
+    assert body["raw_model_output"] is not None
+    assert len(body["raw_model_output"]) == 80
+    assert body["extracted_json"]["summary"] == long_summary
+    assert body["extracted_json"]["assets"][0]["symbol"] == "BTC"
 
 
 def test_structured_unsupported_retries_once_with_json_mode_and_succeeds(

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type ProfileSummary = {
   id: number;
@@ -85,27 +85,37 @@ export default function DailyDigestPage() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadProfiles = async () => {
+  const loadProfiles = useCallback(async (): Promise<number | null> => {
     const res = await fetch("/api/profiles", { cache: "no-store" });
     const body = (await res.json()) as ProfileSummary[] | { detail?: string };
     if (!res.ok || !Array.isArray(body)) {
       throw new Error("Load profiles failed");
     }
     setProfiles(body);
-    if (body.length > 0 && !body.some((item) => item.id === profileId)) {
-      setProfileId(body[0].id);
+    if (body.length === 0) {
+      return null;
     }
-  };
+    const matched = body.some((item) => item.id === profileId) ? profileId : body[0].id;
+    if (matched !== profileId) {
+      setProfileId(matched);
+    }
+    return matched;
+  }, [profileId]);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     if (!digestDate) return;
     setLoading(true);
     setError(null);
     try {
-      await loadProfiles();
+      const effectiveProfileId = await loadProfiles();
+      if (effectiveProfileId === null) {
+        setDigest(null);
+        setDates([]);
+        return;
+      }
       const [datesRes, digestRes] = await Promise.all([
-        fetch(`/api/digests/dates?profile_id=${profileId}`, { cache: "no-store" }),
-        fetch(`/api/digests?date=${digestDate}&profile_id=${profileId}`, { cache: "no-store" }),
+        fetch(`/api/digests/dates?profile_id=${effectiveProfileId}`, { cache: "no-store" }),
+        fetch(`/api/digests?date=${digestDate}&profile_id=${effectiveProfileId}`, { cache: "no-store" }),
       ]);
 
       const datesBody = (await datesRes.json()) as string[] | { detail?: string };
@@ -126,12 +136,11 @@ export default function DailyDigestPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [digestDate, loadProfiles]);
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [digestDate, profileId]);
+  }, [load, profileId]);
 
   const generate = async () => {
     if (!digestDate) return;

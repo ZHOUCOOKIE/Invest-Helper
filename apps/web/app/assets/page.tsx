@@ -18,6 +18,7 @@ export default function AssetsPage() {
   const [market, setMarket] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
 
   const loadAssets = async () => {
     setLoading(true);
@@ -47,13 +48,14 @@ export default function AssetsPage() {
     setError(null);
 
     try {
+      setCreating(true);
       const res = await fetch("/api/assets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          symbol,
-          name: name || null,
-          market: market || null,
+          symbol: symbol.trim().toUpperCase(),
+          name: name.trim() || null,
+          market: market.trim().toUpperCase() || null,
         }),
       });
 
@@ -68,6 +70,8 @@ export default function AssetsPage() {
       await loadAssets();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setCreating(false);
     }
   };
 
@@ -87,7 +91,12 @@ export default function AssetsPage() {
           onChange={(e) => setMarket(e.target.value)}
           placeholder="market (optional, e.g. US)"
         />
-        <button type="submit">Create Asset</button>
+        <button type="submit" disabled={creating}>
+          {creating ? "Creating..." : "Create Asset"}
+        </button>
+        <button type="button" onClick={() => void loadAssets()} disabled={loading || creating}>
+          {loading ? "Loading..." : "Refresh"}
+        </button>
       </form>
 
       {error && <p style={{ color: "crimson" }}>{error}</p>}

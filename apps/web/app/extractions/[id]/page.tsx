@@ -58,7 +58,6 @@ type Extraction = {
   auto_policy: "threshold" | "top1_fallback" | null;
   auto_applied_kol_view_ids: number[] | null;
   auto_approve_confidence_threshold: number | null;
-  auto_approve_min_display_confidence: number | null;
   auto_reject_confidence_threshold: number | null;
   approve_inserted_count: number | null;
   approve_skipped_count: number | null;
@@ -225,9 +224,9 @@ export default function ExtractionDetailPage() {
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionInfo, setActionInfo] = useState<string | null>(null);
   const [matchingAssetHint, setMatchingAssetHint] = useState<string | null>(null);
   const [reExtracting, setReExtracting] = useState(false);
-  const [reExtractCooldown, setReExtractCooldown] = useState(false);
   const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>({
@@ -330,7 +329,6 @@ export default function ExtractionDetailPage() {
         });
 
         const extractedViews = pickAssetViews(extractionData.extracted_json);
-        const minDisplayConfidence = extractionData.auto_approve_min_display_confidence ?? 50;
         const threshold = extractionData.auto_approve_confidence_threshold ?? 70;
         const extractedAsOf = normalizeAsOfDate(
           typeof extractionData.extracted_json.as_of === "string"
@@ -343,10 +341,7 @@ export default function ExtractionDetailPage() {
             `${item.symbol.toUpperCase()}|${item.horizon}|${normalizeAsOfDate(item.as_of, extractedAsOf)}`,
           ),
         );
-        const selectableViews = extractedViews.filter(
-          (item) =>
-            item.confidence >= minDisplayConfidence && !autoAppliedKeys.has(buildAssetViewKey(item, extractedAsOf)),
-        );
+        const selectableViews = extractedViews.filter((item) => !autoAppliedKeys.has(buildAssetViewKey(item, extractedAsOf)));
         const highConfidenceKeys = selectableViews
           .filter((item) => item.confidence >= threshold)
           .map((item) => buildAssetViewKey(item, extractedAsOf));
@@ -371,15 +366,11 @@ export default function ExtractionDetailPage() {
     if (!extraction) {
       return;
     }
-    if (reExtractCooldown) {
-      return;
-    }
     if (!window.confirm("确认强制重新提取？这会创建新的 extraction 版本并消耗预算（不会覆盖历史）。")) {
       return;
     }
     setActionError(null);
-    setReExtractCooldown(true);
-    window.setTimeout(() => setReExtractCooldown(false), 3000);
+    setActionInfo(null);
     setReExtracting(true);
     try {
       const res = await fetch(`/api/extractions/${extraction.id}/re-extract`, { method: "POST" });
@@ -387,6 +378,7 @@ export default function ExtractionDetailPage() {
       if (!res.ok || typeof body.id !== "number") {
         throw new Error(getHttpErrorMessage(res.status, body.detail, `Re-extract failed: ${res.status}`));
       }
+      setActionInfo(`已创建新 extraction #${body.id}，正在跳转...`);
       router.push(`/extractions/${body.id}`);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Re-extract failed");
@@ -491,6 +483,8 @@ export default function ExtractionDetailPage() {
   };
 
   const reject = async () => {
+    const confirmed = window.confirm("确认拒绝该 extraction 吗？该操作将把状态设为 rejected。");
+    if (!confirmed) return;
     setActionError(null);
     setSubmitting(true);
     try {
@@ -548,8 +542,7 @@ export default function ExtractionDetailPage() {
 
   const extractedAssetViews = useMemo(() => {
     if (!extraction) return [];
-    const minDisplayConfidence = extraction.auto_approve_min_display_confidence ?? 50;
-    return pickAssetViews(extraction.extracted_json).filter((item) => item.confidence >= minDisplayConfidence);
+    return pickAssetViews(extraction.extracted_json);
   }, [extraction]);
 
   const extractedAsOf = useMemo(() => {
@@ -766,15 +759,18 @@ export default function ExtractionDetailPage() {
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>Approve</h2>
+            <h2 style={{ marginTop: 0 }}>通过</h2>
             <button
               type="button"
               onClick={() => void reExtract()}
-              disabled={reExtracting || reExtractCooldown}
+              disabled={reExtracting}
               style={{ marginBottom: "10px" }}
             >
-              {reExtracting ? "Re-extracting..." : "Re-extract with AI (force)"}
+              {reExtracting ? "重新解构中..." : "用 AI 重新解构（强制）"}
             </button>
+            <p style={{ marginTop: 0, color: "#555" }}>
+              Auto-review 规则：按阈值 70 执行（&gt;=70 auto approved，&lt;70 auto rejected）；force re-extract 也会自动审核。
+            </p>
             {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
             <form
               onSubmit={extractedAssetViews.length > 0 ? approveBatch : approve}
@@ -957,13 +953,13 @@ export default function ExtractionDetailPage() {
               </label>
 
               <button type="submit" disabled={submitting || extraction.status !== "pending"}>
-                {submitting ? "Submitting..." : extractedAssetViews.length > 0 ? "Approve Batch" : "Approve"}
+                {submitting ? "提交中..." : extractedAssetViews.length > 0 ? "批量通过" : "通过"}
               </button>
             </form>
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>Reject</h2>
+            <h2 style={{ marginTop: 0 }}>拒绝</h2>
             <label>
               reason (optional)
               <textarea
@@ -979,11 +975,12 @@ export default function ExtractionDetailPage() {
               disabled={submitting || extraction.status !== "pending"}
               style={{ marginTop: "8px" }}
             >
-              Reject
+              拒绝
             </button>
           </section>
 
           {actionError && <p style={{ color: "crimson" }}>{actionError}</p>}
+          {actionInfo && <p style={{ color: "green" }}>{actionInfo}</p>}
           {extraction.status !== "pending" && (
             <p style={{ color: "#666" }}>
               当前状态是 {extraction.status}，不可再次审核。reviewed_by={extraction.reviewed_by ?? "N/A"}

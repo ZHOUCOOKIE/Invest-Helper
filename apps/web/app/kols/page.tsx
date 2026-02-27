@@ -18,6 +18,7 @@ export default function KolsPage() {
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
 
   const loadKols = async () => {
     setLoading(true);
@@ -44,13 +45,14 @@ export default function KolsPage() {
     e.preventDefault();
     setError(null);
     try {
+      setCreating(true);
       const res = await fetch("/api/kols", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          platform,
-          handle,
-          display_name: displayName || null,
+          platform: platform.trim().toLowerCase(),
+          handle: handle.trim().replace(/^@+/, ""),
+          display_name: displayName.trim() || null,
         }),
       });
 
@@ -65,6 +67,8 @@ export default function KolsPage() {
       await loadKols();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setCreating(false);
     }
   };
 
@@ -84,7 +88,12 @@ export default function KolsPage() {
           onChange={(e) => setDisplayName(e.target.value)}
           placeholder="display_name (optional)"
         />
-        <button type="submit">Create KOL</button>
+        <button type="submit" disabled={creating}>
+          {creating ? "Creating..." : "Create KOL"}
+        </button>
+        <button type="button" onClick={() => void loadKols()} disabled={loading || creating}>
+          {loading ? "Loading..." : "Refresh"}
+        </button>
       </form>
 
       {error && <p style={{ color: "crimson" }}>{error}</p>}

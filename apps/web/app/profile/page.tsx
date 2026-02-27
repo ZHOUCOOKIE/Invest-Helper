@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 type ProfileSummary = {
   id: number;
@@ -36,44 +36,52 @@ export default function ProfilePage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadProfiles = async () => {
+  const loadProfiles = useCallback(async (): Promise<number | null> => {
     const res = await fetch("/api/profiles", { cache: "no-store" });
     const body = (await res.json()) as ProfileSummary[] | { detail?: string };
     if (!res.ok || !Array.isArray(body)) {
       throw new Error("Load profiles failed");
     }
     setProfiles(body);
-    if (body.length > 0 && !body.some((item) => item.id === profileId)) {
-      setProfileId(body[0].id);
+    if (body.length === 0) {
+      return null;
     }
-  };
+    const matched = body.some((item) => item.id === profileId) ? profileId : body[0].id;
+    if (matched !== profileId) {
+      setProfileId(matched);
+    }
+    return matched;
+  }, [profileId]);
 
-  const loadDetail = async (id: number) => {
+  const loadDetail = useCallback(async (id: number) => {
     const res = await fetch(`/api/profiles/${id}`, { cache: "no-store" });
     const body = (await res.json()) as ProfileDetail | { detail?: string };
     if (!res.ok) {
       throw new Error("detail" in body ? (body.detail ?? "Load profile failed") : "Load profile failed");
     }
     setDetail(body as ProfileDetail);
-  };
+  }, []);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      await loadProfiles();
-      await loadDetail(profileId);
+      const effectiveProfileId = await loadProfiles();
+      if (effectiveProfileId === null) {
+        setDetail(null);
+        return;
+      }
+      await loadDetail(effectiveProfileId);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
     }
-  };
+  }, [loadDetail, loadProfiles]);
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profileId]);
+  }, [load, profileId]);
 
   const saveKols = async () => {
     if (!detail) return;

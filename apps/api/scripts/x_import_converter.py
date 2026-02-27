@@ -252,8 +252,6 @@ def load_records_from_bytes(
 def convert_records(
     rows: list[Any],
     *,
-    author_handle: str | None,
-    kol_id: int | None,
     start_date: date | None,
     end_date: date | None,
     include_raw_json: bool = True,
@@ -269,7 +267,7 @@ def convert_records(
             continue
         row = row_any
 
-        raw_handle = author_handle or _pick(row, HANDLE_KEYS)
+        raw_handle = _pick(row, HANDLE_KEYS)
         if not isinstance(raw_handle, str) or not raw_handle.strip():
             stats.skipped_missing_handle += 1
             stats.failed_count += 1
@@ -374,8 +372,6 @@ def convert_records(
             "posted_at": posted_iso,
             "content_text": text,
         }
-        if kol_id is not None:
-            item["kol_id"] = kol_id
         if include_raw_json:
             item["raw_json"] = row
         output.append(item)
@@ -397,8 +393,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True, help="Input export file path (.csv or .json)")
     parser.add_argument("--output", default="x_import.json", help="Output JSON path")
     parser.add_argument("--input_format", choices=["csv", "json"], default=None, help="Optional input format override")
-    parser.add_argument("--author_handle", default=None, help="Override author handle for all rows")
-    parser.add_argument("--kol_id", type=int, default=None, help="Optional kol_id to write into each output row")
     parser.add_argument("--start_date", default=None, help="Inclusive start date in YYYY-MM-DD")
     parser.add_argument("--end_date", default=None, help="Inclusive end date in YYYY-MM-DD")
     parser.add_argument("--no_raw_json", action="store_true", help="Do not include raw_json field in output")
@@ -433,8 +427,6 @@ def main(argv: list[str] | None = None) -> int:
 
     output_rows, stats = convert_records(
         rows,
-        author_handle=args.author_handle,
-        kol_id=args.kol_id,
         start_date=start_date,
         end_date=end_date,
         include_raw_json=not args.no_raw_json,

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import type { FormEvent } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { AssetViewsTimeline } from "./views-timeline";
 
 type KolView = {
@@ -110,16 +110,16 @@ export default function AssetDetailPage() {
     as_of: "",
   });
 
-  const loadViews = async () => {
+  const loadViews = useCallback(async () => {
     const res = await fetch(`/api/assets/${assetId}/views`, { cache: "no-store" });
     const body = (await res.json()) as AssetViewsResponse | { detail?: string };
     if (!res.ok) {
       throw new Error("detail" in body ? (body.detail ?? "Request failed") : `Request failed ${res.status}`);
     }
     setData(body as AssetViewsResponse);
-  };
+  }, [assetId]);
 
-  const loadFeed = async (nextOffset: number, nextHorizon: typeof feedHorizon) => {
+  const loadFeed = useCallback(async (nextOffset: number, nextHorizon: typeof feedHorizon) => {
     setFeedLoading(true);
     setFeedError(null);
     try {
@@ -147,9 +147,9 @@ export default function AssetDetailPage() {
     } finally {
       setFeedLoading(false);
     }
-  };
+  }, [assetId]);
 
-  const loadTimeline = async () => {
+  const loadTimeline = useCallback(async () => {
     setTimelineLoading(true);
     setTimelineError(null);
     try {
@@ -164,7 +164,12 @@ export default function AssetDetailPage() {
     } finally {
       setTimelineLoading(false);
     }
-  };
+  }, [assetId]);
+
+  const refreshFeed = useCallback(async () => {
+    setFeedOffset(0);
+    await loadFeed(0, feedHorizon);
+  }, [feedHorizon, loadFeed]);
 
   useEffect(() => {
     const load = async () => {
@@ -215,12 +220,12 @@ export default function AssetDetailPage() {
   useEffect(() => {
     if (Number.isNaN(assetId)) return;
     void loadFeed(feedOffset, feedHorizon);
-  }, [assetId, feedOffset, feedHorizon]);
+  }, [assetId, feedOffset, feedHorizon, loadFeed]);
 
   useEffect(() => {
     if (Number.isNaN(assetId)) return;
     void loadTimeline();
-  }, [assetId]);
+  }, [assetId, loadTimeline]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -260,8 +265,7 @@ export default function AssetDetailPage() {
         throw new Error(body.detail ?? `Create failed ${res.status}`);
       }
 
-      await loadViews();
-      setFeedOffset(0);
+      await Promise.all([loadViews(), refreshFeed(), loadTimeline()]);
       setSubmitMessage("观点创建成功，列表已刷新。");
       setForm((prev) => ({ ...prev, summary: "", source_url: "", as_of: "" }));
     } catch (err) {
@@ -404,7 +408,7 @@ export default function AssetDetailPage() {
                   <option value="1y">1y</option>
                 </select>
               </label>
-              <button type="button" onClick={() => setFeedOffset(0)} disabled={feedLoading}>
+              <button type="button" onClick={() => void refreshFeed()} disabled={feedLoading}>
                 {feedLoading ? "Loading..." : "Refresh"}
               </button>
               <small style={{ color: "#666" }}>total: {feed?.total ?? 0}</small>

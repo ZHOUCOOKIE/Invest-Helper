@@ -33,8 +33,6 @@ def test_convert_records_filters_date_extracts_id_and_dedups() -> None:
 
     converted, stats = convert_records(
         rows,
-        author_handle=None,
-        kol_id=None,
         start_date=date(2026, 2, 19),
         end_date=date(2026, 2, 23),
     )
@@ -51,7 +49,7 @@ def test_convert_records_filters_date_extracts_id_and_dedups() -> None:
     assert len(stats.errors or []) == 2
 
 
-def test_convert_records_author_override_and_kol_id() -> None:
+def test_convert_records_uses_exported_handle_without_override() -> None:
     rows = [
         {
             "tweet_id": "2001",
@@ -63,16 +61,13 @@ def test_convert_records_author_override_and_kol_id() -> None:
 
     converted, stats = convert_records(
         rows,
-        author_handle="@qinbafrank",
-        kol_id=123,
         start_date=None,
         end_date=None,
     )
 
     assert stats.output_count == 1
-    assert converted[0]["author_handle"] == "qinbafrank"
-    assert converted[0]["resolved_author_handle"] == "qinbafrank"
-    assert converted[0]["kol_id"] == 123
-    assert converted[0]["url"] == "https://x.com/qinbafrank/status/2001"
+    assert converted[0]["author_handle"] == "raw_name"
+    assert converted[0]["resolved_author_handle"] == "raw_name"
+    assert converted[0]["url"] == "https://x.com/raw_name/status/2001"
     assert converted[0]["posted_at"].endswith("Z")
     assert stats.failed_count == 0

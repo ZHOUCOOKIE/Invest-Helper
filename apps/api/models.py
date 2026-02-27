@@ -20,7 +20,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from enums import ExtractionStatus, Horizon, ReviewStatus, Stance
 
-enum_values = lambda enum_cls: [item.value for item in enum_cls]
+
+def enum_values(enum_cls):
+    return [item.value for item in enum_cls]
 
 
 class Base(DeclarativeBase):

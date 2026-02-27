@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import type { DragEvent, FormEvent } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type ManualIngestResponse = {
   raw_post: { id: number };
@@ -170,6 +170,7 @@ type ExtractBatchStats = {
   skipped_already_has_result_count: number;
   skipped_already_rejected_count: number;
   skipped_already_approved_count: number;
+  skipped_due_to_import_limit_count: number;
   skipped_not_followed_count: number;
   failed_count: number;
   auto_rejected_count: number;
@@ -185,12 +186,16 @@ type ExtractJobCreateResponse = {
 
 type ExtractJob = ExtractBatchStats & {
   job_id: string;
-  status: "queued" | "running" | "done" | "failed";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timeout" | "done";
+  is_terminal: boolean;
   mode: "pending_only" | "pending_or_failed" | "force";
   batch_size: number;
   batch_sleep_ms: number;
+  ai_call_limit_total: number | null;
+  ai_call_used: number;
   last_error_summary: string | null;
   created_at: string;
+  last_updated_at: string;
   started_at: string | null;
   finished_at: string | null;
 };
@@ -200,56 +205,6 @@ type ApiErrorBody = {
   error_code?: string;
   message?: string;
   detail?: unknown;
-};
-
-type RuntimeSettings = {
-  extractor_mode: string;
-  provider_detected: string;
-  extraction_output_mode: string;
-  model: string;
-  has_api_key: boolean;
-  base_url: string;
-  budget_remaining: number | null;
-  budget_total: number;
-  default_budget_total: number;
-  call_budget_override_enabled: boolean;
-  call_budget_override_value: number | null;
-  window_start: string;
-  window_end: string;
-  max_output_tokens: number;
-  auto_reject_confidence_threshold: number;
-  throttle: {
-    max_concurrency: number;
-    max_rpm: number;
-    batch_size: number;
-    batch_sleep_ms: number;
-  };
-  effective_throttle: {
-    max_concurrency: number;
-    max_rpm: number;
-    batch_size: number;
-    batch_sleep_ms: number;
-  };
-  burst: {
-    enabled: boolean;
-    mode: string | null;
-    expires_at: string | null;
-  };
-  runtime_overrides: {
-    call_budget: boolean;
-    burst: boolean;
-    throttle: boolean;
-    adaptive_throttle: boolean;
-  };
-  adaptive_throttle: {
-    enabled: boolean;
-    active: boolean;
-    degrade_level: number;
-    consecutive_successes: number;
-    recovery_success_target: number;
-    last_reason: string | null;
-    last_changed_at: string | null;
-  };
 };
 
 type XProgress = {
@@ -359,29 +314,12 @@ export default function IngestPage() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ManualIngestResponse | null>(null);
   const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
-  const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
-  const [runtimeBudgetInput, setRuntimeBudgetInput] = useState("30");
-  const [runtimeBudgetSaving, setRuntimeBudgetSaving] = useState(false);
-  const [burstEnabledInput, setBurstEnabledInput] = useState(false);
-  const [burstCallBudgetInput, setBurstCallBudgetInput] = useState("1000");
-  const [burstDurationInput, setBurstDurationInput] = useState("30");
-  const [burstSaving, setBurstSaving] = useState(false);
-  const [throttleInput, setThrottleInput] = useState({
-    max_concurrency: "2",
-    max_rpm: "30",
-    batch_size: "20",
-    batch_sleep_ms: "250",
-  });
-  const [throttleSaving, setThrottleSaving] = useState(false);
   const [extractBatchSize, setExtractBatchSize] = useState(20);
   const [statusError, setStatusError] = useState<string | null>(null);
 
   const [kols, setKols] = useState<Kol[]>([]);
-  const [kolsError, setKolsError] = useState<string | null>(null);
   const [assets, setAssets] = useState<AssetItem[]>([]);
   const [assetsError, setAssetsError] = useState<string | null>(null);
-  const [selectedKolId, setSelectedKolId] = useState<number | null>(null);
-  const [authorHandle, setAuthorHandle] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [onlyFollowedKols, setOnlyFollowedKols] = useState(true);
@@ -403,7 +341,6 @@ export default function IngestPage() {
   const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
   const [progress, setProgress] = useState<XProgress | null>(null);
   const [generatedDigestDate, setGeneratedDigestDate] = useState<string | null>(null);
-  const [nowTs, setNowTs] = useState(() => Date.now());
   const [cleanupKolId, setCleanupKolId] = useState("");
   const [cleanupKolCascade, setCleanupKolCascade] = useState(false);
   const [cleanupKolDeleteRawPosts, setCleanupKolDeleteRawPosts] = useState(false);
@@ -415,6 +352,14 @@ export default function IngestPage() {
   const [followingImportBusy, setFollowingImportBusy] = useState(false);
   const [followingImportError, setFollowingImportError] = useState<string | null>(null);
   const [followingImportStats, setFollowingImportStats] = useState<FollowingImportStats | null>(null);
+  const extractPollControllerRef = useRef<AbortController | null>(null);
+  const extractPollRunIdRef = useRef(0);
+  const cancelExtractPolling = (reason?: string) => {
+    extractPollRunIdRef.current += 1;
+    extractPollControllerRef.current?.abort();
+    extractPollControllerRef.current = null;
+    if (reason) setWorkflowStep(reason);
+  };
 
   useEffect(() => {
     const cachedStart = localStorage.getItem(STORAGE_START_DATE);
@@ -428,42 +373,24 @@ export default function IngestPage() {
   }, [startDate]);
 
   useEffect(() => {
+    return () => {
+      cancelExtractPolling();
+    };
+  }, []);
+
+  useEffect(() => {
     if (endDate) localStorage.setItem(STORAGE_END_DATE, endDate);
   }, [endDate]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowTs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
     const loadStatus = async () => {
       try {
-        const [extractorRes, runtimeRes] = await Promise.all([
-          fetch("/api/extractor-status", { cache: "no-store" }),
-          fetch("/api/settings/runtime", { cache: "no-store" }),
-        ]);
+        const extractorRes = await fetch("/api/extractor-status", { cache: "no-store" });
         const extractorParsed = await parseApiResponse<ExtractorStatus>(extractorRes);
         if (!extractorRes.ok || !extractorParsed.data) {
           throw new Error(formatApiError("Load extractor status failed", extractorParsed.data, extractorParsed.textBody, extractorParsed.requestId));
         }
         setExtractorStatus(extractorParsed.data as ExtractorStatus);
-
-        const runtimeParsed = await parseApiResponse<RuntimeSettings>(runtimeRes);
-        if (!runtimeRes.ok || !runtimeParsed.data) {
-          throw new Error(formatApiError("Load runtime settings failed", runtimeParsed.data, runtimeParsed.textBody, runtimeParsed.requestId));
-        }
-        const runtime = runtimeParsed.data as RuntimeSettings;
-        setRuntimeSettings(runtime);
-        setRuntimeBudgetInput(String(runtime.budget_total));
-        setBurstEnabledInput(runtime.burst.enabled);
-        setThrottleInput({
-          max_concurrency: String(runtime.throttle.max_concurrency),
-          max_rpm: String(runtime.throttle.max_rpm),
-          batch_size: String(runtime.throttle.batch_size),
-          batch_sleep_ms: String(runtime.throttle.batch_sleep_ms),
-        });
-        setExtractBatchSize([10, 20, 50].includes(runtime.throttle.batch_size) ? runtime.throttle.batch_size : 20);
       } catch (err) {
         setStatusError(err instanceof Error ? err.message : "Load extractor status failed");
       }
@@ -478,7 +405,7 @@ export default function IngestPage() {
         const xKols = (parsed.data as Kol[]).filter((item) => item.platform === "x");
         setKols(xKols);
       } catch (err) {
-        setKolsError(err instanceof Error ? err.message : "Load kols failed");
+        setWorkflowError(err instanceof Error ? err.message : "Load kols failed");
       }
     };
     const loadAssets = async () => {
@@ -498,8 +425,6 @@ export default function IngestPage() {
     void loadKols();
     void loadAssets();
   }, []);
-
-  const selectedKol = useMemo(() => kols.find((item) => item.id === selectedKolId) ?? null, [kols, selectedKolId]);
 
   const formatApiError = (
     fallbackMessage: string,
@@ -554,11 +479,9 @@ export default function IngestPage() {
   };
 
   const progressHandle = useMemo(() => {
-    if (authorHandle.trim()) return authorHandle.trim();
-    if (selectedKol) return selectedKol.handle;
     if (selectedHandles.length === 1) return selectedHandles[0];
     return "";
-  }, [authorHandle, selectedHandles, selectedKol]);
+  }, [selectedHandles]);
 
   const refreshProgress = async () => {
     const query = progressHandle ? `?author_handle=${encodeURIComponent(progressHandle)}` : "";
@@ -601,14 +524,7 @@ export default function IngestPage() {
   };
 
   const applyOverridesForStandardRows = (rows: XImportItem[]): XImportItem[] => {
-    const effectiveAuthorOverride = authorHandle.trim().replace(/^@+/, "");
-    const withOverrides = rows.map((item) => {
-      const next: XImportItem = { ...item };
-      if (effectiveAuthorOverride) next.author_handle = effectiveAuthorOverride;
-      if (selectedKolId !== null) next.kol_id = selectedKolId;
-      return next;
-    });
-    return withOverrides.filter((item) => {
+    return rows.filter((item) => {
       const key = toDateKeyFromIso(item.posted_at);
       if (!key) return false;
       if (startDate && key < startDate) return false;
@@ -617,12 +533,9 @@ export default function IngestPage() {
     });
   };
 
-  const convertViaApi = async (targetFile: File, forcedAuthorHandle?: string): Promise<XConvertResult> => {
+  const convertViaApi = async (targetFile: File): Promise<XConvertResult> => {
     const params = new URLSearchParams();
     params.set("filename", targetFile.name);
-    const effectiveAuthorHandle = (forcedAuthorHandle || authorHandle).trim();
-    if (effectiveAuthorHandle) params.set("author_handle", effectiveAuthorHandle.replace(/^@+/, ""));
-    if (selectedKolId !== null) params.set("kol_id", String(selectedKolId));
     if (startDate) params.set("start_date", startDate);
     if (endDate) params.set("end_date", endDate);
     params.set("include_raw_json", "true");
@@ -646,10 +559,8 @@ export default function IngestPage() {
     return parsed.data as XConvertResult;
   };
 
-  const importRows = async (rows: XImportItem[], authorHandleOverride?: string): Promise<XImportStats> => {
+  const importRows = async (rows: XImportItem[]): Promise<XImportStats> => {
     const params = new URLSearchParams();
-    const normalizedOverride = (authorHandleOverride || "").trim().replace(/^@+/, "");
-    if (normalizedOverride) params.set("author_handle_override", normalizedOverride);
     params.set("only_followed", onlyFollowedKols ? "true" : "false");
     params.set("allow_unknown_handles", onlyFollowedKols ? "false" : "true");
     let res: Response;
@@ -674,22 +585,37 @@ export default function IngestPage() {
     ids: number[],
     batchSize: number,
     mode: "pending_only" | "pending_or_failed" | "force",
+    aiCallLimitTotal?: number,
   ): Promise<ExtractBatchStats> => {
     const stableIds = Array.from(new Set(ids)).sort((a, b) => a - b);
-    const idempotencyKey = `ingest:${mode}:${Math.max(1, batchSize)}:${stableIds.join(",")}`.slice(0, 256);
+    const normalizedAiLimit =
+      typeof aiCallLimitTotal === "number" && Number.isFinite(aiCallLimitTotal)
+        ? Math.max(0, Math.floor(aiCallLimitTotal))
+        : null;
+    const idempotencyKey = `ingest:${mode}:${Math.max(1, batchSize)}:${normalizedAiLimit ?? "none"}:${stableIds.join(",")}`.slice(0, 256);
+    cancelExtractPolling();
+    const pollController = new AbortController();
+    extractPollControllerRef.current = pollController;
+    const runId = extractPollRunIdRef.current + 1;
+    extractPollRunIdRef.current = runId;
     let createRes: Response;
     try {
       createRes = await fetch(buildDirectApiUrl(DIRECT_EXTRACT_JOBS_PATH, new URLSearchParams()), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: pollController.signal,
         body: JSON.stringify({
           raw_post_ids: stableIds,
           mode,
           batch_size: Math.max(1, batchSize),
+          ai_call_limit_total: normalizedAiLimit,
           idempotency_key: idempotencyKey,
         }),
       });
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new Error("Extract job polling cancelled");
+      }
       throw new Error(formatExtractJobNetworkError("create", err));
     }
     const createParsed = await parseApiResponse<ExtractJobCreateResponse>(createRes);
@@ -708,254 +634,61 @@ export default function IngestPage() {
     }
     const jobId = (createParsed.data as ExtractJobCreateResponse).job_id;
 
-    for (let attempt = 0; attempt < 1800; attempt += 1) {
-      let res: Response;
-      try {
-        res = await fetch(buildDirectApiUrl(`${DIRECT_EXTRACT_JOBS_PATH}/${encodeURIComponent(jobId)}`, new URLSearchParams()), {
-          cache: "no-store",
-        });
-      } catch (err) {
-        throw new Error(formatExtractJobNetworkError("poll", err));
-      }
-      const parsed = await parseApiResponse<ExtractJob>(res);
-      if (!res.ok || !parsed.data) {
+    try {
+      for (let attempt = 0; attempt < 1800; attempt += 1) {
+        if (extractPollRunIdRef.current !== runId) {
+          throw new Error("Extract job polling superseded by a newer run");
+        }
+        let res: Response;
+        try {
+          res = await fetch(buildDirectApiUrl(`${DIRECT_EXTRACT_JOBS_PATH}/${encodeURIComponent(jobId)}`, new URLSearchParams()), {
+            cache: "no-store",
+            signal: pollController.signal,
+          });
+        } catch (err) {
+          if (err instanceof DOMException && err.name === "AbortError") {
+            throw new Error("Extract job polling cancelled");
+          }
+          throw new Error(formatExtractJobNetworkError("poll", err));
+        }
+        const parsed = await parseApiResponse<ExtractJob>(res);
+        if (!res.ok || !parsed.data) {
+          setWorkflowRequestId(parsed.requestId);
+          throw new Error(
+            formatApiError("Load extract job failed", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath),
+          );
+        }
+        const job = parsed.data as ExtractJob;
         setWorkflowRequestId(parsed.requestId);
-        throw new Error(
-          formatApiError("Load extract job failed", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath),
+        setWorkflowStep(
+          `Extract job ${job.status}: success=${job.success_count}, failed=${job.failed_count}, skipped=${job.skipped_count}, requested=${job.requested_count}, ai_used=${job.ai_call_used}${job.ai_call_limit_total !== null ? `/${job.ai_call_limit_total}` : ""}`,
         );
-      }
-      const job = parsed.data as ExtractJob;
-      setWorkflowRequestId(parsed.requestId);
-      setWorkflowStep(
-        `Extract job ${job.status}: success=${job.success_count}, failed=${job.failed_count}, skipped=${job.skipped_count}, requested=${job.requested_count}`,
-      );
-      if (job.status === "done") return job;
-      if (job.status === "failed") {
-        const summary = job.last_error_summary ? `: ${job.last_error_summary}` : "";
-        throw new Error(`Extract job failed${summary}${parsed.requestId ? ` (request_id=${parsed.requestId})` : ""}`);
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 1200));
-    }
-    throw new Error("Extract job polling timeout");
-  };
-
-  const updateRuntimeCallBudget = async () => {
-    const next = Number(runtimeBudgetInput);
-    if (!Number.isFinite(next) || next < 0) {
-      setStatusError("call budget 必须是 >= 0 的数字");
-      return;
-    }
-    setRuntimeBudgetSaving(true);
-    setStatusError(null);
-    try {
-      const res = await fetch("/api/settings/runtime/call-budget", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ call_budget: Math.floor(next) }),
-      });
-      const body = (await res.json()) as RuntimeSettings | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Update runtime budget failed") : "Update failed");
-      }
-      const updated = body as RuntimeSettings;
-      setRuntimeSettings(updated);
-      setRuntimeBudgetInput(String(updated.budget_total));
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : "Update runtime budget failed");
-    } finally {
-      setRuntimeBudgetSaving(false);
-    }
-  };
-
-  const clearRuntimeCallBudgetOverride = async () => {
-    setRuntimeBudgetSaving(true);
-    setStatusError(null);
-    try {
-      const res = await fetch("/api/settings/runtime/call-budget/clear", {
-        method: "POST",
-      });
-      const body = (await res.json()) as RuntimeSettings | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Clear runtime budget override failed") : "Clear failed");
-      }
-      const updated = body as RuntimeSettings;
-      setRuntimeSettings(updated);
-      setRuntimeBudgetInput(String(updated.default_budget_total));
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : "Clear runtime budget override failed");
-    } finally {
-      setRuntimeBudgetSaving(false);
-    }
-  };
-
-  const updateRuntimeBurst = async () => {
-    const callBudget = Math.floor(Number(burstCallBudgetInput));
-    const durationMinutes = Math.floor(Number(burstDurationInput));
-    if (!burstEnabledInput) {
-      setBurstSaving(true);
-      setStatusError(null);
-      try {
-        const res = await fetch("/api/settings/runtime/burst", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: false, mode: "normal", call_budget: 0, duration_minutes: 1 }),
+        if (job.is_terminal) {
+          if (job.status === "failed" || job.status === "cancelled" || job.status === "timeout") {
+            const summary = job.last_error_summary ? `: ${job.last_error_summary}` : "";
+            throw new Error(`Extract job failed${summary}${parsed.requestId ? ` (request_id=${parsed.requestId})` : ""}`);
+          }
+          return job;
+        }
+        await new Promise((resolve, reject) => {
+          const timer = window.setTimeout(() => resolve(undefined), 1200);
+          pollController.signal.addEventListener(
+            "abort",
+            () => {
+              window.clearTimeout(timer);
+              reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+          );
         });
-        const body = (await res.json()) as RuntimeSettings | { detail?: string };
-        if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Disable burst failed") : "Disable burst failed");
-        setRuntimeSettings(body as RuntimeSettings);
-      } catch (err) {
-        setStatusError(err instanceof Error ? err.message : "Disable burst failed");
-      } finally {
-        setBurstSaving(false);
       }
-      return;
-    }
-
-    if (!Number.isFinite(callBudget) || callBudget < 0) {
-      setStatusError("burst call_budget 必须是 >= 0 的数字");
-      return;
-    }
-    if (!Number.isFinite(durationMinutes) || durationMinutes < 1) {
-      setStatusError("burst duration_minutes 必须是 >= 1 的整数");
-      return;
-    }
-    if (durationMinutes > 120) {
-      setStatusError("burst duration_minutes 上限是 120");
-      return;
-    }
-    setBurstSaving(true);
-    setStatusError(null);
-    try {
-      const res = await fetch("/api/settings/runtime/burst", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          enabled: true,
-          mode: "normal",
-          call_budget: callBudget,
-          duration_minutes: durationMinutes,
-        }),
-      });
-      const body = (await res.json()) as RuntimeSettings | { detail?: string };
-      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Enable burst failed") : "Enable burst failed");
-      setRuntimeSettings(body as RuntimeSettings);
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : "Enable burst failed");
+      throw new Error("Extract job polling timeout");
     } finally {
-      setBurstSaving(false);
-    }
-  };
-
-  const enableUnlimitedSafeBurst = async () => {
-    const durationMinutes = Math.floor(Number(burstDurationInput));
-    if (!Number.isFinite(durationMinutes) || durationMinutes < 1 || durationMinutes > 120) {
-      setStatusError("Unlimited (safe) 需要 1-120 分钟 duration");
-      return;
-    }
-    setBurstSaving(true);
-    setStatusError(null);
-    try {
-      const res = await fetch("/api/settings/runtime/burst", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          enabled: true,
-          mode: "unlimited_safe",
-          call_budget: 100000,
-          duration_minutes: durationMinutes,
-        }),
-      });
-      const body = (await res.json()) as RuntimeSettings | { detail?: string };
-      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Enable unlimited safe burst failed") : "Enable failed");
-      const updated = body as RuntimeSettings;
-      setRuntimeSettings(updated);
-      setBurstEnabledInput(updated.burst.enabled);
-      setBurstCallBudgetInput(String(updated.budget_total));
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : "Enable unlimited safe burst failed");
-    } finally {
-      setBurstSaving(false);
-    }
-  };
-
-  const updateRuntimeThrottle = async () => {
-    const payload = {
-      max_concurrency: Math.floor(Number(throttleInput.max_concurrency)),
-      max_rpm: Math.floor(Number(throttleInput.max_rpm)),
-      batch_size: Math.floor(Number(throttleInput.batch_size)),
-      batch_sleep_ms: Math.floor(Number(throttleInput.batch_sleep_ms)),
-    };
-    if (Object.values(payload).some((value) => !Number.isFinite(value))) {
-      setStatusError("throttle 参数必须都是数字");
-      return;
-    }
-    setThrottleSaving(true);
-    setStatusError(null);
-    try {
-      const res = await fetch("/api/settings/runtime/throttle", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = (await res.json()) as RuntimeSettings | { detail?: string };
-      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Update throttle failed") : "Update throttle failed");
-      const updated = body as RuntimeSettings;
-      setRuntimeSettings(updated);
-      setThrottleInput({
-        max_concurrency: String(updated.throttle.max_concurrency),
-        max_rpm: String(updated.throttle.max_rpm),
-        batch_size: String(updated.throttle.batch_size),
-        batch_sleep_ms: String(updated.throttle.batch_sleep_ms),
-      });
-      if ([10, 20, 50].includes(updated.throttle.batch_size)) {
-        setExtractBatchSize(updated.throttle.batch_size);
+      if (extractPollControllerRef.current === pollController) {
+        extractPollControllerRef.current = null;
       }
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : "Update throttle failed");
-    } finally {
-      setThrottleSaving(false);
     }
   };
-
-  const clearRuntimeThrottleOverride = async () => {
-    setThrottleSaving(true);
-    setStatusError(null);
-    try {
-      const res = await fetch("/api/settings/runtime/throttle/clear", {
-        method: "POST",
-      });
-      const body = (await res.json()) as RuntimeSettings | { detail?: string };
-      if (!res.ok) throw new Error("detail" in body ? (body.detail ?? "Clear throttle override failed") : "Clear throttle override failed");
-      const refreshRes = await fetch("/api/settings/runtime", { cache: "no-store" });
-      const refreshBody = (await refreshRes.json()) as RuntimeSettings | { detail?: string };
-      if (!refreshRes.ok) {
-        throw new Error("detail" in refreshBody ? (refreshBody.detail ?? "Refresh runtime settings failed") : "Refresh runtime settings failed");
-      }
-      const updated = refreshBody as RuntimeSettings;
-      setRuntimeSettings(updated);
-      setThrottleInput({
-        max_concurrency: String(updated.throttle.max_concurrency),
-        max_rpm: String(updated.throttle.max_rpm),
-        batch_size: String(updated.throttle.batch_size),
-        batch_sleep_ms: String(updated.throttle.batch_sleep_ms),
-      });
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : "Clear throttle override failed");
-    } finally {
-      setThrottleSaving(false);
-    }
-  };
-
-  const windowRemainingText = useMemo(() => {
-    if (!runtimeSettings) return "-";
-    const end = new Date(runtimeSettings.window_end).getTime();
-    if (Number.isNaN(end)) return "-";
-    const diffMs = Math.max(0, end - nowTs);
-    const totalSeconds = Math.floor(diffMs / 1000);
-    const mins = Math.floor(totalSeconds / 60);
-    const secs = totalSeconds % 60;
-    return `${mins}m ${secs}s`;
-  }, [runtimeSettings, nowTs]);
 
   const generateDigest = async (dateStr: string) => {
     setWorkflowStep(`Generating digest for ${dateStr}...`);
@@ -998,6 +731,7 @@ export default function IngestPage() {
       "",
     );
     if (confirmText !== "YES") return;
+    cancelExtractPolling("Extract polling cancelled before cleanup.");
     setWorkflowError(null);
     try {
       const params = new URLSearchParams({
@@ -1134,6 +868,7 @@ export default function IngestPage() {
   };
 
   const handleImportWorkflow = async () => {
+    if (workflowBusy) return;
     if (!file) {
       setWorkflowError("Please choose a file first.");
       return;
@@ -1146,7 +881,6 @@ export default function IngestPage() {
     setExtractByHandle({});
     setGeneratedDigestDate(null);
     try {
-      const effectiveAuthorOverride = authorHandle.trim().replace(/^@+/, "");
       let rows: XImportItem[] = [];
       let detectedHandles: string[] = [];
       let convertedRowsTotal = 0;
@@ -1177,7 +911,7 @@ export default function IngestPage() {
             convertedRowsTotal = parsed.length;
           } else {
             setWorkflowStep("Detected raw export JSON, converting...");
-            const converted = await convertViaApi(file, effectiveAuthorOverride);
+            const converted = await convertViaApi(file);
             setConvertResult(converted);
             detectedHandles = converted.handles_summary.map((item) => item.author_handle);
             syncSelectedHandles(detectedHandles);
@@ -1186,7 +920,7 @@ export default function IngestPage() {
           }
         } catch {
           setWorkflowStep("JSON parse failed in browser, converting via backend...");
-          const converted = await convertViaApi(file, effectiveAuthorOverride);
+          const converted = await convertViaApi(file);
           setConvertResult(converted);
           detectedHandles = converted.handles_summary.map((item) => item.author_handle);
           syncSelectedHandles(detectedHandles);
@@ -1195,7 +929,7 @@ export default function IngestPage() {
         }
       } else {
         setWorkflowStep("Converting upload via backend...");
-        const converted = await convertViaApi(file, effectiveAuthorOverride);
+        const converted = await convertViaApi(file);
         setConvertResult(converted);
         detectedHandles = converted.handles_summary.map((item) => item.author_handle);
         syncSelectedHandles(detectedHandles);
@@ -1203,15 +937,9 @@ export default function IngestPage() {
         convertedRowsTotal = converted.converted_rows;
       }
 
-      const activeHandleSet =
-        selectedKolId !== null || effectiveAuthorOverride
-          ? null
-          : new Set(
-              (selectedHandles.length > 0
-                ? selectedHandles
-                : detectedHandles
-              ).map((item) => item.trim().toLowerCase()),
-            );
+      const activeHandleSet = new Set(
+        (selectedHandles.length > 0 ? selectedHandles : detectedHandles).map((item) => item.trim().toLowerCase()),
+      );
       if (activeHandleSet && activeHandleSet.size > 0) {
         rows = rows.filter((item) =>
           activeHandleSet.has((item.resolved_author_handle || item.author_handle).trim().toLowerCase()),
@@ -1222,7 +950,7 @@ export default function IngestPage() {
       if (rows.length === 0) throw new Error("No rows left after conversion/filtering.");
 
       setWorkflowStep("Importing into raw_posts...");
-      const imported = await importRows(rows, effectiveAuthorOverride);
+      const imported = await importRows(rows);
       setImportStats(imported);
 
       if (autoExtract && Object.keys(imported.imported_by_handle).length > 0) {
@@ -1237,6 +965,7 @@ export default function IngestPage() {
           skipped_already_has_result_count: 0,
           skipped_already_rejected_count: 0,
           skipped_already_approved_count: 0,
+          skipped_due_to_import_limit_count: 0,
           skipped_not_followed_count: 0,
           failed_count: 0,
           auto_rejected_count: 0,
@@ -1245,30 +974,32 @@ export default function IngestPage() {
           resumed_failed: 0,
           resumed_skipped: 0,
         };
-        const perHandle: Record<string, ExtractBatchStats> = {};
-        for (const [handle, byHandle] of Object.entries(imported.imported_by_handle)) {
-          const ids = byHandle.raw_post_ids ?? [];
-          if (ids.length === 0) continue;
-          const extracted = await runExtractJob(ids, extractBatchSize, "pending_or_failed");
-          perHandle[handle] = extracted;
-          totals.requested_count += extracted.requested_count;
-          totals.success_count += extracted.success_count;
-          totals.skipped_count += extracted.skipped_count;
-          totals.skipped_already_extracted_count += extracted.skipped_already_extracted_count;
-          totals.skipped_already_pending_count += extracted.skipped_already_pending_count;
-          totals.skipped_already_success_count += extracted.skipped_already_success_count;
-          totals.skipped_already_has_result_count += extracted.skipped_already_has_result_count;
-          totals.skipped_already_rejected_count += extracted.skipped_already_rejected_count;
-          totals.skipped_already_approved_count += extracted.skipped_already_approved_count;
-          totals.skipped_not_followed_count += extracted.skipped_not_followed_count;
-          totals.failed_count += extracted.failed_count;
-          totals.auto_rejected_count += extracted.auto_rejected_count;
-          totals.resumed_requested_count += extracted.resumed_requested_count;
-          totals.resumed_success += extracted.resumed_success;
-          totals.resumed_failed += extracted.resumed_failed;
-          totals.resumed_skipped += extracted.resumed_skipped;
+        const allIds = Array.from(
+          new Set(
+            Object.values(imported.imported_by_handle).flatMap((byHandle) => byHandle.raw_post_ids ?? []),
+          ),
+        );
+        if (allIds.length > 0) {
+          const extracted = await runExtractJob(allIds, extractBatchSize, "pending_or_failed", allIds.length);
+          totals.requested_count = extracted.requested_count;
+          totals.success_count = extracted.success_count;
+          totals.skipped_count = extracted.skipped_count;
+          totals.skipped_already_extracted_count = extracted.skipped_already_extracted_count;
+          totals.skipped_already_pending_count = extracted.skipped_already_pending_count;
+          totals.skipped_already_success_count = extracted.skipped_already_success_count;
+          totals.skipped_already_has_result_count = extracted.skipped_already_has_result_count;
+          totals.skipped_already_rejected_count = extracted.skipped_already_rejected_count;
+          totals.skipped_already_approved_count = extracted.skipped_already_approved_count;
+          totals.skipped_due_to_import_limit_count = extracted.skipped_due_to_import_limit_count;
+          totals.skipped_not_followed_count = extracted.skipped_not_followed_count;
+          totals.failed_count = extracted.failed_count;
+          totals.auto_rejected_count = extracted.auto_rejected_count;
+          totals.resumed_requested_count = extracted.resumed_requested_count;
+          totals.resumed_success = extracted.resumed_success;
+          totals.resumed_failed = extracted.resumed_failed;
+          totals.resumed_skipped = extracted.resumed_skipped;
         }
-        setExtractByHandle(perHandle);
+        setExtractByHandle({});
         setExtractStats(totals);
       }
 
@@ -1341,33 +1072,7 @@ export default function IngestPage() {
         </p>
 
         <div style={{ display: "grid", gap: "8px", maxWidth: "700px" }}>
-          <label>
-            KOL (recommended)
-            <select
-              value={selectedKolId ?? ""}
-              onChange={(event) => {
-                const next = event.target.value ? Number(event.target.value) : null;
-                setSelectedKolId(next);
-                const kol = kols.find((item) => item.id === next);
-                if (kol) setAuthorHandle(kol.handle);
-              }}
-              style={{ display: "block", width: "100%" }}
-            >
-              <option value="">(none)</option>
-              {kols.map((kol) => (
-                <option key={kol.id} value={kol.id}>
-                  #{kol.id} {kol.display_name ?? kol.handle} (@{kol.handle})
-                </option>
-              ))}
-            </select>
-          </label>
-          {kolsError && <p style={{ color: "crimson", margin: 0 }}>{kolsError}</p>}
-
-          <label>
-            author_handle 覆盖（可选）
-            <input value={authorHandle} onChange={(event) => setAuthorHandle(event.target.value)} style={{ display: "block", width: "100%" }} />
-          </label>
-          {convertResult && convertResult.handles_summary.length > 1 && selectedKolId === null && !authorHandle.trim() && (
+          {convertResult && convertResult.handles_summary.length > 1 && (
             <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "8px", display: "grid", gap: "6px" }}>
               <strong>Import all handles（默认）</strong>
               {convertResult.handles_summary.map((item) => {
@@ -1468,7 +1173,10 @@ export default function IngestPage() {
             Generate Digest Now
           </button>
           <button type="button" onClick={() => void refreshProgress()} disabled={workflowBusy}>
-            Refresh Progress
+            刷新进度
+          </button>
+          <button type="button" onClick={() => cancelExtractPolling("Extract polling cancelled by user.")}>
+            停止轮询
           </button>
           <label style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
             <input
@@ -1633,7 +1341,7 @@ export default function IngestPage() {
             </ul>
           </div>
         )}
-        {convertResult && selectedKolId === null && convertResult.resolved_author_handle && (
+        {convertResult && convertResult.resolved_author_handle && (
           <p style={{ margin: 0 }}>
             Detected handle: @{convertResult.resolved_author_handle} (Create/Use KOL on import)
           </p>
@@ -1750,7 +1458,8 @@ export default function IngestPage() {
             </p>
             <p style={{ margin: 0 }}>
               skipped_already_rejected={extractStats.skipped_already_rejected_count}, skipped_already_approved=
-              {extractStats.skipped_already_approved_count}, skipped_not_followed={extractStats.skipped_not_followed_count}
+              {extractStats.skipped_already_approved_count}, skipped_due_to_import_limit=
+              {extractStats.skipped_due_to_import_limit_count}, skipped_not_followed={extractStats.skipped_not_followed_count}
             </p>
             <p style={{ margin: 0 }}>
               resumed_requested_count={extractStats.resumed_requested_count}, resumed_success={extractStats.resumed_success},
@@ -1762,9 +1471,9 @@ export default function IngestPage() {
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
             <Link href="/extractions?status=pending">Open pending list</Link>
             <button type="button" onClick={() => void refreshProgress()}>
-              Refresh progress
+              刷新进度
             </button>
-            <Link href={`/extractions?status=pending&t=${Date.now()}`}>Refresh extractions</Link>
+            <Link href={`/extractions?status=pending&t=${Date.now()}`}>刷新 extractions</Link>
           </div>
         )}
         {importStats && importStats.warnings.length > 0 && (
@@ -1830,168 +1539,6 @@ export default function IngestPage() {
               </details>
             )}
           </div>
-        )}
-      </section>
-
-      <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "760px" }}>
-        <h2 style={{ marginTop: 0 }}>Runtime Call Budget</h2>
-        {runtimeSettings ? (
-          <div style={{ display: "grid", gap: "8px" }}>
-            <p style={{ margin: 0 }}>
-              Current effective budget_total={runtimeSettings.budget_total}, budget_remaining=
-              {runtimeSettings.budget_remaining ?? "unlimited"}
-            </p>
-            <p style={{ margin: 0 }}>
-              Default (env/settings)={runtimeSettings.default_budget_total} (expected 30/hour reset)
-            </p>
-            {runtimeSettings.call_budget_override_enabled && (
-              <p style={{ margin: 0, color: "crimson", fontWeight: 700 }}>
-                Override active: {runtimeSettings.call_budget_override_value} (click Clear to restore default{" "}
-                {runtimeSettings.default_budget_total})
-              </p>
-            )}
-            <p style={{ margin: 0 }}>
-              window_start: {runtimeSettings.window_start} | window_end: {runtimeSettings.window_end} (remaining {windowRemainingText})
-            </p>
-            <p style={{ margin: 0 }}>
-              provider_detected: {runtimeSettings.provider_detected} | extraction_output_mode: {runtimeSettings.extraction_output_mode}
-            </p>
-            <p style={{ margin: 0 }}>
-              burst: {runtimeSettings.burst.enabled ? "enabled" : "disabled"} | mode: {runtimeSettings.burst.mode ?? "-"} | expires_at: {runtimeSettings.burst.expires_at ?? "-"}
-            </p>
-            <p style={{ margin: 0, color: "#8a5800" }}>
-              Update Runtime Budget 是进程内临时覆盖，重启后会恢复到 env/default。
-            </p>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-              <input
-                type="number"
-                min={0}
-                step={1}
-                value={runtimeBudgetInput}
-                onChange={(event) => setRuntimeBudgetInput(event.target.value)}
-                style={{ width: "120px" }}
-              />
-              <button type="button" onClick={() => void updateRuntimeCallBudget()} disabled={runtimeBudgetSaving}>
-                {runtimeBudgetSaving ? "Saving..." : "Update Runtime Budget"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void clearRuntimeCallBudgetOverride()}
-                disabled={runtimeBudgetSaving || !runtimeSettings.call_budget_override_enabled}
-              >
-                {runtimeBudgetSaving ? "Saving..." : "Clear Override"}
-              </button>
-              <span>override: {runtimeSettings.call_budget_override_enabled ? "yes" : "no"}</span>
-            </div>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={burstEnabledInput}
-                  onChange={(event) => setBurstEnabledInput(event.target.checked)}
-                />{" "}
-                Enable Burst
-              </label>
-              <input
-                type="number"
-                min={0}
-                step={1}
-                value={burstCallBudgetInput}
-                onChange={(event) => setBurstCallBudgetInput(event.target.value)}
-                style={{ width: "120px" }}
-              />
-              <input
-                type="number"
-                min={1}
-                step={1}
-                value={burstDurationInput}
-                onChange={(event) => setBurstDurationInput(event.target.value)}
-                style={{ width: "120px" }}
-              />
-              <button type="button" onClick={() => void updateRuntimeBurst()} disabled={burstSaving}>
-                {burstSaving ? "Saving..." : burstEnabledInput ? "Enable Burst" : "Disable Burst"}
-              </button>
-              <button type="button" onClick={() => void enableUnlimitedSafeBurst()} disabled={burstSaving}>
-                {burstSaving ? "Saving..." : "Unlimited (safe)"}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <p style={{ margin: 0 }}>Loading runtime settings...</p>
-        )}
-      </section>
-
-      <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "760px" }}>
-        <h2 style={{ marginTop: 0 }}>Runtime Throttle</h2>
-        <p style={{ margin: "0 0 8px 0", color: "#666" }}>
-          Adaptive throttle telemetry + Clear Throttle Override
-        </p>
-        {runtimeSettings ? (
-          <div style={{ display: "grid", gap: "8px" }}>
-            <p style={{ margin: 0 }}>
-              Base throttle ({runtimeSettings.runtime_overrides.throttle ? "manually overridden" : "default aggressive"}):
-              {" "}max_rpm={runtimeSettings.throttle.max_rpm}, max_concurrency={runtimeSettings.throttle.max_concurrency},
-              {" "}batch_size={runtimeSettings.throttle.batch_size}, batch_sleep_ms={runtimeSettings.throttle.batch_sleep_ms}
-            </p>
-            <p style={{ margin: 0 }}>
-              Effective throttle (current): max_rpm={runtimeSettings.effective_throttle.max_rpm}, max_concurrency=
-              {runtimeSettings.effective_throttle.max_concurrency}, batch_size={runtimeSettings.effective_throttle.batch_size},
-              batch_sleep_ms={runtimeSettings.effective_throttle.batch_sleep_ms}
-            </p>
-            <p style={{ margin: 0, color: "#8a5800" }}>
-              默认是付费模型的保守配置；若 429 增多，建议降低 rpm/并发或增大 sleep。
-            </p>
-            <p style={{ margin: 0 }}>
-              Adaptive throttle: {runtimeSettings.adaptive_throttle.enabled ? "enabled" : "disabled"} | active=
-              {runtimeSettings.adaptive_throttle.active ? "true" : "false"} | level={runtimeSettings.adaptive_throttle.degrade_level}
-              {" "}({runtimeSettings.adaptive_throttle.consecutive_successes}/
-              {runtimeSettings.adaptive_throttle.recovery_success_target} successes toward recovery) | reason=
-              {runtimeSettings.adaptive_throttle.last_reason ?? "-"} | changed_at=
-              {runtimeSettings.adaptive_throttle.last_changed_at ?? "-"}
-            </p>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-              <input
-                type="number"
-                min={1}
-                value={throttleInput.max_rpm}
-                onChange={(event) => setThrottleInput((prev) => ({ ...prev, max_rpm: event.target.value }))}
-                style={{ width: "100px" }}
-              />
-              <input
-                type="number"
-                min={1}
-                value={throttleInput.max_concurrency}
-                onChange={(event) => setThrottleInput((prev) => ({ ...prev, max_concurrency: event.target.value }))}
-                style={{ width: "100px" }}
-              />
-              <input
-                type="number"
-                min={1}
-                value={throttleInput.batch_size}
-                onChange={(event) => setThrottleInput((prev) => ({ ...prev, batch_size: event.target.value }))}
-                style={{ width: "100px" }}
-              />
-              <input
-                type="number"
-                min={100}
-                value={throttleInput.batch_sleep_ms}
-                onChange={(event) => setThrottleInput((prev) => ({ ...prev, batch_sleep_ms: event.target.value }))}
-                style={{ width: "120px" }}
-              />
-              <button type="button" onClick={() => void updateRuntimeThrottle()} disabled={throttleSaving}>
-                {throttleSaving ? "Saving..." : "Update Throttle"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void clearRuntimeThrottleOverride()}
-                disabled={throttleSaving || !runtimeSettings.runtime_overrides.throttle}
-              >
-                {throttleSaving ? "Saving..." : "Clear Throttle Override"}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <p style={{ margin: 0 }}>Loading throttle settings...</p>
         )}
       </section>
 

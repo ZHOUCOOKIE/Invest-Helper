@@ -48,7 +48,20 @@ def _seed_pending_with_confidence(fake_db: FakeAsyncSession, *, extraction_id: i
             id=extraction_id,
             raw_post_id=raw_post_id,
             status=ExtractionStatus.pending,
-            extracted_json={"summary": "hist", "confidence": confidence, "meta": {}},
+            extracted_json={
+                "summary": "hist",
+                "confidence": confidence,
+                "meta": {},
+                "asset_views": [
+                    {
+                        "symbol": "BTC",
+                        "stance": "bull",
+                        "horizon": "1w",
+                        "confidence": confidence,
+                        "summary": "hist view",
+                    }
+                ],
+            },
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             prompt_version="extract_v1",

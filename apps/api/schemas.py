@@ -169,7 +169,6 @@ class PostExtractionRead(BaseModel):
     auto_policy: str | None
     auto_applied_kol_view_ids: list[int] | None
     auto_approve_confidence_threshold: int | None = None
-    auto_approve_min_display_confidence: int | None = None
     auto_reject_confidence_threshold: int | None = None
     approve_inserted_count: int | None = None
     approve_skipped_count: int | None = None
@@ -389,6 +388,26 @@ class AdminBackfillAutoReviewRead(BaseModel):
     errors: list[AutoReviewBackfillErrorRead] = Field(default_factory=list)
 
 
+class AdminReextractPendingErrorRead(BaseModel):
+    extraction_id: int | None = None
+    raw_post_id: int | None = None
+    error: str
+
+
+class AdminReextractPendingRead(BaseModel):
+    scanned: int
+    created: int = 0
+    triggered: int
+    conflict_count: int = 0
+    succeeded_parse: int = 0
+    failed_parse: int = 0
+    auto_approved: int = 0
+    auto_rejected: int = 0
+    noneany_rejected: int = 0
+    skipped_terminal: int
+    errors: list[AdminReextractPendingErrorRead] = Field(default_factory=list)
+
+
 class AdminRefreshWrongExtractedJsonRead(BaseModel):
     scanned: int
     updated: int
@@ -434,6 +453,7 @@ class RawPostsExtractBatchRead(BaseModel):
     skipped_already_has_result_count: int = 0
     skipped_already_rejected_count: int = 0
     skipped_already_approved_count: int = 0
+    skipped_due_to_import_limit_count: int = 0
     skipped_not_followed_count: int = 0
     failed_count: int
     auto_approved_count: int = 0
@@ -445,6 +465,12 @@ class RawPostsExtractBatchRead(BaseModel):
     capped_count: int = 0
     horizon_coerced_count: int = 0
     raw_truncated_count: int = 0
+    openai_call_attempted_count: int = 0
+    openai_call_succeeded_count: int = 0
+    openai_call_429_count: int = 0
+    openai_call_timeout_count: int = 0
+    openai_total_sleep_ms: int = 0
+    max_concurrency_used: int = 1
 
 
 class ExtractJobCreateRequest(BaseModel):
@@ -452,6 +478,7 @@ class ExtractJobCreateRequest(BaseModel):
     mode: Literal["pending_only", "pending_or_failed", "force"] = "pending_or_failed"
     batch_size: int = Field(default=50, ge=1, le=500)
     batch_sleep_ms: int = Field(default=200, ge=0, le=60_000)
+    ai_call_limit_total: int | None = Field(default=None, ge=0, le=100000)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=256)
 
 
@@ -461,10 +488,13 @@ class ExtractJobCreateRead(BaseModel):
 
 class ExtractJobRead(BaseModel):
     job_id: str
-    status: Literal["queued", "running", "done", "failed"]
+    status: Literal["queued", "running", "completed", "failed", "cancelled", "timeout", "done"]
+    is_terminal: bool
     mode: Literal["pending_only", "pending_or_failed", "force"]
     batch_size: int
     batch_sleep_ms: int
+    ai_call_limit_total: int | None = None
+    ai_call_used: int = 0
     requested_count: int
     success_count: int
     skipped_count: int
@@ -474,6 +504,7 @@ class ExtractJobRead(BaseModel):
     skipped_already_has_result_count: int = 0
     skipped_already_rejected_count: int = 0
     skipped_already_approved_count: int = 0
+    skipped_due_to_import_limit_count: int = 0
     skipped_not_followed_count: int = 0
     failed_count: int
     auto_approved_count: int = 0
@@ -481,12 +512,19 @@ class ExtractJobRead(BaseModel):
     capped_count: int = 0
     horizon_coerced_count: int = 0
     raw_truncated_count: int = 0
+    openai_call_attempted_count: int = 0
+    openai_call_succeeded_count: int = 0
+    openai_call_429_count: int = 0
+    openai_call_timeout_count: int = 0
+    openai_total_sleep_ms: int = 0
+    max_concurrency_used: int = 1
     resumed_requested_count: int = 0
     resumed_success: int = 0
     resumed_failed: int = 0
     resumed_skipped: int = 0
     last_error_summary: str | None = None
     created_at: datetime
+    last_updated_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -799,45 +837,3 @@ class ExtractorStatusRead(BaseModel):
     base_url: str
     call_budget_remaining: int | None
     max_output_tokens: int
-
-
-class RuntimeSettingsRead(BaseModel):
-    extractor_mode: str
-    provider_detected: str
-    extraction_output_mode: str
-    model: str
-    has_api_key: bool
-    base_url: str
-    budget_remaining: int | None
-    budget_total: int
-    default_budget_total: int
-    call_budget_override_enabled: bool
-    call_budget_override_value: int | None
-    override_value: int | None = None
-    window_start: datetime
-    window_end: datetime
-    max_output_tokens: int
-    auto_reject_confidence_threshold: int
-    throttle: dict[str, int]
-    effective_throttle: dict[str, int]
-    burst: dict[str, bool | datetime | str | None]
-    runtime_overrides: dict[str, bool]
-    adaptive_throttle: dict[str, bool | int | str | datetime | None]
-
-
-class RuntimeCallBudgetUpdateRequest(BaseModel):
-    call_budget: int = Field(ge=0, le=100000)
-
-
-class RuntimeBurstUpdateRequest(BaseModel):
-    enabled: bool
-    mode: Literal["normal", "unlimited_safe"] = "normal"
-    call_budget: int = Field(default=0, ge=0, le=100000)
-    duration_minutes: int = Field(default=0, ge=1, le=120)
-
-
-class RuntimeThrottleUpdateRequest(BaseModel):
-    max_concurrency: int = Field(ge=1, le=1000)
-    max_rpm: int = Field(ge=1, le=100000)
-    batch_size: int = Field(ge=1, le=1000)
-    batch_sleep_ms: int = Field(ge=0, le=600000)

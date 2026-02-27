@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -1873,6 +1874,307 @@ def test_approved_rejected_are_terminal_skip_unless_force(monkeypatch) -> None: 
     assert calls == [1, 2]
 
 
+def test_failed_with_non_empty_assets_skips_reupload_unless_force(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="assets-lock-1",
+            url="https://x.com/alice/status/assets-lock-1",
+            content_text="has assets",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=910,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"assets": [{"symbol": "BTC", "market": "CRYPTO"}], "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error="OpenAIRequestError: timeout",
+            created_at=now,
+        )
+    )
+
+    calls: list[int] = []
+
+    async def fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        calls.append(raw_post.id)
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "forced", "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+        )
+        db.add(extraction)
+        await db.flush()
+        return extraction
+
+    monkeypatch.setattr("main.create_pending_extraction", fake_create_pending_extraction)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    normal = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "pending_or_failed"})
+
+    assert normal.status_code == 200
+    normal_body = normal.json()
+    assert normal_body["success_count"] == 0
+    assert normal_body["skipped_already_has_result_count"] == 1
+    assert calls == []
+
+    forced = client.post("/raw-posts/extract-batch", json={"raw_post_ids": [1], "mode": "force"})
+    app.dependency_overrides.clear()
+
+    assert forced.status_code == 200
+    forced_body = forced.json()
+    assert forced_body["success_count"] == 1
+    assert calls == [1]
+
+
+def test_admin_reextract_pending_uses_status_pending_not_classified_pending(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    monkeypatch.setenv("ENV", "local")
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="pending-status-only-1",
+            url="https://x.com/alice/status/pending-status-only-1",
+            content_text="pending status row",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            review_status=ReviewStatus.unreviewed,
+        )
+    )
+    # This row is status=pending but classify_extraction_state may treat it as SUCCESS
+    # because extracted_json is a valid dict and no failure marker is present.
+    fake_db.seed(
+        PostExtraction(
+            id=777,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "valid parsed payload", "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+            created_at=now,
+        )
+    )
+
+    calls: list[dict[str, object]] = []
+
+    async def fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        calls.append({"raw_post_id": raw_post.id, **kwargs})
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "forced rerun", "asset_views": []},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+        )
+        db.add(extraction)
+        await db.flush()
+        return extraction
+
+    monkeypatch.setattr("main.create_pending_extraction", fake_create_pending_extraction)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/admin/extractions/reextract-pending?confirm=YES")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scanned"] == 1
+    assert body["triggered"] == 1
+    assert body["skipped_terminal"] == 0
+    assert body["errors"] == []
+    assert len(calls) == 1
+    assert calls[0]["raw_post_id"] == 1
+    assert calls[0]["force_reextract"] is True
+
+
+def test_bulk_reextract_pending_handles_unique_conflict_without_500(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    monkeypatch.setenv("ENV", "local")
+    for raw_post_id in (1, 2):
+        fake_db.seed(
+            RawPost(
+                id=raw_post_id,
+                platform="x",
+                author_handle="alice",
+                external_id=f"pending-{raw_post_id}",
+                url=f"https://x.com/alice/status/pending-{raw_post_id}",
+                content_text=f"pending {raw_post_id}",
+                posted_at=now,
+                fetched_at=now,
+                raw_json=None,
+                review_status=ReviewStatus.unreviewed,
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=700 + raw_post_id,
+                raw_post_id=raw_post_id,
+                status=ExtractionStatus.pending,
+                extracted_json={"summary": "old pending", "asset_views": []},
+                model_name="gpt-4o-mini",
+                extractor_name="openai_structured",
+                last_error=None,
+                created_at=now,
+            )
+        )
+
+    rollback_calls = {"n": 0}
+
+    async def tracked_rollback() -> None:
+        rollback_calls["n"] += 1
+        return None
+
+    fake_db.rollback = tracked_rollback  # type: ignore[method-assign]
+
+    async def fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        if raw_post.id == 1:
+            raise IntegrityError(
+                "insert into post_extractions ...",
+                {},
+                Exception('duplicate key value violates unique constraint "uq_post_extractions_active_raw_post_id"'),
+            )
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "ok", "asset_views": [], "meta": {}},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+        )
+        db.add(extraction)
+        await db.flush()
+        return extraction
+
+    monkeypatch.setattr("main.create_pending_extraction", fake_create_pending_extraction)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/admin/extractions/reextract-pending?confirm=YES")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scanned"] == 2
+    assert body["created"] == 1
+    assert body["conflict_count"] == 1
+    assert len(body["errors"]) == 1
+    assert rollback_calls["n"] >= 1
+
+
+def test_bulk_reextract_pending_is_idempotent_under_double_call(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    monkeypatch.setenv("ENV", "local")
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    for raw_post_id in (1, 2):
+        fake_db.seed(
+            RawPost(
+                id=raw_post_id,
+                platform="x",
+                author_handle="alice",
+                external_id=f"idempotent-{raw_post_id}",
+                url=f"https://x.com/alice/status/idempotent-{raw_post_id}",
+                content_text="idempotent pending",
+                posted_at=now,
+                fetched_at=now,
+                raw_json=None,
+                review_status=ReviewStatus.unreviewed,
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=800 + raw_post_id,
+                raw_post_id=raw_post_id,
+                status=ExtractionStatus.pending,
+                extracted_json={"summary": "old pending", "asset_views": []},
+                model_name="gpt-4o-mini",
+                extractor_name="openai_structured",
+                last_error=None,
+                created_at=now,
+            )
+        )
+
+    def fake_extract(self, raw_post: RawPost):  # noqa: ANN001
+        return {
+            "assets": [{"symbol": "BTC", "market": "CRYPTO"}],
+            "stance": "bear",
+            "horizon": "1w",
+            "confidence": 30,
+            "summary": "auto reject to become terminal",
+            "source_url": raw_post.url,
+            "as_of": "2026-02-26",
+            "event_tags": [],
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "stance": "bear",
+                    "horizon": "1w",
+                    "confidence": 30,
+                    "summary": "reject",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    first = client.post("/admin/extractions/reextract-pending?confirm=YES")
+    second = client.post("/admin/extractions/reextract-pending?confirm=YES")
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["created"] == 2
+    assert second_body["created"] == 0
+    assert second_body["skipped_terminal"] >= 2
+
+    for raw_post_id in (1, 2):
+        active_rows = [
+            row
+            for row in fake_db._data[PostExtraction].values()
+            if row.raw_post_id == raw_post_id and row.status == ExtractionStatus.pending and not (row.last_error or "").strip()
+        ]
+        assert len(active_rows) <= 1
+
+
 def test_retry_failed_retries_only_failed_and_respects_limit(monkeypatch) -> None:  # noqa: ANN001
     fake_db = FakeAsyncSession()
     now = datetime.now(UTC)
@@ -2014,7 +2316,7 @@ def test_import_kol_binding_with_kol_id_and_case_insensitive_match() -> None:
     assert "k3" not in by_external
 
 
-def test_convert_endpoint_export_json_with_date_filter_and_kol_binding() -> None:
+def test_convert_endpoint_export_json_with_date_filter() -> None:
     client = TestClient(app)
     payload = {
         "tweets": [
@@ -2033,7 +2335,7 @@ def test_convert_endpoint_export_json_with_date_filter_and_kol_binding() -> None
         ]
     }
     response = client.post(
-        "/ingest/x/convert?filename=export.json&author_handle=qinbafrank&kol_id=123&start_date=2026-02-19&end_date=2026-02-23",
+        "/ingest/x/convert?filename=export.json&start_date=2026-02-19&end_date=2026-02-23",
         content=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
@@ -2044,8 +2346,8 @@ def test_convert_endpoint_export_json_with_date_filter_and_kol_binding() -> None
     assert body["converted_failed"] == 1
     assert len(body["items"]) == 1
     assert body["items"][0]["external_id"] == "3001"
-    assert body["items"][0]["author_handle"] == "qinbafrank"
-    assert body["items"][0]["kol_id"] == 123
+    assert body["items"][0]["author_handle"] == "raw_handle"
+    assert body["items"][0]["kol_id"] is None
     assert body["items"][0]["content_text"] == "inside range"
     assert body["items"][0]["posted_at"] == "2026-02-20T10:00:00Z"
     assert "out of range" in body["errors"][0]["reason"]

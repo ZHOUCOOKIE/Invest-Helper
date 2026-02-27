@@ -1,8 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type RawPost = {
   id: number;
@@ -76,6 +75,24 @@ type RefreshWrongJsonResponse = {
   updated_ids: number[];
 };
 
+type ReextractPendingResponse = {
+  scanned: number;
+  created: number;
+  triggered: number;
+  conflict_count: number;
+  succeeded_parse: number;
+  failed_parse: number;
+  auto_approved: number;
+  auto_rejected: number;
+  noneany_rejected: number;
+  skipped_terminal: number;
+  errors: Array<{
+    extraction_id: number | null;
+    raw_post_id: number | null;
+    error: string;
+  }>;
+};
+
 const PAGE_SIZE = 20;
 const statusOptions: ExtractionFilterStatus[] = ["all", "pending", "approved", "rejected"];
 
@@ -142,30 +159,40 @@ function getInitialStatus(searchStatus: string | null): ExtractionFilterStatus {
 }
 
 export default function ExtractionsPage() {
-  const searchParams = useSearchParams();
-  const initialStatus = getInitialStatus(searchParams.get("status"));
-  const initialQ = searchParams.get("q") ?? "";
-  const initialBadOnly = searchParams.get("bad_only") === "true";
-  const [status, setStatus] = useState<ExtractionFilterStatus>(initialStatus);
-  const [q, setQ] = useState(initialQ);
-  const [badOnly, setBadOnly] = useState(initialBadOnly);
+  const [searchReady, setSearchReady] = useState(false);
+  const [status, setStatus] = useState<ExtractionFilterStatus>("all");
+  const [q, setQ] = useState("");
+  const [badOnly, setBadOnly] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [offset, setOffset] = useState(0);
   const [items, setItems] = useState<Extraction[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(searchParams.get("msg"));
+  const [message, setMessage] = useState<string | null>(null);
   const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
   const [progress, setProgress] = useState<XProgress | null>(null);
   const [backfillBusy, setBackfillBusy] = useState(false);
   const [backfillResult, setBackfillResult] = useState<BackfillAutoReviewResponse | null>(null);
   const [stats, setStats] = useState<ExtractionsStats | null>(null);
   const [refreshWrongBusy, setRefreshWrongBusy] = useState(false);
+  const [reextractPendingBusy, setReextractPendingBusy] = useState(false);
   const requestSeqRef = useRef(0);
 
   const canPrev = useMemo(() => offset > 0, [offset]);
   const canNext = useMemo(() => items.length === PAGE_SIZE, [items.length]);
 
-  const load = async () => {
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setStatus(getInitialStatus(params.get("status")));
+    setQ(params.get("q") ?? "");
+    setBadOnly(params.get("bad_only") === "true");
+    setShowHistory(params.get("show_history") === "true");
+    setMessage(params.get("msg"));
+    setSearchReady(true);
+  }, []);
+
+  const load = useCallback(async () => {
+    if (!searchReady) return;
     const requestSeq = requestSeqRef.current + 1;
     requestSeqRef.current = requestSeq;
     setLoading(true);
@@ -177,6 +204,7 @@ export default function ExtractionsPage() {
         offset: String(offset),
         q: q.trim(),
         bad_only: badOnly ? "true" : "false",
+        show_history: showHistory ? "true" : "false",
       });
       const res = await fetch(`/api/extractions?${params.toString()}`, {
         cache: "no-store",
@@ -203,37 +231,43 @@ export default function ExtractionsPage() {
         setLoading(false);
       }
     }
-  };
+  }, [badOnly, offset, q, searchReady, showHistory, status]);
 
   useEffect(() => {
     void load();
-  }, [status, offset, q, badOnly]);
+  }, [load]);
 
-  const refreshStats = async () => {
+  const refreshStats = useCallback(async () => {
     const res = await fetch("/api/extractions/stats", { cache: "no-store" });
     const body = (await res.json()) as ExtractionsStats | { detail?: string };
     if (!res.ok) {
       throw new Error("detail" in body ? (body.detail ?? "Load stats failed") : "Load stats failed");
     }
     setStats(body as ExtractionsStats);
-  };
+  }, []);
 
-  const refreshProgress = async () => {
+  const refreshProgress = useCallback(async () => {
     const res = await fetch("/api/ingest/x/progress", { cache: "no-store" });
     const body = (await res.json()) as XProgress | { detail?: string };
     if (!res.ok) {
       throw new Error("detail" in body ? (body.detail ?? "Load progress failed") : "Load progress failed");
     }
     setProgress(body as XProgress);
-  };
-
-  useEffect(() => {
-    void refreshProgress();
-    void refreshStats();
   }, []);
 
+  useEffect(() => {
+    const loadAux = async () => {
+      try {
+        await Promise.all([refreshProgress(), refreshStats()]);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Load progress/stats failed");
+      }
+    };
+    void loadAux();
+  }, [refreshProgress, refreshStats]);
+
   const rejectInline = async (extractionId: number) => {
-    const reason = window.prompt("Reject reason (optional):", "") ?? "";
+    const reason = window.prompt("拒绝原因（可选）：", "") ?? "";
     setError(null);
     setMessage(null);
     try {
@@ -250,6 +284,45 @@ export default function ExtractionsPage() {
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Reject failed");
+    }
+  };
+
+  const reextractAllPendingForce = async () => {
+    const confirmText = window.prompt("将强制重试所有待审核记录并生成新 extraction。输入 YES 继续：", "");
+    if (confirmText !== "YES") return;
+    setReextractPendingBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/admin/extractions/reextract-pending?confirm=YES", { method: "POST" });
+      const rawText = await res.text();
+      let body: ReextractPendingResponse | { detail?: string } | null = null;
+      try {
+        body = rawText ? (JSON.parse(rawText) as ReextractPendingResponse | { detail?: string }) : null;
+      } catch {
+        body = null;
+      }
+      if (!res.ok) {
+        const detail =
+          body && typeof body === "object" && "detail" in body
+            ? (body.detail ?? "重试待审核失败")
+            : (rawText || `HTTP ${res.status}`).slice(0, 200);
+        throw new Error(detail);
+      }
+      const done = body as ReextractPendingResponse;
+      const shouldReloadNow = offset === 0;
+      setOffset(0);
+      setMessage(
+        `已完成：scanned=${done.scanned}, approved=${done.auto_approved}, rejected=${done.auto_rejected}, failed_parse=${done.failed_parse}, noneany_rejected=${done.noneany_rejected}, conflict=${done.conflict_count}.`,
+      );
+      await Promise.all([refreshProgress(), refreshStats()]);
+      if (shouldReloadNow) {
+        await load();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重试待审核失败");
+    } finally {
+      setReextractPendingBusy(false);
     }
   };
 
@@ -342,9 +415,9 @@ export default function ExtractionsPage() {
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
-      <h1>Extractions Review</h1>
+      <h1>Extraction 审核</h1>
       <p>
-        默认展示 pending，可切换状态；Approve 进入详情页，Reject 可直接操作。
+        默认仅展示每个 raw_post 最新 extraction；开启 history 才会显示历史版本。auto-review 阈值=70，手动 force re-extract 默认进入待人工审核。
       </p>
 
       <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "12px", flexWrap: "wrap" }}>
@@ -386,18 +459,36 @@ export default function ExtractionsPage() {
               setOffset(0);
             }}
           />{" "}
-          Show bad only
+          仅显示异常
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={showHistory}
+            onChange={(event) => {
+              setShowHistory(event.target.checked);
+              setOffset(0);
+            }}
+          />{" "}
+          显示历史版本
         </label>
         <button type="button" onClick={() => void load()} disabled={loading}>
-          {loading ? "Loading..." : "Refresh"}
+          {loading ? "加载中..." : "刷新"}
         </button>
         <button type="button" onClick={() => void refreshStats()} disabled={loading}>
-          Refresh Stats
+          刷新统计
         </button>
         {status === "pending" && (
           <>
+            <button
+              type="button"
+              onClick={() => void reextractAllPendingForce()}
+              disabled={loading || reextractPendingBusy}
+            >
+              {reextractPendingBusy ? "执行中..." : "重试所有待审核（强制）"}
+            </button>
             <button type="button" onClick={() => void backfillAutoReview()} disabled={loading || backfillBusy}>
-              {backfillBusy ? "Running..." : "Backfill Auto Review (confidence rule)"}
+              {backfillBusy ? "执行中..." : "回填自动审核（置信度规则）"}
             </button>
             <label>
               <input
@@ -405,13 +496,13 @@ export default function ExtractionsPage() {
                 checked={clearAlsoDeleteRawPosts}
                 onChange={(event) => setClearAlsoDeleteRawPosts(event.target.checked)}
               />{" "}
-              also delete raw posts
+              同时删除 raw posts
             </label>
             <button type="button" onClick={() => void clearPending()} disabled={loading}>
-              Clear Pending (Delete)
+              清空待处理（删除）
             </button>
             <button type="button" onClick={() => void refreshWrongExtractedJson()} disabled={loading || refreshWrongBusy}>
-              {refreshWrongBusy ? "Running..." : "Refresh Wrong Extracted JSON"}
+              {refreshWrongBusy ? "执行中..." : "刷新错误 extracted_json"}
             </button>
           </>
         )}
@@ -451,7 +542,7 @@ export default function ExtractionsPage() {
         </div>
       )}
 
-      {!loading && items.length === 0 && <p>No extractions.</p>}
+      {!loading && items.length === 0 && <p>暂无 extraction。</p>}
 
       <div style={{ display: "grid", gap: "10px" }}>
         {items.map((item, idx) => {
@@ -483,9 +574,9 @@ export default function ExtractionsPage() {
                 </div>
               )}
               <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                <Link href={`/extractions/${item.id}`}>Approve</Link>
+                <Link href={`/extractions/${item.id}`}>通过</Link>
                 <button type="button" onClick={() => void rejectInline(item.id)} disabled={item.status !== "pending"}>
-                  Reject
+                  拒绝
                 </button>
               </div>
             </article>
@@ -499,10 +590,10 @@ export default function ExtractionsPage() {
           onClick={() => setOffset((prev) => Math.max(0, prev - PAGE_SIZE))}
           disabled={!canPrev || loading}
         >
-          Prev
+          上一页
         </button>
         <button type="button" onClick={() => setOffset((prev) => prev + PAGE_SIZE)} disabled={!canNext || loading}>
-          Next
+          下一页
         </button>
         <small>offset={offset}</small>
       </div>

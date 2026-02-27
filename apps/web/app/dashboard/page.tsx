@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type DashboardAssetLatestView = {
   kol_view_id: number;
@@ -88,7 +88,7 @@ export default function DashboardPage() {
   const [showAllAssets, setShowAllAssets] = useState(false);
   const todayDigestDate = new Date().toISOString().slice(0, 10);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -115,11 +115,11 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [clarityWindow, showAllAssets, windowKey]);
 
   useEffect(() => {
     void load();
-  }, [clarityWindow, windowKey, showAllAssets]);
+  }, [load]);
 
   const visibleAssets = useMemo(() => {
     const assets = data?.assets ?? [];

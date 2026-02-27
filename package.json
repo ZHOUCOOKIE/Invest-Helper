@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "bash -lc './scripts/test_api.sh && cd apps/web && node --test tests/timeline-layout.test.mjs'",
+    "test:api": "bash -lc './scripts/test_api.sh'",
+    "test:web": "bash -lc 'cd apps/web && node --test tests/timeline-layout.test.mjs'",
+    "lint": "bash -lc 'cd apps/web && pnpm lint'"
   },
   "keywords": [],
   "author": "",

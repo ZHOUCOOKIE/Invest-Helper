@@ -26,13 +26,6 @@ TL;DR
 - `docs/DOC_AUDIT.md`（Authoritative）
   - 文档合并审计与决策记录。
 
-## Local Runbook Compatibility
-
-- `RUNBOOK_LOCAL.example.txt`（Stub, tracked）
-- `RUNBOOK_LOCAL.txt`（Local private note, gitignored）
-
-以上路径仅为兼容历史用法，权威内容已合并到 `docs/RUNBOOK.md`。
-
 ## Additional References
 
 - `docs/PROMPT_AND_FLOW_REASONING_ZH.md`（Reference）

@@ -4,7 +4,6 @@ Authoritative
 
 TL;DR
 - 本文是本地运行与回放的唯一权威操作手册。
-- 兼容旧路径的 `RUNBOOK_LOCAL*.txt` 已合并到本文件。
 - 开发测试与验收命令请使用 `docs/DEV_WORKFLOW.md`。
 
 ## Preconditions

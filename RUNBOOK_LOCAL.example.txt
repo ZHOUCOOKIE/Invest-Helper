@@ -1,7 +1,0 @@
-InvestPulse Local Runbook Example (Stub)
-
-This compatibility example is deprecated as a source of truth.
-Authoritative run instructions are in:
-- docs/RUNBOOK.md
-
-Keep this file only for legacy references.

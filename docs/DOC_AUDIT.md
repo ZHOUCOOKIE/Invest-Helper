@@ -3,7 +3,7 @@
 Authoritative
 
 TL;DR
-- 本次审计目标：把重复文档收敛为更少的 SSOT 文档，保留历史路径兼容。
+- 本次审计目标：把重复文档收敛为更少的 SSOT 文档，并删除确认冗余文档。
 - 合并日期：2026-02-27。
 - 合并后 `README/AGENTS/RUNBOOK/DEV_WORKFLOW/API` 不再各自维护重复流程。
 
@@ -11,8 +11,8 @@ TL;DR
 
 | Source | Action | SSOT Target | Reason |
 |---|---|---|---|
-| `RUNBOOK_LOCAL.txt` | Kept local-only (gitignored) | `docs/RUNBOOK.md` | 仓库安全策略禁止提交该文件，避免敏感内容入库 |
-| `RUNBOOK_LOCAL.example.txt` | Retained as stub | `docs/RUNBOOK.md` | 保留示例文件路径，避免引用失效 |
+| `RUNBOOK_LOCAL.example.txt` | Deleted | `docs/RUNBOOK.md` | 与 `docs/RUNBOOK.md` 内容重叠且不再需要兼容 stub |
+| `repo_tree.txt` | Deleted | `docs/INDEX.md` + `AGENTS.md` | 无引用，目录导航信息已由 SSOT 文档覆盖 |
 | `README.md` quickstart details | Merged by reference | `docs/RUNBOOK.md` + `docs/DEV_WORKFLOW.md` | 避免启动/测试命令多点维护 |
 | `AGENTS.md` command duplicates | Normalized | `docs/INDEX.md` + SSOT docs | 消除与 runbook/workflow 的冲突风险 |
 | `docs/TRACEABILITY_AND_REPLAY.md` replay curls | De-duplicated | `docs/RUNBOOK.md` | 回放操作命令只保留一处权威版本 |
@@ -31,7 +31,7 @@ TL;DR
 
 ## Validation Performed
 
-- 全仓引用检查：`git grep -n "RUNBOOK_LOCAL"`
+- 全仓引用检查：`git grep -n "RUNBOOK_LOCAL.example.txt\|repo_tree.txt"`
 - 导航检查：`docs/INDEX.md` 包含全部 SSOT 文档路径。
 - 随机流程抽检（单一权威）：
   - 本地启动：仅 `docs/RUNBOOK.md`
@@ -42,4 +42,3 @@ TL;DR
 
 - 本次仅做文档整理与引用更新，不涉及代码重构。
 - 未实现能力继续使用 `Not Implemented` 标注，不做能力扩写。
-- `RUNBOOK_LOCAL.txt` 受仓库提交钩子保护，不作为可跟踪权威文档。

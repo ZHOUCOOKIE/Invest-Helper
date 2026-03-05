@@ -111,11 +111,11 @@ def test_keep_all_direct_mentions_when_gt_3_without_deriving_extra(monkeypatch: 
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "asset_views": [
-                {"symbol": "AAPL", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "a", "reasoning": "a"},
-                {"symbol": "TSLA", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "b", "reasoning": "b"},
-                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "c", "reasoning": "c"},
-                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "d", "reasoning": "d"},
-                {"symbol": "EUR/USD", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "e", "reasoning": "e"},
+                {"symbol": "AAPL", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "a", "reasoning": "a"},
+                {"symbol": "TSLA", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "b", "reasoning": "b"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "c", "reasoning": "c"},
+                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "d", "reasoning": "d"},
+                {"symbol": "EUR/USD", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "e", "reasoning": "e"},
                 {"symbol": "AMZN", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "x", "reasoning": "x"},
             ],
         }
@@ -133,7 +133,7 @@ def test_keep_all_direct_mentions_when_gt_3_without_deriving_extra(monkeypatch: 
     assert symbols == {"AAPL", "TSLA", "BTC", "USD/JPY", "EUR/USD"}
     assert "AMZN" not in symbols
     meta = body["extracted_json"]["meta"]
-    assert body["extracted_json"]["meta"]["asset_views_capped"] is True
+    assert body["extracted_json"]["meta"]["asset_views_capped"] is False
     assert meta["asset_views_cap_reason"] == "keep_only_direct_mentions_when_gt_3"
     assert set(meta["direct_mentioned_symbols"]) == {"AAPL", "TSLA", "BTC", "USD/JPY", "EUR/USD"}
     assert set(symbols).issubset(set(meta["direct_mentioned_symbols"]))
@@ -152,10 +152,10 @@ def test_macro_post_only_keeps_representative_assets(monkeypatch: pytest.MonkeyP
                 {"symbol": "AAPL", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "a", "reasoning": "a"},
                 {"symbol": "MSFT", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "b", "reasoning": "b"},
                 {"symbol": "NVDA", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "c", "reasoning": "c"},
-                {"symbol": "SPY", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "d", "reasoning": "d"},
-                {"symbol": "GLD", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "e", "reasoning": "e"},
-                {"symbol": "BTC", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "f", "reasoning": "f"},
-                {"symbol": "ETH", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "g", "reasoning": "g"},
+                {"symbol": "SPY", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "d", "reasoning": "d"},
+                {"symbol": "GLD", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "e", "reasoning": "e"},
+                {"symbol": "BTC", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "f", "reasoning": "f"},
+                {"symbol": "ETH", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "g", "reasoning": "g"},
             ],
         }
 
@@ -213,7 +213,7 @@ def test_precious_crypto_fx_symbols_can_persist_and_display(monkeypatch: pytest.
             "asset_views": [
                 {"symbol": "XAUUSD", "stance": "bull", "horizon": "1w", "confidence": 77, "summary": "gold", "reasoning": "gold"},
                 {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 71, "summary": "btc", "reasoning": "btc"},
-                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 69, "summary": "fx", "reasoning": "fx"},
+                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "fx", "reasoning": "fx"},
             ],
         }
 

@@ -190,6 +190,70 @@ def test_extract_job_happy_path_counts(monkeypatch) -> None:  # noqa: ANN001
     app.dependency_overrides.clear()
 
 
+def test_extract_batch_respects_max_concurrency(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    _seed_kol(fake_db)
+    for raw_post_id in range(1, 7):
+        _seed_raw_post(fake_db, raw_post_id=raw_post_id)
+
+    concurrency = {"in_flight": 0, "peak": 0}
+    lock = asyncio.Lock()
+
+    async def _fake_create_pending_extraction(db, raw_post, **kwargs):  # noqa: ANN001
+        async with lock:
+            concurrency["in_flight"] += 1
+            if concurrency["in_flight"] > concurrency["peak"]:
+                concurrency["peak"] = concurrency["in_flight"]
+        await asyncio.sleep(0.05)
+        extraction = PostExtraction(
+            raw_post_id=raw_post.id,
+            status=ExtractionStatus.pending,
+            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            model_name="deepseek/deepseek-v3.2",
+            extractor_name="openrouter_json_mode",
+            prompt_version="extract_v1",
+            prompt_text=None,
+            prompt_hash=None,
+            raw_model_output=None,
+            parsed_model_output=None,
+            model_latency_ms=None,
+            model_input_tokens=None,
+            model_output_tokens=None,
+            last_error=None,
+            reviewed_at=None,
+            reviewed_by=None,
+            review_note=None,
+            applied_kol_view_id=None,
+            auto_applied_count=0,
+            auto_policy=None,
+            auto_applied_kol_view_ids=None,
+            created_at=datetime.now(UTC),
+        )
+        db.add(extraction)
+        await db.flush()
+        async with lock:
+            concurrency["in_flight"] = max(0, concurrency["in_flight"] - 1)
+        return extraction
+
+    monkeypatch.setattr(main_module, "create_pending_extraction", _fake_create_pending_extraction)
+    monkeypatch.setattr(main_module, "_check_reextract_rate_limit", lambda raw_post_id: None)
+    monkeypatch.setattr(
+        main_module,
+        "_get_runtime_throttle",
+        lambda settings: {"max_concurrency": 2, "max_rpm": 100000, "batch_size": 6, "batch_sleep_ms": 0},
+    )
+    monkeypatch.setattr(main_module, "AsyncSession", FakeAsyncSession)
+    monkeypatch.setattr(main_module, "AsyncSessionLocal", lambda: _SessionCtx(fake_db))
+
+    payload = main_module.RawPostsExtractBatchRequest(raw_post_ids=[1, 2, 3, 4, 5, 6], mode="pending_or_failed")
+    result = asyncio.run(main_module._extract_raw_posts_batch_core(payload, fake_db))
+
+    assert result.success_count == 6
+    assert result.failed_count == 0
+    assert result.max_concurrency_used == 2
+    assert concurrency["peak"] <= 2
+
+
 def test_extract_job_reupload_resumes_only_failed(monkeypatch) -> None:  # noqa: ANN001
     fake_db = FakeAsyncSession()
     _seed_kol(fake_db)

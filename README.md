@@ -12,6 +12,9 @@ TL;DR
 Implemented
 - X 导入与原始帖子入库（manual/convert/import/following/retry）。
 - 抽取与审核流程（single/batch/async jobs，approve/reject/re-extract）。
+- OpenRouter 抽取默认模型：`deepseek/deepseek-v3.2`（可被环境变量 `OPENAI_MODEL` 覆盖）。
+- Prompt 限制已在代码 enforce：JSON-only 输出、OpenRouter `text_json` 模式、reasoning 中文检测与一次纠正重试。
+- 抽取并发与节流已在批量/异步任务生效：`max_concurrency` + `max_rpm` + `batch_size` + `batch_sleep_ms` + retry backoff。
 - Profile 规则（KOL 权重、market 过滤）。
 - 按 `profile_id + digest_date + version` 的 Digest 版本化生成与回放。
 - 证据链字段贯通 `raw_posts -> post_extractions -> kol_views -> daily_digests`。

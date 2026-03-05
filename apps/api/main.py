@@ -338,7 +338,7 @@ def _is_bad_extracted_json(extraction: PostExtraction) -> bool:
     payload = extraction.extracted_json
     if not isinstance(payload, dict):
         return True
-    required_keys = {"asset_views", "reasoning", "summary", "stance", "horizon", "confidence", "as_of"}
+    required_keys = {"asset_views", "summary", "stance", "horizon", "confidence", "as_of"}
     if not required_keys.issubset(payload.keys()):
         return True
     if not isinstance(payload.get("asset_views"), list):
@@ -357,7 +357,7 @@ def _extraction_matches_keyword(extraction: PostExtraction, keyword: str) -> boo
         extraction.last_error or "",
     ]
     if isinstance(extraction.extracted_json, dict):
-        for key in ("summary", "reasoning", "stance", "horizon", "source_url"):
+        for key in ("summary", "stance", "horizon", "source_url"):
             value = extraction.extracted_json.get(key)
             if isinstance(value, str):
                 haystack.append(value)
@@ -617,10 +617,10 @@ def _append_last_error(current: str | None, extra: str) -> str:
     return f"{current}; {extra}"
 
 
-def _detect_reasoning_language(reasoning: Any) -> str:
-    if not isinstance(reasoning, str):
+def _detect_summary_language(summary: Any) -> str:
+    if not isinstance(summary, str):
         return "zh"
-    text = reasoning.strip()
+    text = summary.strip()
     if not text:
         return "zh"
     cjk_count = len(CJK_RE.findall(text))
@@ -631,6 +631,20 @@ def _detect_reasoning_language(reasoning: Any) -> str:
         return "non_zh"
     if cjk_count <= 1 and en_word_count >= 12:
         return "non_zh"
+    return "zh"
+
+
+def _detect_extracted_summary_language(extracted_json: dict[str, Any]) -> str:
+    if _detect_summary_language(extracted_json.get("summary")) == "non_zh":
+        return "non_zh"
+    asset_views = extracted_json.get("asset_views")
+    if not isinstance(asset_views, list):
+        return "zh"
+    for item in asset_views:
+        if not isinstance(item, dict):
+            continue
+        if _detect_summary_language(item.get("summary")) == "non_zh":
+            return "non_zh"
     return "zh"
 
 
@@ -646,9 +660,9 @@ def _build_extraction_meta(
     extractor: DummyExtractor | OpenAIExtractor,
     fallback_reason: str | None,
     last_error: str | None,
-    reasoning_language: str,
-    reasoning_language_violation: bool,
-    reasoning_language_retry_used: bool,
+    summary_language: str,
+    summary_language_violation: bool,
+    summary_language_retry_used: bool,
 ) -> dict[str, Any]:
     base_meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
     safe_meta = dict(base_meta)
@@ -666,9 +680,9 @@ def _build_extraction_meta(
         safe_meta["dummy_fallback"] = True
     if last_error:
         safe_meta["parse_error"] = safe_meta.get("parse_error") or ("json" in last_error.lower() and "openai" in last_error.lower())
-    safe_meta["reasoning_language"] = reasoning_language
-    safe_meta["reasoning_language_violation"] = reasoning_language_violation
-    safe_meta["reasoning_language_retry_used"] = reasoning_language_retry_used
+    safe_meta["summary_language"] = summary_language
+    safe_meta["summary_language_violation"] = summary_language_violation
+    safe_meta["summary_language_retry_used"] = summary_language_retry_used
     return safe_meta
 
 
@@ -685,6 +699,7 @@ def _extract_openai_parse_error_meta(extractor: DummyExtractor | OpenAIExtractor
         "parse_strategy_used",
         "repaired",
         "truncated_retry_used",
+        "invalid_json_retry_used",
         "finish_reason",
         "finish_reason_best_effort",
     ):
@@ -712,6 +727,52 @@ def _is_valid_extracted_object(extracted_json: Any) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return isinstance(parsed, dict)
+
+
+def _normalize_library_entry_for_read(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    confidence_raw = value.get("confidence")
+    if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
+        confidence = 0
+    else:
+        confidence = int(max(0, min(100, round(float(confidence_raw)))))
+    tags = value.get("tags")
+    normalized_tags: list[str] = []
+    if isinstance(tags, list):
+        for item in tags:
+            if isinstance(item, str) and item.strip():
+                normalized_tags.append(item.strip().lower())
+    summary = value.get("summary")
+    normalized_summary = summary if isinstance(summary, str) and summary.strip() else None
+    return {
+        "confidence": confidence,
+        "tags": normalized_tags,
+        "summary": normalized_summary,
+    }
+
+
+def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {
+            "content_kind": "asset",
+            "library_entry": None,
+        }
+    content_kind_raw = payload.get("content_kind")
+    if isinstance(content_kind_raw, str) and content_kind_raw.strip().lower() in {"asset", "library"}:
+        content_kind = content_kind_raw.strip().lower()
+    else:
+        content_kind = "asset"
+    payload_wo_legacy_tags = {k: v for k, v in payload.items() if k != "library_tags"}
+    return {
+        **payload_wo_legacy_tags,
+        "content_kind": content_kind,
+        "library_entry": _normalize_library_entry_for_read(payload.get("library_entry")),
+    }
+
+
+def _prepare_extraction_for_read(extraction: PostExtraction) -> None:
+    extraction.extracted_json = _coerce_extracted_json_for_read(extraction.extracted_json)
 
 
 def _unwrap_extracted_json_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -750,10 +811,13 @@ def classify_extraction_state(
 
     meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json, dict) else None
     parse_error = bool(meta.get("parse_error")) if isinstance(meta, dict) else False
+    parse_error_reason = meta.get("parse_error_reason") if isinstance(meta, dict) else None
     dummy_fallback = bool(meta.get("dummy_fallback")) if isinstance(meta, dict) else False
     has_last_error = bool((extraction.last_error or "").strip())
     is_dummy = (extraction.extractor_name or "").strip().lower() == "dummy"
     if has_last_error or parse_error or dummy_fallback or is_dummy:
+        return ClassifiedExtractionState.failed
+    if parse_error_reason in {"truncated_output", "invalid_json"}:
         return ClassifiedExtractionState.failed
 
     if _is_valid_extracted_object(extraction.extracted_json):
@@ -798,10 +862,14 @@ def _has_non_empty_assets(extraction: PostExtraction | None) -> bool:
         return False
     for item in assets:
         if isinstance(item, str) and item.strip():
+            if item.strip().lower() == "noneany":
+                continue
             return True
         if isinstance(item, dict):
             symbol = item.get("symbol")
             if isinstance(symbol, str) and symbol.strip():
+                if symbol.strip().lower() == "noneany":
+                    continue
                 return True
     return False
 
@@ -1638,7 +1706,6 @@ def _iter_asset_view_candidates(extracted_json: dict[str, Any]) -> list[dict[str
         if not isinstance(confidence_raw, (int, float)):
             continue
         confidence = int(max(0, min(100, round(float(confidence_raw)))))
-        reasoning = item.get("reasoning") if isinstance(item.get("reasoning"), str) else None
         summary = item.get("summary") if isinstance(item.get("summary"), str) else None
         candidates.append(
             {
@@ -1646,7 +1713,6 @@ def _iter_asset_view_candidates(extracted_json: dict[str, Any]) -> list[dict[str
                 "stance": stance,
                 "horizon": horizon,
                 "confidence": confidence,
-                "reasoning": reasoning,
                 "summary": summary,
             }
         )
@@ -1733,7 +1799,7 @@ async def _auto_apply_extraction_views(
             symbol=item["symbol"],
             market=_infer_auto_market(raw_post, item["symbol"]),
         )
-        summary = (item.get("summary") or item.get("reasoning") or extraction.extracted_json.get("summary") or "").strip()
+        summary = (item.get("summary") or extraction.extracted_json.get("summary") or "").strip()
         if not summary:
             summary = f"{item['symbol']} {item['stance']} ({item['horizon']})"
         source_url = (extraction.extracted_json.get("source_url") or raw_post.url or "").strip()
@@ -1912,13 +1978,40 @@ def _coerce_extraction_confidence(extracted_json: dict[str, Any]) -> int | None:
     return int(max(0, min(100, round(float(confidence_raw)))))
 
 
+def _coerce_library_entry_confidence(extracted_json: dict[str, Any]) -> int | None:
+    library_entry = extracted_json.get("library_entry")
+    if not isinstance(library_entry, dict):
+        return None
+    confidence_raw = library_entry.get("confidence")
+    if not isinstance(confidence_raw, (int, float)):
+        return None
+    return int(max(0, min(100, round(float(confidence_raw)))))
+
+
 def _has_noneany_assets(extracted_json: dict[str, Any]) -> bool:
     assets = extracted_json.get("assets")
     if not isinstance(assets, list):
         return False
     for item in assets:
-        if isinstance(item, str) and item == "NoneAny":
+        if isinstance(item, str) and item.strip().lower() == "noneany":
             return True
+        if isinstance(item, dict):
+            symbol = item.get("symbol")
+            if isinstance(symbol, str) and symbol.strip().lower() == "noneany":
+                return True
+    return False
+
+
+def _is_noneany_only_assets(extracted_json: dict[str, Any]) -> bool:
+    assets = extracted_json.get("assets")
+    if not isinstance(assets, list) or len(assets) != 1:
+        return False
+    item = assets[0]
+    if isinstance(item, dict):
+        symbol = item.get("symbol")
+        return isinstance(symbol, str) and symbol.strip().lower() == "noneany"
+    if isinstance(item, str):
+        return item.strip().lower() == "noneany"
     return False
 
 
@@ -1934,8 +2027,10 @@ async def postprocess_auto_review(
         return None
     if not isinstance(extraction.extracted_json, dict):
         return None
+    content_kind = str(extraction.extracted_json.get("content_kind") or "asset").strip().lower()
     noneany_detected = _has_noneany_assets(extraction.extracted_json)
-    if noneany_detected:
+    noneany_only = _is_noneany_only_assets(extraction.extracted_json)
+    if noneany_detected and content_kind == "asset" and noneany_only:
         base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
         reviewed_at = datetime.now(UTC)
         extraction.extracted_json = {
@@ -1946,6 +2041,8 @@ async def postprocess_auto_review(
                 "auto_review_reason": "no_investment_asset_noneany",
                 "noneany_detected": True,
                 "auto_reject_reason": "no_investment_asset_noneany",
+                "noneany_only": True,
+                "auto_policy_applied": "noneany_asset_forced_reject",
             },
         }
         extraction.status = ExtractionStatus.rejected
@@ -1957,16 +2054,28 @@ async def postprocess_auto_review(
         raw_post.reviewed_at = reviewed_at
         return "rejected"
     if trigger not in {"auto", "bulk"}:
+        base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
+        extraction.extracted_json = {
+            **extraction.extracted_json,
+            "meta": {
+                **base_meta,
+                "auto_policy_applied": "no_auto_review_user_trigger",
+            },
+        }
         return None
-    if not _has_reviewable_asset_views(extraction):
+    if content_kind == "asset" and not _has_reviewable_asset_views(extraction):
         return None
-    model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
+    if content_kind == "library":
+        model_confidence = _coerce_library_entry_confidence(extraction.extracted_json)
+    else:
+        model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
     if model_confidence is None:
         return None
 
     base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
     reviewed_at = datetime.now(UTC)
     if model_confidence < threshold:
+        threshold_policy = "threshold_library" if content_kind == "library" else "threshold_asset"
         extraction.extracted_json = {
             **extraction.extracted_json,
             "meta": {
@@ -1977,6 +2086,7 @@ async def postprocess_auto_review(
                 "model_confidence": model_confidence,
                 "auto_reject_reason": "confidence_below_threshold",
                 "auto_reject_threshold": threshold,
+                "auto_policy_applied": threshold_policy,
             },
         }
         extraction.status = ExtractionStatus.rejected
@@ -1988,6 +2098,7 @@ async def postprocess_auto_review(
         raw_post.reviewed_at = reviewed_at
         return "rejected"
 
+    threshold_policy = "threshold_library" if content_kind == "library" else "threshold_asset"
     extraction.extracted_json = {
         **extraction.extracted_json,
         "meta": {
@@ -1996,6 +2107,7 @@ async def postprocess_auto_review(
             "auto_review_threshold": threshold,
             "auto_review_reason": "confidence_at_or_above_threshold",
             "model_confidence": model_confidence,
+            "auto_policy_applied": threshold_policy,
         },
     }
     await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post, force_apply=True)
@@ -2038,9 +2150,7 @@ async def _apply_model_output_to_extraction(
                 parsed_payload = parsed_raw
     if isinstance(parsed_payload, dict):
         parsed_payload, _ = _unwrap_extracted_json_payload(parsed_payload)
-        raw_extracted_json = parsed_payload.copy()
     else:
-        raw_extracted_json = {}
         parsed_payload = default_extracted_json(extraction_input)
 
     extracted_json = normalize_extracted_json(
@@ -2056,18 +2166,10 @@ async def _apply_model_output_to_extraction(
         alias_to_symbol=alias_to_symbol,
         known_symbols=known_symbols,
     )
-    raw_horizon = raw_extracted_json.get("horizon")
-    if isinstance(raw_horizon, str) and raw_horizon not in {"intraday", "1w", "1m", "3m", "1y"}:
-        extracted_json["horizon"] = "1w"
-        extracted_json["meta"] = {
-            **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
-            "horizon_coerced": True,
-            "horizon_original": raw_horizon,
-            "horizon_final": "1w",
-            "horizon_coerce_reason": "invalid_horizon_enum",
-        }
-    elif isinstance(extracted_json.get("meta"), dict):
-        extracted_json["meta"].setdefault("horizon_coerced", False)
+    extracted_meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
+    if extracted_meta.get("noneany_mixed_with_symbols"):
+        prior_error = audit_meta.get("last_error") if isinstance(audit_meta.get("last_error"), str) else None
+        audit_meta["last_error"] = _append_last_error(prior_error, "noneany_mixed_with_symbols")
 
     extracted_json["meta"] = {
         **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
@@ -2094,6 +2196,7 @@ async def _apply_model_output_to_extraction(
     extraction.raw_model_output = raw_model_output
     extraction.parsed_model_output = parsed_payload
     extraction.last_error = audit_meta.get("last_error") if isinstance(audit_meta.get("last_error"), str) else None
+    await db.flush()
 
     await ensure_assets_from_extracted_json(
         db,
@@ -2274,9 +2377,9 @@ async def create_pending_extraction(
     budget_exhausted = False
     fallback_reason: str | None = None
     force_fail_reason: str | None = None
-    reasoning_language = "zh"
-    reasoning_language_violation = False
-    reasoning_language_retry_used = False
+    summary_language = "zh"
+    summary_language_violation = False
+    summary_language_retry_used = False
     allow_dummy_fallback = bool(settings.dummy_fallback) or settings.extractor_mode.strip().lower() == "dummy"
 
     runtime_budget_total = (
@@ -2328,13 +2431,14 @@ async def create_pending_extraction(
     if not isinstance(extracted_json, dict):
         extracted_json = default_extracted_json(extraction_input)
     parsed_for_apply = extracted_json.copy()
-    reasoning_language = _detect_reasoning_language(extracted_json.get("reasoning"))
-    reasoning_language_violation = reasoning_language == "non_zh"
+    summary_language = _detect_extracted_summary_language(extracted_json)
+    summary_language_violation = summary_language == "non_zh"
     parse_error_meta = _extract_openai_parse_error_meta(extractor)
     truncated_retry_used = bool(parse_error_meta.get("truncated_retry_used"))
-    if reasoning_language_violation and force_fail_reason is None and isinstance(extractor, OpenAIExtractor):
-        if truncated_retry_used:
-            last_error = _append_last_error(last_error, "reasoning_language_violation_no_retry_budget_after_truncated_retry")
+    invalid_json_retry_used = bool(parse_error_meta.get("invalid_json_retry_used"))
+    if summary_language_violation and force_fail_reason is None and isinstance(extractor, OpenAIExtractor):
+        if truncated_retry_used or invalid_json_retry_used:
+            last_error = _append_last_error(last_error, "summary_language_violation_no_retry_budget_after_parse_retry")
         else:
             retry_call_allowed = False
             if openai_call_limiter is not None:
@@ -2345,8 +2449,8 @@ async def create_pending_extraction(
                     budget_total=runtime_budget_total,
                 )
             if retry_call_allowed:
-                reasoning_language_retry_used = True
-                extractor.set_reasoning_language_retry_hint(True)
+                summary_language_retry_used = True
+                extractor.set_summary_language_retry_hint(True)
                 try:
                     extracted_json_retry = await _run_extractor_extract(extractor, extraction_input)
                     if isinstance(extracted_json_retry, dict):
@@ -2361,18 +2465,18 @@ async def create_pending_extraction(
                         known_symbols=known_symbols,
                     )
                     parsed_for_apply = extracted_json.copy()
-                    reasoning_language = _detect_reasoning_language(extracted_json.get("reasoning"))
-                    reasoning_language_violation = reasoning_language == "non_zh"
-                    if reasoning_language_violation:
-                        last_error = _append_last_error(last_error, "reasoning_language_violation_after_retry")
+                    summary_language = _detect_extracted_summary_language(extracted_json)
+                    summary_language_violation = summary_language == "non_zh"
+                    if summary_language_violation:
+                        last_error = _append_last_error(last_error, "summary_language_violation_after_retry")
                 except Exception as retry_exc:  # noqa: BLE001
-                    last_error = _append_last_error(last_error, f"reasoning_language_retry_failed: {_build_last_error(retry_exc)}")
+                    last_error = _append_last_error(last_error, f"summary_language_retry_failed: {_build_last_error(retry_exc)}")
                 finally:
-                    extractor.set_reasoning_language_retry_hint(False)
+                    extractor.set_summary_language_retry_hint(False)
             else:
-                no_retry_budget_reason = "reasoning_language_violation_no_retry_budget"
+                no_retry_budget_reason = "summary_language_violation_no_retry_budget"
                 if openai_call_limiter is not None:
-                    no_retry_budget_reason = "reasoning_language_violation_no_retry_import_limit"
+                    no_retry_budget_reason = "summary_language_violation_no_retry_import_limit"
                 last_error = _append_last_error(last_error, no_retry_budget_reason)
 
     parse_error_meta = _extract_openai_parse_error_meta(extractor)
@@ -2381,9 +2485,9 @@ async def create_pending_extraction(
         extractor=extractor,
         fallback_reason=fallback_reason,
         last_error=last_error,
-        reasoning_language=reasoning_language,
-        reasoning_language_violation=reasoning_language_violation,
-        reasoning_language_retry_used=reasoning_language_retry_used,
+        summary_language=summary_language,
+        summary_language_violation=summary_language_violation,
+        summary_language_retry_used=summary_language_retry_used,
     )
     if parse_error_meta:
         extraction_meta = {
@@ -2394,7 +2498,7 @@ async def create_pending_extraction(
         **extraction_meta,
         # Additional retry budget is capped at one extra model call after the first attempt.
         "extra_retry_budget_total": 1,
-        "extra_retry_budget_used": 1 if (reasoning_language_retry_used or truncated_retry_used) else 0,
+        "extra_retry_budget_used": 1 if (summary_language_retry_used or truncated_retry_used or invalid_json_retry_used) else 0,
     }
 
     if truncation_meta:
@@ -5485,6 +5589,7 @@ async def list_extractions(
         items = [item for item in items if _is_bad_extracted_json(item)]
     items = items[offset : offset + limit]
     for extraction in items:
+        _prepare_extraction_for_read(extraction)
         _attach_extraction_auto_approve_settings(extraction)
     return items
 
@@ -5553,10 +5658,8 @@ async def refresh_wrong_extracted_json(
                     "stance": view.stance.value if hasattr(view.stance, "value") else str(view.stance),
                     "horizon": view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon),
                     "confidence": int(view.confidence),
-                    "reasoning": None,
                     "summary": view.summary,
                     "as_of": view.as_of.isoformat() if view.as_of else None,
-                    "drivers": [],
                 }
             )
 
@@ -5665,6 +5768,7 @@ async def get_extraction(extraction_id: int, db: AsyncSession = Depends(get_db))
     extraction = result.scalar_one_or_none()
     if extraction is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction not found")
+    _prepare_extraction_for_read(extraction)
     await _attach_auto_applied_metadata(db, extraction)
     _attach_extraction_auto_approve_settings(extraction)
     return extraction

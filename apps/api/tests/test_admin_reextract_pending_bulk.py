@@ -156,7 +156,8 @@ def test_bulk_retry_pending_runs_auto_review_threshold(monkeypatch: pytest.Monke
     assert response.status_code == 200
     body = response.json()
     assert body["auto_approved"] == 1
-    assert body["auto_rejected"] == 1
+    assert body["auto_rejected"] == 0
+    assert body["noneany_rejected"] == 1
 
     latest_1 = _latest_extraction_for_raw_post(fake_db, 1)
     latest_2 = _latest_extraction_for_raw_post(fake_db, 2)
@@ -190,7 +191,7 @@ def test_bulk_retry_pending_noneany_rejects_even_if_manual_rule_blocks(monkeypat
                         "symbol": "BTC",
                         "stance": "bull",
                         "horizon": "1w",
-                        "confidence": 80,
+                        "confidence": 69,
                         "summary": "would approve without noneany",
                     }
                 ],

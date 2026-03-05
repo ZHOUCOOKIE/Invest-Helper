@@ -82,10 +82,8 @@ type AssetViewItem = {
   stance: "bull" | "bear" | "neutral";
   horizon: "intraday" | "1w" | "1m" | "3m" | "1y";
   confidence: number;
-  reasoning: string | null;
   summary: string | null;
   as_of: string | null;
-  drivers: string[];
 };
 
 type ExtractorStatus = {
@@ -184,12 +182,8 @@ function pickAssetViews(extracted: Record<string, unknown>): AssetViewItem[] {
       stance: item.stance as AssetViewItem["stance"],
       horizon: item.horizon as AssetViewItem["horizon"],
       confidence: Math.max(0, Math.min(100, Math.round(item.confidence))),
-      reasoning: typeof item.reasoning === "string" ? item.reasoning : null,
       summary: typeof item.summary === "string" ? item.summary : null,
       as_of: typeof item.as_of === "string" ? item.as_of : null,
-      drivers: Array.isArray(item.drivers)
-        ? item.drivers.filter((driver): driver is string => typeof driver === "string")
-        : [],
     });
   }
   return items.sort((a, b) => b.confidence - a.confidence);
@@ -449,7 +443,7 @@ export default function ExtractionDetailPage() {
           stance: item.stance,
           horizon: item.horizon,
           confidence: item.confidence,
-          summary: (item.summary || item.reasoning || `${item.symbol} ${item.stance}`).slice(0, 1024),
+          summary: (item.summary || `${item.symbol} ${item.stance}`).slice(0, 1024),
           source_url: (form.source_url || extraction?.raw_post.url || "").trim(),
           as_of: normalizeAsOfDate(item.as_of, extractedAsOf),
         };
@@ -691,8 +685,6 @@ export default function ExtractionDetailPage() {
                       )}
                     </div>
                     <div>summary: {item.summary || "(none)"}</div>
-                    <div>reasoning: {item.reasoning || "(none)"}</div>
-                    {item.drivers.length > 0 && <div>drivers: {item.drivers.join(", ")}</div>}
                   </div>
                 ))}
               </div>
@@ -844,7 +836,7 @@ export default function ExtractionDetailPage() {
                             }}
                           />{" "}
                           {item.symbol} | {item.stance} | {item.horizon} | confidence={item.confidence} |{" "}
-                          {item.summary || item.reasoning || "(none)"}
+                          {item.summary || "(none)"}
                           {isAutoApproved && (
                             <span
                               style={{

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse"
     database_url_test: str | None = None
     openai_api_key: str = ""
-    openai_model: str = "minimax/minimax-m2.5"
+    openai_model: str = "deepseek/deepseek-v3.2"
     extractor_mode: str = "auto"
     openai_base_url: str = "https://openrouter.ai/api/v1"
     dummy_fallback: bool = False

@@ -24,11 +24,13 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const todayDigestDate = new Date().toISOString().slice(0, 10);
+
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <body className="antialiased">
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
-        <AppShell>{children}</AppShell>
+        <AppShell todayDigestDate={todayDigestDate}>{children}</AppShell>
       </body>
     </html>
   );

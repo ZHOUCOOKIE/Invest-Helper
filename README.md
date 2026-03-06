@@ -5,6 +5,10 @@
 InvestPulse is an evidence-traceable investment signal dashboard built from multi-source posts.  
 It extracts structured signals, supports review workflows, and provides Daily Digest generation/replay by `profile_id + digest_date`.
 
+## UI Preview
+
+![InvestPulse Dashboard Preview](./docs/images/dashboard-preview.png)
+
 ## Why InvestPulse
 
 - Keep signal extraction auditable with source-linked evidence.
@@ -36,8 +40,9 @@ Main routes:
 - `/ingest`
 - `/extractions`
 - `/assets`
-- `/profile`
+- `/kols`
 - `/digests/[date]`
+- `/health`
 
 ## Quick Start
 

@@ -12,37 +12,20 @@ type NavItem = {
   match: (pathname: string) => boolean;
 };
 
-function todayIsoDate(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-const NAV_ITEMS: NavItem[] = [
-  { label: "看板", href: "/dashboard", match: (pathname) => pathname.startsWith("/dashboard") },
-  { label: "导入", href: "/ingest", match: (pathname) => pathname.startsWith("/ingest") },
-  { label: "抽取审核", href: "/extractions", match: (pathname) => pathname.startsWith("/extractions") },
-  { label: "资产", href: "/assets", match: (pathname) => pathname.startsWith("/assets") },
-  { label: "KOL", href: "/kols", match: (pathname) => pathname.startsWith("/kols") },
-  { label: "日报", href: `/digests/${todayIsoDate()}`, match: (pathname) => pathname.startsWith("/digests") },
-  { label: "健康检查", href: "/health", match: (pathname) => pathname.startsWith("/health") },
-];
-
 function applyTheme(mode: ThemeMode): void {
   document.documentElement.dataset.theme = mode;
   window.localStorage.setItem("ip-theme", mode);
 }
 
-export function AppShell({ children }: { children: React.ReactNode }) {
+export function AppShell({
+  children,
+  todayDigestDate,
+}: {
+  children: React.ReactNode;
+  todayDigestDate: string;
+}) {
   const pathname = usePathname();
-  const [theme, setTheme] = useState<ThemeMode>(() => {
-    if (typeof document === "undefined") return "light";
-    const attr = document.documentElement.dataset.theme;
-    return attr === "dark" ? "dark" : "light";
-  });
   const [glow, setGlow] = useState({ x: 0, y: 0, visible: false });
-
-  useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
@@ -75,7 +58,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const navItems = useMemo(() => NAV_ITEMS, []);
+  const navItems = useMemo<NavItem[]>(
+    () => [
+      { label: "看板", href: "/dashboard", match: (path) => path.startsWith("/dashboard") },
+      { label: "导入", href: "/ingest", match: (path) => path.startsWith("/ingest") },
+      { label: "抽取审核", href: "/extractions", match: (path) => path.startsWith("/extractions") },
+      { label: "资产", href: "/assets", match: (path) => path.startsWith("/assets") },
+      { label: "KOL", href: "/kols", match: (path) => path.startsWith("/kols") },
+      { label: "日报", href: `/digests/${todayDigestDate}`, match: (path) => path.startsWith("/digests") },
+      { label: "健康检查", href: "/health", match: (path) => path.startsWith("/health") },
+    ],
+    [todayDigestDate],
+  );
 
   return (
     <div className="app-shell">
@@ -100,13 +94,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           type="button"
           className="theme-toggle"
           onClick={() => {
-            const next = theme === "light" ? "dark" : "light";
-            setTheme(next);
+            const current: ThemeMode = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+            const next = current === "light" ? "dark" : "light";
             applyTheme(next);
           }}
           aria-label="切换主题"
         >
-          {theme === "light" ? "深色" : "浅色"}
+          主题
         </button>
       </header>
       <div className="shell-content">{children}</div>

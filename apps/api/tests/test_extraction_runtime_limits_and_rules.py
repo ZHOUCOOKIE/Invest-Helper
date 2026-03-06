@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db import get_db
-from main import _extract_directly_mentioned_symbols, app, reset_runtime_counters
+from main import app, reset_runtime_counters
 from models import Asset, PostExtraction, RawPost
 from settings import get_settings
 from test_extractor_openai_and_fallback import FakeAsyncSession
@@ -55,7 +55,7 @@ def _clear_runtime():
     reset_runtime_counters()
 
 
-def test_cap_to_three_when_direct_mentions_le_3(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_keep_parsed_asset_views_when_direct_mentions_le_3(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = FakeAsyncSession()
     _seed_assets(fake_db, ["AAPL", "TSLA", "BTC", "MSFT", "NVDA"])
     _seed_raw_post(fake_db, raw_post_id=1, content_text="AAPL TSLA BTC are discussed today.")
@@ -87,21 +87,20 @@ def test_cap_to_three_when_direct_mentions_le_3(monkeypatch: pytest.MonkeyPatch)
     views = body["extracted_json"]["asset_views"]
     symbols = {item["symbol"] for item in views}
     meta = body["extracted_json"]["meta"]
-    assert len(views) == 3
-    assert symbols == {"AAPL", "TSLA", "BTC"}
-    assert meta["asset_views_capped"] is True
+    assert len(views) == 5
+    assert symbols == {"AAPL", "TSLA", "BTC", "MSFT", "NVDA"}
+    assert meta["asset_views_capped"] is False
     assert meta["asset_views_original_count"] == 5
-    assert meta["asset_views_final_count"] == 3
-    assert meta["asset_views_cap_reason"] == "direct_mentions_le_3"
-    assert set(meta["asset_views_kept_symbols"]) == {"AAPL", "TSLA", "BTC"}
-    assert set(meta["direct_mentioned_symbols"]) == {"AAPL", "TSLA", "BTC"}
+    assert meta["asset_views_final_count"] == 5
+    assert meta["asset_views_cap_reason"] is None
+    assert set(meta["asset_views_kept_symbols"]) == {"AAPL", "TSLA", "BTC", "MSFT", "NVDA"}
     assert "original_count" not in meta
     assert "final_count" not in meta
     assert "cap_reason" not in meta
     assert "kept_symbols" not in meta
 
 
-def test_keep_all_direct_mentions_when_gt_3_without_deriving_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_keep_parsed_asset_views_when_direct_mentions_gt_3(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = FakeAsyncSession()
     _seed_assets(fake_db, ["AAPL", "TSLA", "BTC", "USD/JPY", "EUR/USD", "AMZN"])
     _seed_raw_post(fake_db, raw_post_id=2, content_text="AAPL TSLA BTC USD/JPY EUR/USD all mentioned explicitly.")
@@ -134,12 +133,14 @@ def test_keep_all_direct_mentions_when_gt_3_without_deriving_extra(monkeypatch: 
     assert "AMZN" not in symbols
     meta = body["extracted_json"]["meta"]
     assert body["extracted_json"]["meta"]["asset_views_capped"] is False
-    assert meta["asset_views_cap_reason"] == "keep_only_direct_mentions_when_gt_3"
-    assert set(meta["direct_mentioned_symbols"]) == {"AAPL", "TSLA", "BTC", "USD/JPY", "EUR/USD"}
-    assert set(symbols).issubset(set(meta["direct_mentioned_symbols"]))
+    assert meta["asset_views_cap_reason"] is None
+    assert meta["asset_views_original_count"] == 5
+    assert meta["asset_views_final_count"] == 5
 
 
-def test_macro_post_only_keeps_representative_assets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_keep_parsed_asset_views_when_no_direct_mentions_even_in_macro_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake_db = FakeAsyncSession()
     _seed_assets(fake_db, ["SPY", "GLD", "BTC", "ETH", "AAPL", "MSFT", "NVDA"])
     _seed_raw_post(fake_db, raw_post_id=3, content_text="宏观风险偏好下行，加密市场和黄金更受关注。")
@@ -169,8 +170,12 @@ def test_macro_post_only_keeps_representative_assets(monkeypatch: pytest.MonkeyP
     assert response.status_code == 201
     body = response.json()
     symbols = {item["symbol"] for item in body["extracted_json"]["asset_views"]}
-    assert "AAPL" not in symbols and "MSFT" not in symbols and "NVDA" not in symbols
-    assert symbols & {"SPY", "GLD", "BTC", "ETH"}
+    assert symbols == {"SPY", "GLD", "BTC", "ETH"}
+    meta = body["extracted_json"]["meta"]
+    assert meta["asset_views_capped"] is False
+    assert meta["asset_views_original_count"] == 4
+    assert meta["asset_views_final_count"] == 4
+    assert meta["asset_views_cap_reason"] is None
 
 
 def test_keep_parsed_asset_views_when_no_direct_mentions_and_no_macro(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,27 +354,6 @@ def test_extract_batch_counters_include_capped_horizon_coerced_and_raw_truncated
     assert "kept_symbols" not in meta
     assert meta["asset_views_original_count"] == 0
     assert meta["asset_views_final_count"] == 0
-
-
-def test_direct_mentions_detection_has_no_cross_call_leakage() -> None:
-    alias_to_symbol = {"特斯拉": "TSLA", "比特币": "BTC"}
-    known_symbols = {"AAPL", "TSLA", "BTC"}
-
-    first = _extract_directly_mentioned_symbols(
-        content_text="今天看 AAPL 和 特斯拉",
-        alias_to_symbol=alias_to_symbol,
-        known_symbols=known_symbols,
-    )
-    second = _extract_directly_mentioned_symbols(
-        content_text="比特币短线波动",
-        alias_to_symbol=alias_to_symbol,
-        known_symbols=known_symbols,
-    )
-
-    assert set(first) == {"AAPL", "TSLA"}
-    assert set(second) == {"BTC"}
-    assert "AAPL" not in second
-    assert "TSLA" not in second
 
 
 def test_get_extraction_detail_returns_single_top_level_payload(monkeypatch: pytest.MonkeyPatch) -> None:

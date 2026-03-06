@@ -1306,81 +1306,9 @@ def _build_alias_to_symbol_map(aliases: list[dict[str, str]]) -> dict[str, str]:
     return mapping
 
 
-def _extract_directly_mentioned_symbols(
-    text: str = "",
-    *,
-    content_text: str | None = None,
-    alias_to_symbol: dict[str, str] | None = None,
-    known_symbols: set[str] | None = None,
-) -> list[str]:
-    source_text = content_text if content_text is not None else text
-    if not isinstance(source_text, str) or not source_text.strip():
-        return []
-
-    direct_mentions: list[str] = []
-    seen: set[str] = set()
-
-    def _push(symbol: str) -> None:
-        normalized = symbol.strip().upper()
-        if not normalized or normalized in seen:
-            return
-        seen.add(normalized)
-        direct_mentions.append(normalized)
-
-    if known_symbols:
-        normalized_known = sorted(
-            {
-                item.strip().upper()
-                for item in known_symbols
-                if isinstance(item, str) and item.strip()
-            },
-            key=len,
-            reverse=True,
-        )
-        for symbol in normalized_known:
-            if re.search(rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])", source_text, flags=re.IGNORECASE):
-                _push(symbol)
-
-    if alias_to_symbol:
-        lowered_text = source_text.lower()
-        normalized_aliases = sorted(
-            (
-                (_normalize_alias_key(alias), symbol.strip().upper())
-                for alias, symbol in alias_to_symbol.items()
-                if isinstance(alias, str) and isinstance(symbol, str) and alias.strip() and symbol.strip()
-            ),
-            key=lambda item: len(item[0]),
-            reverse=True,
-        )
-        for alias_key, symbol in normalized_aliases:
-            if alias_key and alias_key in lowered_text:
-                _push(symbol)
-
-    return direct_mentions
-
-
-def _is_macro_context_text(content_text: str) -> bool:
-    text = (content_text or "").lower()
-    macro_tokens = [
-        "macro",
-        "risk-off",
-        "risk off",
-        "risk sentiment",
-        "宏观",
-        "风险偏好",
-        "避险",
-        "通胀",
-        "收益率",
-    ]
-    return any(token in text for token in macro_tokens)
-
-
 def _cap_asset_views_for_runtime_rules(
     *,
     extracted_json: dict[str, Any],
-    raw_post: RawPost | SimpleNamespace,
-    alias_to_symbol: dict[str, str],
-    known_symbols: set[str],
 ) -> None:
     views = extracted_json.get("asset_views")
     meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
@@ -1393,41 +1321,13 @@ def _cap_asset_views_for_runtime_rules(
             "asset_views_final_count": 0,
             "asset_views_cap_reason": None,
             "asset_views_kept_symbols": [],
-            "direct_mentioned_symbols": [],
         }
         return
 
     original_count = len(views)
-    direct_mentions = _extract_directly_mentioned_symbols(
-        content_text=getattr(raw_post, "content_text", ""),
-        alias_to_symbol=alias_to_symbol,
-        known_symbols=known_symbols,
-    )
-    direct_set = set(direct_mentions)
     cap_reason: str | None = None
     capped = False
     kept_views = views
-
-    if direct_mentions:
-        kept_views = [
-            item for item in views if isinstance(item, dict) and _normalize_asset_symbol(item.get("symbol")) in direct_set
-        ]
-        if len(direct_mentions) <= 3:
-            cap_reason = "direct_mentions_le_3"
-            capped = len(kept_views) != original_count
-        else:
-            cap_reason = "keep_only_direct_mentions_when_gt_3"
-            capped = len(kept_views) != original_count
-    elif _is_macro_context_text(getattr(raw_post, "content_text", "")):
-        macro_keep = {"SPY", "GLD", "BTC", "ETH", "US10Y", "DXY", "VIX", "XAUUSD", "CL=F"}
-        macro_filtered = [
-            item for item in views if isinstance(item, dict) and _normalize_asset_symbol(item.get("symbol")) in macro_keep
-        ]
-        if macro_filtered and len(macro_filtered) != original_count:
-            kept_views = macro_filtered
-            cap_reason = "macro_keep_representative_assets"
-            capped = True
-
     final_count = len(kept_views)
     kept_symbols: list[str] = []
     for item in kept_views:
@@ -1444,7 +1344,6 @@ def _cap_asset_views_for_runtime_rules(
         "asset_views_final_count": final_count,
         "asset_views_cap_reason": cap_reason,
         "asset_views_kept_symbols": kept_symbols,
-        "direct_mentioned_symbols": direct_mentions,
     }
 
 
@@ -2109,9 +2008,6 @@ async def _apply_model_output_to_extraction(
     )
     _cap_asset_views_for_runtime_rules(
         extracted_json=extracted_json,
-        raw_post=extraction_input,
-        alias_to_symbol=alias_to_symbol,
-        known_symbols=known_symbols,
     )
     extracted_json["source_url"] = (extraction_input.url or "").strip()
     extracted_json["meta"] = {

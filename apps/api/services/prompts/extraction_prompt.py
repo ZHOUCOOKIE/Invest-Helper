@@ -40,7 +40,7 @@ JSON schema (fixed):
 "market": "string",
 "stance": "bull|bear|neutral",
 "horizon": "intraday|1w|1m|3m|1y",
-"confidence": 70,
+"confidence": 80,
 "summary": "string"
 }
 ],
@@ -63,28 +63,28 @@ hasview: must be integer 0 or 1.
 market: MUST be one of CRYPTO, STOCK, ETF, FOREX, OTHER.
 
 stance: must be one of bull, bear, neutral.
-Stance rule: Prefer the author’s explicit stance. If the post describes an event/trend and you map it to a likely impacted tradable target, infer stance only when the direction is strongly implied by the post; otherwise output neutral.
+Stance rule: Prefer the author’s explicit stance. If the post describes an event/trend and you map it to a likely impacted tradable target, infer stance only when the direction is strongly implied by the post; otherwise without a clear one-way forecast, set stance to neutral.
 
 horizon: must be one of intraday, 1w, 1m, 3m, 1y.
 Horizon rule: Prefer the author’s explicit time point / holding window / expected duration. If none is stated, choose the most reliable horizon implied by the content (nearest reasonable window).
 
 summary: MUST be Chinese (only validate summary language) and concise (avoid long explanations; keep it short).
 
-confidence: MUST be integer 70..100.
+confidence: MUST be integer 80..100.
 Meaning: confidence is your certainty that the post content meaningfully impacts or is strongly associated with THIS asset (including plausible, directly-impacted targets) given the event/trend described.
 
 85..100: clearly about a specific asset / direct event / concrete claim.
 
-70..85: broader but still likely impacts the asset meaningfully.
-If you think confidence < 70 for an asset: DO NOT output that asset at all.
+80..85: broader but still very likely impacts the asset meaningfully.
+If you think confidence < 80 for an asset: DO NOT output that asset at all.
 
 Extraction rules:
 
-You may include asset_views for (a) assets explicitly mentioned OR (b) assets that are very likely impacted by the described event/trend, as long as your confidence is >= 70.
+You may include asset_views for (a) assets explicitly mentioned OR (b) assets that are very likely impacted by the described event/trend, as long as your confidence is >= 80.
 
-If there is NO valid investable view after filtering: set hasview=0 and output asset_views as [].
+Only set hasview=1 and output an asset_views item if the post makes a real directional investment claim about that specific asset (explicitly or strongly implied).
 
-If there is at least one valid investable view: set hasview=1 and output asset_views with those items.
+Do NOT treat hypothetical examples, educational lists, illustrative content, or posts that are mainly sarcasm / moral judgment / rhetorical questions / memes as a directional investment claim. In all such cases, set hasview=0 and output asset_views: [].
 
 Symbol rules:
 

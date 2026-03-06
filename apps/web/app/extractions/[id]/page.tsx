@@ -676,7 +676,7 @@ export default function ExtractionDetailPage() {
               {reExtracting ? "重新解构中..." : "用 AI 重新解构（强制）"}
             </button>
             <p style={{ marginTop: 0, color: "#555" }}>
-              Auto-review 规则：按阈值 70 执行（&gt;=70 auto approved，&lt;70 auto rejected）；手动 force re-extract 默认进入待人工审核。
+              Auto-review 规则：`hasview=0` 自动拒绝；`hasview=1` 时按阈值 70 执行（&gt;=70 auto approved，&lt;70 auto rejected）；手动 force re-extract 默认进入待人工审核。
             </p>
             {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
             <form

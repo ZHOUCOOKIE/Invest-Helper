@@ -127,7 +127,7 @@ def _client_with_db(fake_db: FakeAsyncSession) -> TestClient:
     return TestClient(app)
 
 
-def test_generate_digest_uses_approved_latest_extraction_only() -> None:
+def test_generate_digest_uses_latest_hasview_extraction_only() -> None:
     fake_db = FakeAsyncSession()
     now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
     today = now.date()
@@ -156,7 +156,8 @@ def test_generate_digest_uses_approved_latest_extraction_only() -> None:
             status=ExtractionStatus.approved,
             extracted_json={
                 "as_of": today.isoformat(),
-                "summary": "approved summary should be used",
+                "hasview": 0,
+                "summary": "older summary should not be used",
                 "asset_views": [],
             },
             model_name="dummy",
@@ -165,13 +166,13 @@ def test_generate_digest_uses_approved_latest_extraction_only() -> None:
         )
     )
 
-    # same raw_post newer rejected => this post should not be included
+    # same raw_post newer rejected but hasview=1 => this post should be included
     fake_db.seed(
         PostExtraction(
             id=102,
             raw_post_id=11,
             status=ExtractionStatus.rejected,
-            extracted_json={"as_of": today.isoformat(), "summary": "newer rejected"},
+            extracted_json={"as_of": today.isoformat(), "hasview": 1, "summary": "newer hasview summary"},
             model_name="dummy",
             extractor_name="dummy",
             created_at=now,
@@ -185,8 +186,10 @@ def test_generate_digest_uses_approved_latest_extraction_only() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["digest_date"] == today.isoformat()
-    assert body["post_summaries"] == []
-    assert body["metadata"]["source_post_count"] == 0
+    assert len(body["post_summaries"]) == 1
+    assert body["post_summaries"][0]["extraction_id"] == 102
+    assert body["post_summaries"][0]["summary"] == "newer hasview summary"
+    assert body["metadata"]["source_post_count"] == 1
 
 
 def test_generate_digest_window_and_time_priority_sorting() -> None:
@@ -217,7 +220,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             id=201,
             raw_post_id=21,
             status=ExtractionStatus.approved,
-            extracted_json={"as_of": "2026-03-05", "summary": "A"},
+            extracted_json={"as_of": "2026-03-05", "hasview": 1, "summary": "A"},
             model_name="dummy",
             extractor_name="dummy",
             created_at=now - timedelta(hours=6),
@@ -244,7 +247,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             id=202,
             raw_post_id=22,
             status=ExtractionStatus.approved,
-            extracted_json={"summary": "B", "asset_views": [{"summary": "B1"}]},
+            extracted_json={"hasview": 1, "summary": "B", "asset_views": [{"summary": "B1"}]},
             model_name="dummy",
             extractor_name="dummy",
             created_at=now - timedelta(hours=5),
@@ -271,7 +274,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             id=203,
             raw_post_id=23,
             status=ExtractionStatus.approved,
-            extracted_json={"as_of": "", "summary": "C"},
+            extracted_json={"as_of": "", "hasview": 1, "summary": "C"},
             model_name="dummy",
             extractor_name="dummy",
             created_at=datetime(2026, 3, 6, 5, 0, 0, tzinfo=UTC),
@@ -318,7 +321,7 @@ def test_generate_digest_replaces_same_profile_date() -> None:
             id=301,
             raw_post_id=31,
             status=ExtractionStatus.approved,
-            extracted_json={"as_of": digest_date.isoformat(), "summary": "v1"},
+            extracted_json={"as_of": digest_date.isoformat(), "hasview": 1, "summary": "v1"},
             model_name="dummy",
             extractor_name="dummy",
             created_at=now,
@@ -328,7 +331,7 @@ def test_generate_digest_replaces_same_profile_date() -> None:
     client = _client_with_db(fake_db)
     first = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
     extraction = fake_db._data[PostExtraction][301]
-    extraction.extracted_json = {"as_of": digest_date.isoformat(), "summary": "v2"}
+    extraction.extracted_json = {"as_of": digest_date.isoformat(), "hasview": 1, "summary": "v2"}
     extraction.created_at = now + timedelta(minutes=1)
     second = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
     app.dependency_overrides.clear()
@@ -378,7 +381,7 @@ def test_generate_digest_content_is_json_safe_before_persist() -> None:
             id=401,
             raw_post_id=41,
             status=ExtractionStatus.approved,
-            extracted_json={"as_of": digest_date.isoformat(), "summary": "summary"},
+            extracted_json={"as_of": digest_date.isoformat(), "hasview": 1, "summary": "summary"},
             model_name="dummy",
             extractor_name="dummy",
             created_at=now,
@@ -444,6 +447,7 @@ def test_generate_digest_ai_author_summaries_include_asset_fields() -> None:
             status=ExtractionStatus.approved,
             extracted_json={
                 "as_of": digest_date.isoformat(),
+                "hasview": 1,
                 "summary": "fallback summary",
                 "asset_views": [
                     {

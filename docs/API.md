@@ -38,10 +38,31 @@ Top-level model output must include these 6 core keys:
 - internal observability remains in `extracted_json.meta`
 
 ## Auto Review
-- asset branch (`islibrary=0`): if `hasview=0`, auto reject (`hasview_zero`); else use confidence threshold (`70`)
-- library branch (`islibrary=1`): auto approve by `library_flag` (not using `library_entry.confidence`)
+- if `hasview=0`: auto reject (`hasview_zero`)
+- auto approve requires `hasview=1` and confidence path meeting threshold (`70`)
 - `meta.auto_policy_applied` is recorded (current values: `threshold_asset|no_auto_review_user_trigger`)
 
 ## Backward Read Tolerance
 - read path tolerates old records and legacy fields without rewriting historical approval status
 - legacy `library_tags` is ignored on read
+
+## Daily Digest API (Current)
+- `POST /digests/generate`
+  - required query:
+    - `date` (`YYYY-MM-DD`)
+  - optional query:
+    - `profile_id` (default `1`)
+    - `to_ts` (optional ISO datetime, used as `generated_at`)
+  - behavior:
+    - regenerate and overwrite the single digest row for the same `profile_id + digest_date`
+    - digest window is fixed to `[date-1d 00:00 UTC, date+1d 00:00 UTC)`
+    - source post time fallback priority: `as_of -> posted_at -> created_at`
+- `GET /digests`
+  - required query: `date`
+  - optional query: `profile_id` (default `1`)
+  - returns the replay digest for this `profile_id + digest_date`
+- `GET /digests/dates`
+  - optional query: `profile_id` (default `1`)
+  - returns all replayable digest dates for that profile (desc)
+- `GET /digests/{digest_id}`
+  - replay by primary key

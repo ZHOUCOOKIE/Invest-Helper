@@ -739,7 +739,7 @@ def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
         "as_of": as_of_raw.strip() if isinstance(as_of_raw, str) else "",
         "source_url": source_url_raw.strip() if isinstance(source_url_raw, str) else "",
         "islibrary": islibrary,
-        "hasview": 1 if asset_views else 0,
+        "hasview": _coerce_hasview(payload),
         "asset_views": asset_views,
         "library_entry": _normalize_library_entry_for_read(payload.get("library_entry")),
     }
@@ -1867,16 +1867,13 @@ def _evaluate_auto_review_decision(
     *,
     threshold: int,
 ) -> tuple[Literal["approved", "rejected", "pending"], str | None, int | None]:
-    islibrary = _coerce_islibrary(extracted_json)
-    if islibrary == 1:
-        return ("approved", "library_flag", None)
     hasview = _coerce_hasview(extracted_json)
-    if islibrary == 0 and hasview == 0:
+    if hasview == 0:
         return ("rejected", "hasview_zero", 0)
 
     asset_views = extracted_json.get("asset_views")
     has_asset_views = isinstance(asset_views, list) and len(asset_views) > 0
-    if not ((hasview == 1 or islibrary == 1) and has_asset_views):
+    if not (hasview == 1 and has_asset_views):
         return ("pending", None, None)
 
     model_confidence = _coerce_extraction_confidence(extracted_json)
@@ -1907,21 +1904,16 @@ async def postprocess_auto_review(
         return None
     if not isinstance(extraction.extracted_json, dict):
         return None
-    islibrary = _coerce_islibrary(extraction.extracted_json)
     if trigger not in {"auto", "bulk"}:
-        if islibrary == 1:
-            # Library entries are auto-routed even for user-triggered force re-extract.
-            pass
-        else:
-            base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
-            extraction.extracted_json = {
-                **extraction.extracted_json,
-                "meta": {
-                    **base_meta,
-                    "auto_policy_applied": "no_auto_review_user_trigger",
-                },
-            }
-            return None
+        base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
+        extraction.extracted_json = {
+            **extraction.extracted_json,
+            "meta": {
+                **base_meta,
+                "auto_policy_applied": "no_auto_review_user_trigger",
+            },
+        }
+        return None
     decision, reason, model_confidence = _evaluate_auto_review_decision(
         extraction.extracted_json,
         threshold=threshold,
@@ -1959,7 +1951,6 @@ async def postprocess_auto_review(
         "meta": {
             **base_meta,
             "auto_approved": True,
-            "auto_library": reason == "library_flag",
             "auto_review_threshold": threshold,
             "auto_review_reason": reason,
             "model_confidence": model_confidence,
@@ -1972,7 +1963,7 @@ async def postprocess_auto_review(
         extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
         extraction.reviewed_at = reviewed_at
         if not extraction.review_note:
-            extraction.review_note = "auto-library" if reason == "library_flag" else "auto-approved"
+            extraction.review_note = "auto-approved"
         raw_post.review_status = ReviewStatus.approved
         raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
         raw_post.reviewed_at = reviewed_at
@@ -4931,7 +4922,6 @@ async def get_dashboard(
 async def generate_daily_digest(
     request: Request,
     digest_date: date = Query(alias="date"),
-    days: int = Query(default=7, ge=1, le=90),
     to_ts: datetime | None = Query(default=None),
     profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
@@ -4940,7 +4930,6 @@ async def generate_daily_digest(
         return await generate_daily_digest_service(
             db,
             digest_date=digest_date,
-            days=days,
             to_ts=to_ts,
             profile_id=profile_id,
         )
@@ -4968,14 +4957,12 @@ async def generate_daily_digest(
 @app.get("/digests", response_model=DailyDigestRead)
 async def get_daily_digest(
     digest_date: date = Query(alias="date"),
-    version: int | None = Query(default=None, ge=1),
     profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     return await get_daily_digest_by_date_service(
         db,
         digest_date=digest_date,
-        version=version,
         profile_id=profile_id,
     )
 
@@ -5227,7 +5214,6 @@ async def recompute_extraction_statuses(
                 "meta": {
                     **base_meta,
                     "auto_approved": True,
-                    "auto_library": reason == "library_flag",
                     "auto_review_threshold": threshold,
                     "auto_review_reason": reason,
                     "model_confidence": model_confidence,
@@ -5237,7 +5223,7 @@ async def recompute_extraction_statuses(
             extraction.status = ExtractionStatus.approved
             extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
             extraction.reviewed_at = reviewed_at
-            extraction.review_note = "auto-library" if reason == "library_flag" else "auto-approved"
+            extraction.review_note = "auto-approved"
             raw_post.review_status = ReviewStatus.approved
             raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
             raw_post.reviewed_at = reviewed_at

@@ -11,7 +11,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from enums import ExtractionStatus
 from models import DailyDigest, Kol, PostExtraction, RawPost
 from schemas import (
     DailyDigestAIAnalysisRead,
@@ -170,10 +169,18 @@ def _build_author_summary_rows(
     return rows or [base_row]
 
 
-def _status_key(value: Any) -> str:
-    if hasattr(value, "value"):
-        return str(value.value).strip().lower()
-    return str(value or "").strip().lower()
+def _coerce_hasview(value: Any) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return 1 if value == 1 else 0
+    if isinstance(value, float):
+        return 1 if value == 1.0 else 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return 1
+    return 0
 
 
 def _to_json_safe(value: Any) -> Any:
@@ -374,7 +381,6 @@ async def generate_daily_digest(
     db: AsyncSession,
     *,
     digest_date: date,
-    days: int | None = None,
     to_ts: datetime | None = None,
     profile_id: int = DEFAULT_PROFILE_ID,
 ) -> DailyDigestRead:
@@ -400,7 +406,8 @@ async def generate_daily_digest(
 
     post_summaries: list[DailyDigestPostSummaryRead] = []
     for extraction in latest_by_raw_post_id.values():
-        if _status_key(extraction.status) != ExtractionStatus.approved.value:
+        payload = extraction.extracted_json if isinstance(extraction.extracted_json, dict) else {}
+        if _coerce_hasview(payload.get("hasview")) != 1:
             continue
 
         raw_post = raw_post_map.get(extraction.raw_post_id)
@@ -554,7 +561,6 @@ async def get_daily_digest_by_date(
     db: AsyncSession,
     *,
     digest_date: date,
-    version: int | None = None,
     profile_id: int = DEFAULT_PROFILE_ID,
 ) -> DailyDigestRead:
     await load_profile_rules(db, profile_id=profile_id)
@@ -568,9 +574,6 @@ async def get_daily_digest_by_date(
     items = list(result.scalars().all())
     if not items:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="digest not found")
-
-    # version is deprecated but kept as an ignored compatibility query parameter.
-    _ = version
     return _build_digest_read(digest=items[0])
 
 

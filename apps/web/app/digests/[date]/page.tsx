@@ -375,7 +375,7 @@ export default function DailyDigestPage() {
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
             <h2 style={{ marginTop: 0 }}>第二部分：时间顺序贴文摘要流</h2>
             {digest.post_summaries.length === 0 ? (
-              <p>当天+昨天没有 approved 贴文。</p>
+              <p>当天+昨天没有 hasview=1 的贴文。</p>
             ) : (
               <div style={{ display: "grid", gap: "10px" }}>
                 {digest.post_summaries.map((item) => (

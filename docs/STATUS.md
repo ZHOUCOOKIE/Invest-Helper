@@ -17,9 +17,13 @@
   - `library_entry.summary` must be exact `测试`
   - invalid/missing `library_entry` downgrades to `islibrary=0`
 - Auto review:
-  - asset path: `hasview=0` auto reject; otherwise threshold flow (`70`)
-  - library path: `islibrary=1` auto approve (`library_flag`)
+  - `hasview=0` auto reject
+  - auto approve requires `hasview=1` + threshold flow (`70`)
   - writes `meta.auto_policy_applied`
+- Daily Digest replay contract:
+  - single-row overwrite by `profile_id + digest_date`
+  - generation API params are `date/profile_id/to_ts` only
+  - read API params are `date/profile_id` only
 
 ## Not Implemented
 - None.

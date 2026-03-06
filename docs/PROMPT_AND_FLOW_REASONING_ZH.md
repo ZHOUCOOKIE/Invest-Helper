@@ -42,8 +42,8 @@
 
 ## 4. Auto-review
 - asset 分支：沿用资产视图阈值流程
-- `hasview=0`（非 library）会自动拒绝
-- library 分支：`islibrary=1` 自动通过（`library_flag`）
+- `hasview=0` 会自动拒绝
+- 自动通过必须满足 `hasview=1` 且走置信度阈值路径（`>=70`）
 - 记录 `meta.auto_policy_applied`
 
 ## 5. 可追溯性

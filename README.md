@@ -20,9 +20,8 @@ It extracts structured signals, supports review workflows, and provides Daily Di
 - Runtime normalize contract: `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
 - Strict enum handling for `market`, `stance`, and `horizon`.
 - Auto-review flow:
-  - non-library + `hasview=0` => auto reject
-  - non-library + valid confidence path => threshold review (`70`)
-  - `islibrary=1` => auto approve (`library_flag`)
+  - `hasview=0` => auto reject
+  - `hasview=1` + valid confidence path => threshold review (`70`)
 - Traceability chain across `raw_posts -> post_extractions -> kol_views -> daily_digests`.
 - Replay-ready digests stored by `profile_id + digest_date`.
 

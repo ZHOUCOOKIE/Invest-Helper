@@ -29,7 +29,8 @@ TL;DR
 
 - 唯一键：`(profile_id, digest_date)`。
 - `POST /digests/generate` 对同一 `profile_id + digest_date` 覆盖重生成。
-- `GET /digests` 读取该日该 profile 的单条日报。
+- `POST /digests/generate` 当前有效参数：`date`、`profile_id`、`to_ts`。
+- `GET /digests` 读取该日该 profile 的单条日报（参数：`date`、`profile_id`）。
 - `GET /digests/{digest_id}` 支持按主键直接回放。
 - `GET /digests/dates?profile_id=...` 返回可回放日期集合。
 

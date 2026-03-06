@@ -430,7 +430,7 @@ def test_summary_language_check_only_asset_views_and_library_entry() -> None:
     assert _detect_extracted_summary_language(payload) == "zh"
 
 
-def test_library_auto_review_auto_approved_without_asset_views() -> None:
+def test_library_without_hasview_auto_rejected() -> None:
     raw_post = _raw_post()
     extraction = _extraction(
         {
@@ -451,8 +451,8 @@ def test_library_auto_review_auto_approved_without_asset_views() -> None:
             trigger="auto",
         )
     )
-    assert outcome == "approved"
-    assert extraction.status == ExtractionStatus.approved
+    assert outcome == "rejected"
+    assert extraction.status == ExtractionStatus.rejected
 
 
 def test_non_library_without_asset_views_auto_rejected() -> None:
@@ -558,7 +558,7 @@ def test_hasview_one_with_asset_views_and_confidence_ge_70_auto_approved() -> No
     assert extraction.status == ExtractionStatus.approved
 
 
-def test_islibrary_one_with_asset_views_and_confidence_ge_70_auto_approved() -> None:
+def test_islibrary_one_hasview_zero_with_asset_views_is_not_auto_approved() -> None:
     raw_post = _raw_post()
     extraction = _extraction(
         {
@@ -589,11 +589,11 @@ def test_islibrary_one_with_asset_views_and_confidence_ge_70_auto_approved() -> 
         )
     )
 
-    assert outcome == "approved"
-    assert extraction.status == ExtractionStatus.approved
+    assert outcome == "rejected"
+    assert extraction.status == ExtractionStatus.rejected
 
 
-def test_islibrary_one_auto_approved_even_when_trigger_is_user() -> None:
+def test_islibrary_one_user_trigger_is_not_auto_reviewed() -> None:
     raw_post = _raw_post()
     extraction = _extraction(
         {
@@ -615,5 +615,5 @@ def test_islibrary_one_auto_approved_even_when_trigger_is_user() -> None:
         )
     )
 
-    assert outcome == "approved"
-    assert extraction.status == ExtractionStatus.approved
+    assert outcome is None
+    assert extraction.status == ExtractionStatus.pending

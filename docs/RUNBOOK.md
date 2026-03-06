@@ -56,6 +56,21 @@ curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_
   - downgraded to `islibrary=0`
   - `library_entry=null`
 
+## Generate And Replay Digest
+```bash
+# generate (overwrite same profile_id + date)
+curl -s -X POST "http://localhost:8000/digests/generate?date=2026-03-06&profile_id=1" | jq
+
+# replay by date/profile
+curl -s "http://localhost:8000/digests?date=2026-03-06&profile_id=1" | jq
+
+# list replayable dates
+curl -s "http://localhost:8000/digests/dates?profile_id=1" | jq
+
+# replay by digest id
+curl -s "http://localhost:8000/digests/1" | jq
+```
+
 ## Full Validation
 ```bash
 DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@localhost:5433/investpulse_test make verify

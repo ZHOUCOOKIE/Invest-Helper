@@ -355,17 +355,17 @@ def test_admin_recompute_extraction_statuses_updates_all_statuses_by_rules() -> 
 
     assert response.status_code == 200
     body = response.json()
-    assert body["updated"] == 7
-    assert body["approved_count"] == 6
-    assert body["rejected_count"] == 2
+    assert body["updated"] == 6
+    assert body["approved_count"] == 4
+    assert body["rejected_count"] == 4
     assert body["skipped_terminal_count"] == 0
-    assert set(body["updated_ids"]) == {101, 102, 103, 105, 106, 107, 108}
+    assert set(body["updated_ids"]) == {101, 102, 103, 105, 106, 107}
 
     assert fake_db._data[PostExtraction][101].status == ExtractionStatus.rejected
     assert fake_db._data[PostExtraction][102].status == ExtractionStatus.approved
-    assert fake_db._data[PostExtraction][103].status == ExtractionStatus.approved
+    assert fake_db._data[PostExtraction][103].status == ExtractionStatus.rejected
     assert fake_db._data[PostExtraction][104].status == ExtractionStatus.approved
     assert fake_db._data[PostExtraction][105].status == ExtractionStatus.rejected
     assert fake_db._data[PostExtraction][106].status == ExtractionStatus.approved
     assert fake_db._data[PostExtraction][107].status == ExtractionStatus.approved
-    assert fake_db._data[PostExtraction][108].status == ExtractionStatus.approved
+    assert fake_db._data[PostExtraction][108].status == ExtractionStatus.rejected

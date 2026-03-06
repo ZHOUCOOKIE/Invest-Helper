@@ -641,7 +641,7 @@ export default function IngestPage() {
 
   const generateDigest = async (dateStr: string) => {
     setWorkflowStep(`Generating digest for ${dateStr}...`);
-    const res = await fetch(`/api/digests/generate?date=${dateStr}&days=7&profile_id=1`, { method: "POST" });
+    const res = await fetch(`/api/digests/generate?date=${dateStr}&profile_id=1`, { method: "POST" });
     const body = (await res.json()) as { detail?: string };
     if (!res.ok) throw new Error(body.detail ?? "Generate digest failed");
     setGeneratedDigestDate(dateStr);

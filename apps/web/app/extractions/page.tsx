@@ -77,7 +77,7 @@ function summarizeExtraction(extracted: Record<string, unknown>): string {
     }
   }
 
-  return "(no summary)";
+  return "（无摘要）";
 }
 
 function autoRejectInfo(extracted: Record<string, unknown>): { reason: string; threshold: string } | null {
@@ -119,6 +119,14 @@ function buildPublicId(item: Extraction): string {
   return `${platform}:${stableId}`;
 }
 
+function statusText(status: Extraction["status"] | ExtractionFilterStatus): string {
+  if (status === "pending") return "待处理";
+  if (status === "approved") return "已通过";
+  if (status === "rejected") return "已拒绝";
+  if (status === "library") return "入库";
+  return "全部";
+}
+
 function getInitialStatus(searchStatus: string | null): ExtractionFilterStatus {
   if (
     searchStatus === "pending" ||
@@ -130,6 +138,37 @@ function getInitialStatus(searchStatus: string | null): ExtractionFilterStatus {
     return searchStatus;
   }
   return "all";
+}
+
+function pickRawCreatedAtValue(rawJson: Record<string, unknown> | null): string | null {
+  if (!rawJson) return null;
+  const candidates: Array<Record<string, unknown>> = [rawJson];
+  for (const key of ["tweet", "post", "row"]) {
+    const nested = rawJson[key];
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      candidates.push(nested as Record<string, unknown>);
+    }
+  }
+  for (const item of candidates) {
+    for (const key of ["created_at", "createdAt"]) {
+      const value = item[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+  }
+  return null;
+}
+
+function stripTimezoneSuffix(value: string | null | undefined): string {
+  if (typeof value !== "string") return "-";
+  const trimmed = value.trim();
+  if (!trimmed) return "-";
+  return trimmed.replace(/\s?(?:Z|[+-]\d{2}:\d{2})$/i, "").trim();
+}
+
+function displayPostedTime(rawPost: RawPost): string {
+  return stripTimezoneSuffix(pickRawCreatedAtValue(rawPost.raw_json) ?? rawPost.posted_at);
 }
 
 export default function ExtractionsPage() {
@@ -175,7 +214,7 @@ export default function ExtractionsPage() {
       });
       const body = (await res.json()) as Extraction[] | { detail?: string };
       if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Load failed") : "Load failed");
+        throw new Error("detail" in body ? (body.detail ?? "加载失败") : "加载失败");
       }
       if (requestSeq !== requestSeqRef.current) return;
       const dedupedMap = new Map<number, Extraction>();
@@ -184,12 +223,12 @@ export default function ExtractionsPage() {
       }
       const deduped = Array.from(dedupedMap.values()).sort((a, b) => {
         if (a.created_at === b.created_at) return b.id - a.id;
-        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        return b.created_at.localeCompare(a.created_at);
       });
       setItems(deduped);
     } catch (err) {
       if (requestSeq !== requestSeqRef.current) return;
-      setError(err instanceof Error ? err.message : "Unknown error");
+      setError(err instanceof Error ? err.message : "未知错误");
     } finally {
       if (requestSeq === requestSeqRef.current) {
         setLoading(false);
@@ -205,7 +244,7 @@ export default function ExtractionsPage() {
     const res = await fetch("/api/ingest/x/progress", { cache: "no-store" });
     const body = (await res.json()) as XProgress | { detail?: string };
     if (!res.ok) {
-      throw new Error("detail" in body ? (body.detail ?? "Load progress failed") : "Load progress failed");
+      throw new Error("detail" in body ? (body.detail ?? "加载进度失败") : "加载进度失败");
     }
     setProgress(body as XProgress);
   }, []);
@@ -215,36 +254,15 @@ export default function ExtractionsPage() {
       try {
         await refreshProgress();
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Load progress failed");
+        setError(err instanceof Error ? err.message : "加载进度失败");
       }
     };
     void loadAux();
   }, [refreshProgress]);
 
-  const rejectInline = async (extractionId: number) => {
-    const reason = window.prompt("拒绝原因（可选）：", "") ?? "";
-    setError(null);
-    setMessage(null);
-    try {
-      const res = await fetch(`/api/extractions/${extractionId}/reject`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: reason.trim() || null }),
-      });
-      const body = (await res.json()) as { detail?: string };
-      if (!res.ok) {
-        throw new Error(body.detail ?? `Reject failed: ${res.status}`);
-      }
-      setMessage(`Extraction #${extractionId} rejected.`);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Reject failed");
-    }
-  };
-
   const clearPending = async () => {
     const confirmText = window.prompt(
-      "Dangerous operation: this will hard delete pending/failed extractions. Type YES to continue.",
+      "高风险操作：将硬删除 pending/failed 的抽取记录。输入 YES 继续。",
       "",
     );
     if (confirmText !== "YES") return;
@@ -258,15 +276,15 @@ export default function ExtractionsPage() {
       const res = await fetch(`/api/admin/extractions/pending?${params.toString()}`, { method: "DELETE" });
       const body = (await res.json()) as ClearPendingResponse | { detail?: string };
       if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Clear pending failed") : "Clear pending failed");
+        throw new Error("detail" in body ? (body.detail ?? "清空待处理失败") : "清空待处理失败");
       }
       const done = body as ClearPendingResponse;
       setMessage(
-        `Deleted extractions=${done.deleted_extractions_count}, raw_posts=${done.deleted_raw_posts_count}.`,
+        `已删除抽取=${done.deleted_extractions_count}，已删原始贴文=${done.deleted_raw_posts_count}。`,
       );
       await Promise.all([load(), refreshProgress()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Clear pending failed");
+      setError(err instanceof Error ? err.message : "清空待处理失败");
     }
   };
 
@@ -286,15 +304,15 @@ export default function ExtractionsPage() {
       );
       const body = (await res.json()) as RecomputeStatusesResponse | { detail?: string };
       if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Recompute statuses failed") : "Recompute statuses failed");
+        throw new Error("detail" in body ? (body.detail ?? "重算状态失败") : "重算状态失败");
       }
       const done = body as RecomputeStatusesResponse;
       setMessage(
-        `Recomputed: scanned=${done.scanned}, updated=${done.updated}, pending=${done.pending_count}, approved=${done.approved_count}, rejected=${done.rejected_count}.`,
+        `重算完成：扫描=${done.scanned}，更新=${done.updated}，待处理=${done.pending_count}，通过=${done.approved_count}，拒绝=${done.rejected_count}。`,
       );
       await Promise.all([load(), refreshProgress()]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Recompute statuses failed");
+      setError(err instanceof Error ? err.message : "重算状态失败");
     } finally {
       setRecomputeBusy(false);
     }
@@ -302,17 +320,14 @@ export default function ExtractionsPage() {
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
-      <h1>Extraction 审核</h1>
+      <h1>抽取审核</h1>
       <p>
-        <Link href="/dashboard">返回 Dashboard</Link>
-      </p>
-      <p>
-        默认仅展示每个 raw_post 最新 extraction。auto-review 阈值=70，手动 force re-extract 默认进入待人工审核。
+        默认仅展示每个 raw_post 最新 extraction。auto-review 阈值=80，手动 force re-extract 默认进入待人工审核。
       </p>
 
       <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "12px", flexWrap: "wrap" }}>
         <label>
-          status
+          状态
           <select
             value={status}
             onChange={(event) => {
@@ -323,20 +338,28 @@ export default function ExtractionsPage() {
           >
             {statusOptions.map((option) => (
               <option key={option} value={option}>
-                {option}
+                {option === "all"
+                  ? "全部"
+                  : option === "pending"
+                    ? "待处理"
+                    : option === "approved"
+                      ? "已通过"
+                      : option === "rejected"
+                        ? "已拒绝"
+                        : "入库"}
               </option>
             ))}
           </select>
         </label>
         <label>
-          q
+          关键词
           <input
             value={q}
             onChange={(event) => {
               setQ(event.target.value);
               setOffset(0);
             }}
-            placeholder="keyword"
+            placeholder="请输入关键词"
             style={{ marginLeft: "8px" }}
           />
         </label>
@@ -364,12 +387,12 @@ export default function ExtractionsPage() {
       {error && <p style={{ color: "crimson" }}>{error}</p>}
       {progress && (
         <p style={{ color: "#555" }}>
-          progress[{progress.scope}] total={progress.total_raw_posts}, success={progress.extracted_success_count}, pending=
-          {progress.pending_count}, failed={progress.failed_count}, no_extraction={progress.no_extraction_count}
+          进度[{progress.scope}] 总数={progress.total_raw_posts}, 成功={progress.extracted_success_count}, 待处理=
+          {progress.pending_count}, 失败={progress.failed_count}, 无抽取={progress.no_extraction_count}
         </p>
       )}
 
-      {!loading && items.length === 0 && <p>暂无 extraction。</p>}
+      {!loading && items.length === 0 && <p>暂无抽取记录。</p>}
 
       <div style={{ display: "grid", gap: "10px" }}>
         {items.map((item, idx) => {
@@ -379,11 +402,11 @@ export default function ExtractionsPage() {
           return (
             <article key={item.id} style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", marginBottom: "6px" }}>
-                <strong>No.{serialNo} [{item.status}] public_id={publicId}</strong>
-                <small>created_at: {item.created_at}</small>
+                <strong>第 {serialNo} 条 [{statusText(item.status)}] public_id={publicId}</strong>
+                <small>创建时间: {stripTimezoneSuffix(item.created_at)}</small>
               </div>
               <div>
-                <small>extraction_id={item.id}</small>
+                <small>抽取 ID={item.id}</small>
               </div>
               <div>
                 {item.raw_post.platform} / @{item.raw_post.author_handle}
@@ -393,18 +416,15 @@ export default function ExtractionsPage() {
                   {item.raw_post.url}
                 </a>
               </div>
-              <div>posted_at: {item.raw_post.posted_at}</div>
-              <div style={{ marginTop: "6px" }}>summary: {summarizeExtraction(item.extracted_json)}</div>
+              <div>发布时间: {displayPostedTime(item.raw_post)}</div>
+              <div style={{ marginTop: "6px" }}>摘要: {summarizeExtraction(item.extracted_json)}</div>
               {autoRejected && (
                 <div style={{ marginTop: "4px", color: "#8a5800" }}>
-                  auto_rejected=true, reason={autoRejected.reason}, threshold={autoRejected.threshold}
+                  自动拒绝=true, 原因={autoRejected.reason}, 阈值={autoRejected.threshold}
                 </div>
               )}
               <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                <Link href={`/extractions/${item.id}`}>通过</Link>
-                <button type="button" onClick={() => void rejectInline(item.id)} disabled={item.status !== "pending"}>
-                  拒绝
-                </button>
+                <Link href={`/extractions/${item.id}`}>查看详情</Link>
               </div>
             </article>
           );
@@ -422,7 +442,7 @@ export default function ExtractionsPage() {
         <button type="button" onClick={() => setOffset((prev) => prev + PAGE_SIZE)} disabled={!canNext || loading}>
           下一页
         </button>
-        <small>offset={offset}</small>
+        <small>偏移量={offset}</small>
       </div>
     </main>
   );

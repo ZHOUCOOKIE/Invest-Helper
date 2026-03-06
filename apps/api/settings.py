@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     prompt_version: str = "extract_v1"
     max_assets_in_prompt: int = 50
     auto_approve_enabled: bool = True
-    auto_approve_confidence_threshold: int = 70
+    auto_approve_confidence_threshold: int = 80
     auto_approve_max_views: int = 10
     auto_reject_confidence_threshold: int = 50
     extract_max_concurrency_default: int = 4

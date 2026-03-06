@@ -1,6 +1,6 @@
 from collections import Counter, defaultdict, deque
 import asyncio
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time as dt_time, timedelta
 from enum import Enum
 import json
 import logging
@@ -30,6 +30,7 @@ from models import Asset, AssetAlias, DailyDigest, Kol, KolView, PostExtraction,
 from schemas import (
     AssetCreate,
     AssetViewFeedItemRead,
+    AssetViewPostDetailRead,
     AssetViewsGroupRead,
     AssetViewsFeedRead,
     AssetViewsTimelineItemRead,
@@ -64,14 +65,14 @@ from schemas import (
     ExtractionListStatus,
     ExtractionRejectRequest,
     KolCreate,
+    KolAssetSummaryRead,
+    KolAssetSummaryItemRead,
+    KolAssetViewsRead,
+    KolAssetViewItemRead,
     KolRead,
     KolViewRead,
     PostExtractionRead,
     PostExtractionWithRawPostRead,
-    ProfileKolsUpdateRequest,
-    ProfileMarketsUpdateRequest,
-    ProfileRead,
-    ProfileSummaryRead,
     RawPostsExtractBatchRead,
     RawPostsExtractBatchRequest,
     XImportItemCreate,
@@ -112,12 +113,6 @@ from services.digests import (
     get_daily_digest_by_id as get_daily_digest_by_id_service,
     list_daily_digest_dates as list_daily_digest_dates_service,
 )
-from services.profiles import (
-    get_profile as get_profile_service,
-    list_profiles as list_profiles_service,
-    update_profile_kols as update_profile_kols_service,
-    update_profile_markets as update_profile_markets_service,
-)
 from services.prompts import build_extract_prompt
 from services.view_logic import calc_clarity, is_newer_view, select_latest_views
 from scripts.x_import_converter import convert_records, load_records_from_bytes
@@ -127,7 +122,7 @@ app = FastAPI(title="InvestPulse API")
 logger = logging.getLogger("uvicorn.error")
 EXTRACTION_REVIEWER = "human-review"
 AUTO_EXTRACTION_REVIEWER = "auto"
-AUTO_REVIEW_CONFIDENCE_THRESHOLD = 70
+AUTO_REVIEW_CONFIDENCE_THRESHOLD = 80
 FORCE_REEXTRACT_TRIGGER_USER = "user"
 FORCE_REEXTRACT_TRIGGER_AUTO = "auto"
 FORCE_REEXTRACT_TRIGGER_BULK_PENDING_RETRY = "bulk_pending_retry"
@@ -236,12 +231,13 @@ async def handle_validation_exception(request: Request, exc: RequestValidationEr
 
 @app.exception_handler(Exception)
 async def handle_unexpected_exception(request: Request, exc: Exception):
+    logger.exception("unhandled exception: path=%s", request.url.path)
     return _json_error(
         request,
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         error_code="internal_server_error",
         message="Internal Server Error",
-        detail=str(exc),
+        detail="Internal Server Error",
     )
 
 
@@ -382,6 +378,7 @@ async def _compute_dashboard_clarity_ranking(
             SELECT
                 asset_id,
                 kol_id,
+                stance,
                 (
                     CASE
                         WHEN stance = 'bull' THEN 1.0
@@ -402,6 +399,8 @@ async def _compute_dashboard_clarity_ranking(
             SELECT
                 sv.asset_id AS asset_id,
                 SUM(sv.signed_weight) AS s_raw,
+                SUM(CASE WHEN sv.stance = 'bull' THEN 1 ELSE 0 END)::int AS bull_count,
+                SUM(CASE WHEN sv.stance = 'bear' THEN 1 ELSE 0 END)::int AS bear_count,
                 COUNT(*)::int AS n_views,
                 COUNT(DISTINCT sv.kol_id)::int AS k_unique
             FROM scored_views sv
@@ -414,6 +413,8 @@ async def _compute_dashboard_clarity_ranking(
             a.market AS market,
             asset_scores.s_raw AS s_raw,
             ABS(asset_scores.s_raw) * LN(1 + asset_scores.n_views) * LN(1 + asset_scores.k_unique) AS clarity_score,
+            asset_scores.bull_count AS bull_count,
+            asset_scores.bear_count AS bear_count,
             asset_scores.n_views AS n_views,
             asset_scores.k_unique AS k_unique
         FROM asset_scores
@@ -571,6 +572,9 @@ async def _compute_dashboard_clarity_ranking(
                 clarity_score=round(float(row["clarity_score"] or 0.0), 6),
                 n=int(row["n_views"] or 0),
                 k=int(row["k_unique"] or 0),
+                bull_count=int(row.get("bull_count") or 0),
+                bear_count=int(row.get("bear_count") or 0),
+                total_count=int(row["n_views"] or 0),
                 top_contributors=contributors_map.get(asset_id, []),
             )
         )
@@ -953,6 +957,22 @@ def _raw_snippet(value: Any, *, max_chars: int = 240) -> str:
     except Exception:  # noqa: BLE001
         text = repr(value)
     return text[:max_chars]
+
+
+def _pick_raw_created_at(raw_json: Any) -> str | None:
+    if not isinstance(raw_json, dict):
+        return None
+    candidates: list[dict[str, Any]] = [raw_json]
+    for key in ("tweet", "post", "row"):
+        nested = raw_json.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for item in candidates:
+        for key in ("created_at", "createdAt"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
 def _detect_x_export_kind(rows: list[Any]) -> str:
@@ -2662,32 +2682,109 @@ async def create_kol(payload: KolCreate, db: AsyncSession = Depends(get_db)):
     return kol
 
 
-@app.get("/profiles", response_model=list[ProfileSummaryRead])
-async def list_profiles(db: AsyncSession = Depends(get_db)):
-    return await list_profiles_service(db)
-
-
-@app.get("/profiles/{profile_id}", response_model=ProfileRead)
-async def get_profile(profile_id: int = Path(ge=1), db: AsyncSession = Depends(get_db)):
-    return await get_profile_service(db, profile_id=profile_id)
-
-
-@app.put("/profiles/{profile_id}/kols", response_model=ProfileRead)
-async def update_profile_kols(
-    payload: ProfileKolsUpdateRequest,
-    profile_id: int = Path(ge=1),
+@app.get("/kols/{kol_id}/assets-summary", response_model=KolAssetSummaryRead)
+async def get_kol_assets_summary(
+    kol_id: int,
+    top: int = Query(default=5, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
-    return await update_profile_kols_service(db, profile_id=profile_id, payload=payload)
+    kol = await db.get(Kol, kol_id)
+    if kol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol not found")
+
+    views_result = await db.execute(
+        select(KolView)
+        .where(KolView.kol_id == kol_id)
+        .order_by(KolView.created_at.desc(), KolView.id.desc())
+    )
+    views = list(views_result.scalars().all())
+    if not views:
+        return KolAssetSummaryRead(kol_id=kol_id, total_views=0, top_assets=[])
+
+    assets_result = await db.execute(select(Asset).order_by(Asset.id.asc()))
+    asset_map = {item.id: item for item in assets_result.scalars().all()}
+
+    counts: dict[int, int] = defaultdict(int)
+    for view in views:
+        counts[view.asset_id] += 1
+
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:top]
+    top_assets = [
+        KolAssetSummaryItemRead(
+            asset_id=asset_id,
+            symbol=asset_map[asset_id].symbol if asset_id in asset_map else str(asset_id),
+            name=asset_map[asset_id].name if asset_id in asset_map else None,
+            market=asset_map[asset_id].market if asset_id in asset_map else None,
+            views_count=count,
+        )
+        for asset_id, count in ordered
+    ]
+    return KolAssetSummaryRead(
+        kol_id=kol_id,
+        total_views=len(views),
+        top_assets=top_assets,
+    )
 
 
-@app.put("/profiles/{profile_id}/markets", response_model=ProfileRead)
-async def update_profile_markets(
-    payload: ProfileMarketsUpdateRequest,
-    profile_id: int = Path(ge=1),
+@app.get("/kols/{kol_id}/views", response_model=KolAssetViewsRead)
+async def get_kol_views(
+    kol_id: int,
+    asset_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    return await update_profile_markets_service(db, profile_id=profile_id, payload=payload)
+    kol = await db.get(Kol, kol_id)
+    if kol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol not found")
+
+    query = (
+        select(KolView)
+        .where(KolView.kol_id == kol_id)
+        .order_by(KolView.as_of.desc(), KolView.created_at.desc(), KolView.id.desc())
+    )
+    if asset_id is not None:
+        query = query.where(KolView.asset_id == asset_id)
+    result = await db.execute(query)
+    all_views = list(result.scalars().all())
+    all_views.sort(
+        key=lambda item: (
+            item.as_of.isoformat() if item.as_of is not None else "",
+            item.created_at or datetime.min.replace(tzinfo=UTC),
+            item.id,
+        ),
+        reverse=True,
+    )
+    total = len(all_views)
+    page = all_views[offset : offset + limit]
+
+    assets_result = await db.execute(select(Asset).order_by(Asset.id.asc()))
+    asset_map = {item.id: item for item in assets_result.scalars().all()}
+    items = [
+        KolAssetViewItemRead(
+            id=view.id,
+            asset_id=view.asset_id,
+            asset_symbol=asset_map[view.asset_id].symbol if view.asset_id in asset_map else str(view.asset_id),
+            asset_name=asset_map[view.asset_id].name if view.asset_id in asset_map else None,
+            stance=view.stance,
+            horizon=view.horizon,
+            confidence=view.confidence,
+            summary=view.summary,
+            source_url=view.source_url,
+            as_of=view.as_of,
+            created_at=view.created_at,
+        )
+        for view in page
+    ]
+    return KolAssetViewsRead(
+        kol_id=kol_id,
+        asset_id=asset_id,
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=(offset + len(items)) < total,
+        items=items,
+    )
 
 
 @app.get("/assets/{asset_id}/views", response_model=AssetViewsRead)
@@ -2780,13 +2877,14 @@ async def get_asset_views_timeline(
     kol_result = await db.execute(select(Kol))
     kol_map = {item.id: item for item in kol_result.scalars().all()}
     posted_at_by_url: dict[str, datetime] = {}
+    posted_at_raw_by_url: dict[str, str] = {}
     if source_urls:
         raw_posts_result = await db.execute(
-            select(RawPost.url, RawPost.posted_at)
+            select(RawPost.url, RawPost.posted_at, RawPost.raw_json)
             .where(RawPost.url.in_(source_urls))
             .order_by(RawPost.posted_at.desc(), RawPost.id.desc())
         )
-        for url, posted_at in raw_posts_result.all():
+        for url, posted_at, raw_json in raw_posts_result.all():
             if not isinstance(url, str):
                 continue
             key = url.strip()
@@ -2794,6 +2892,10 @@ async def get_asset_views_timeline(
                 continue
             if key not in posted_at_by_url:
                 posted_at_by_url[key] = posted_at
+            if key not in posted_at_raw_by_url:
+                raw_created_at = _pick_raw_created_at(raw_json)
+                if raw_created_at:
+                    posted_at_raw_by_url[key] = raw_created_at
     extraction_id_by_view_id: dict[int, int] = {}
     if view_ids:
         extraction_result = await db.execute(
@@ -2820,6 +2922,7 @@ async def get_asset_views_timeline(
             as_of=item.as_of,
             created_at=item.created_at,
             posted_at=posted_at_by_url.get(item.source_url.strip() if item.source_url else ""),
+            posted_at_raw=posted_at_raw_by_url.get(item.source_url.strip() if item.source_url else ""),
             extraction_id=extraction_id_by_view_id.get(item.id),
         )
         for item in filtered
@@ -2830,6 +2933,55 @@ async def get_asset_views_timeline(
         since_date=since_date,
         generated_at=now,
         items=items,
+    )
+
+
+@app.get("/assets/{asset_id}/views/{view_id}/post-detail", response_model=AssetViewPostDetailRead)
+async def get_asset_view_post_detail(
+    asset_id: int,
+    view_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    asset = await db.get(Asset, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+
+    view = await db.get(KolView, view_id)
+    if view is None or view.asset_id != asset_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="view not found")
+
+    extraction_result = await db.execute(
+        select(PostExtraction)
+        .options(selectinload(PostExtraction.raw_post))
+        .where(PostExtraction.applied_kol_view_id == view.id)
+        .order_by(PostExtraction.id.desc())
+    )
+    extraction_rows = extraction_result.scalars().all()
+    extraction = extraction_rows[0] if extraction_rows else None
+
+    raw_post: RawPost | None = None
+    if extraction is not None and extraction.raw_post is not None:
+        raw_post = extraction.raw_post
+    elif view.source_url and view.source_url.strip():
+        raw_post_result = await db.execute(
+            select(RawPost)
+            .where(RawPost.url == view.source_url.strip())
+            .order_by(RawPost.posted_at.desc(), RawPost.id.desc())
+        )
+        raw_post_rows = raw_post_result.scalars().all()
+        raw_post = raw_post_rows[0] if raw_post_rows else None
+
+    return AssetViewPostDetailRead(
+        asset_id=asset_id,
+        view_id=view.id,
+        extraction_id=extraction.id if extraction is not None else None,
+        raw_post_id=raw_post.id if raw_post is not None else None,
+        source_url=view.source_url,
+        summary=view.summary,
+        posted_at=raw_post.posted_at if raw_post is not None else None,
+        posted_at_raw=_pick_raw_created_at(raw_post.raw_json) if raw_post is not None else None,
+        author_handle=raw_post.author_handle if raw_post is not None else None,
+        content_text=raw_post.content_text if raw_post is not None else None,
     )
 
 
@@ -4439,7 +4591,7 @@ async def admin_delete_asset(
 async def admin_delete_digests_by_date(
     confirm: str = Query(...),
     digest_date: date = Query(...),
-    profile_id: int = Query(..., ge=1),
+    profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     _require_destructive_admin_guard(confirm=confirm)
@@ -4472,7 +4624,7 @@ async def admin_delete_digests_by_date(
 
     return AdminHardDeleteRead(
         operation="delete_digests_by_date",
-        target=f"profile:{profile_id},date:{digest_date.isoformat()}",
+        target=f"date:{digest_date.isoformat()}",
         derived_only=True,
         enable_cascade=False,
         also_delete_raw_posts=False,
@@ -4680,7 +4832,6 @@ async def get_dashboard(
     assets_limit: int = Query(default=15, ge=1, le=5000),
     show_all_assets: bool = Query(default=False),
     assets_window: str = Query(default="24h", pattern="^(24h|7d)$"),
-    profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     now = datetime.now(UTC)
@@ -4725,6 +4876,22 @@ async def get_dashboard(
 
     views_result = await db.execute(select(KolView).order_by(KolView.created_at.desc(), KolView.id.desc()))
     all_views = list(views_result.scalars().all())
+    source_urls = sorted({item.source_url.strip() for item in all_views if item.source_url and item.source_url.strip()})
+    posted_at_by_url: dict[str, datetime] = {}
+    if source_urls:
+        raw_posts_result = await db.execute(
+            select(RawPost.url, RawPost.posted_at)
+            .where(RawPost.url.in_(source_urls))
+            .order_by(RawPost.posted_at.desc(), RawPost.id.desc())
+        )
+        for url, posted_at in raw_posts_result.all():
+            if not isinstance(url, str):
+                continue
+            key = url.strip()
+            if not key:
+                continue
+            if key not in posted_at_by_url:
+                posted_at_by_url[key] = posted_at
 
     asset_counts_24h: dict[int, int] = defaultdict(int)
     asset_counts_7d: dict[int, int] = defaultdict(int)
@@ -4733,17 +4900,22 @@ async def get_dashboard(
     kol_asset_counts_7d: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
     for view in all_views:
-        view_created = view.created_at
-        if view_created is None:
+        source_key = view.source_url.strip() if view.source_url else ""
+        business_ts = posted_at_by_url.get(source_key)
+        if business_ts is None and view.as_of is not None:
+            business_ts = datetime.combine(view.as_of, dt_time.min, tzinfo=UTC)
+        if business_ts is None:
+            business_ts = view.created_at
+        if business_ts is None:
             continue
         horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
         latest_key = (view.asset_id, horizon_value)
         current_latest = latest_by_asset_horizon.get(latest_key)
         if current_latest is None or is_newer_view(view, current_latest):
             latest_by_asset_horizon[latest_key] = view
-        if view_created >= views_cutoff_24h:
+        if business_ts >= views_cutoff_24h:
             asset_counts_24h[view.asset_id] += 1
-        if view_created >= views_cutoff_7d:
+        if business_ts >= views_cutoff_7d:
             asset_counts_7d[view.asset_id] += 1
             kol_counts_7d[view.kol_id] += 1
             kol_asset_counts_7d[view.kol_id][view.asset_id] += 1
@@ -4890,7 +5062,7 @@ async def get_dashboard(
     clarity_ranking = await _compute_dashboard_clarity_ranking(
         db,
         now=now,
-        profile_id=profile_id,
+        profile_id=1,
         window=window,
         limit=limit,
     )
@@ -4923,7 +5095,6 @@ async def generate_daily_digest(
     request: Request,
     digest_date: date = Query(alias="date"),
     to_ts: datetime | None = Query(default=None),
-    profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -4931,18 +5102,16 @@ async def generate_daily_digest(
             db,
             digest_date=digest_date,
             to_ts=to_ts,
-            profile_id=profile_id,
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         try:
             await db.rollback()
         except Exception:
             logger.exception("rollback failed after /digests/generate error")
         logger.exception(
-            "generate digest failed: profile_id=%s date=%s",
-            profile_id,
+            "generate digest failed: date=%s",
             digest_date.isoformat(),
         )
         return _json_error(
@@ -4950,29 +5119,26 @@ async def generate_daily_digest(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             error_code="digest_generate_failed",
             message="Generate digest failed",
-            detail=str(exc),
+            detail="Generate digest failed",
         )
 
 
 @app.get("/digests", response_model=DailyDigestRead)
 async def get_daily_digest(
     digest_date: date = Query(alias="date"),
-    profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     return await get_daily_digest_by_date_service(
         db,
         digest_date=digest_date,
-        profile_id=profile_id,
     )
 
 
 @app.get("/digests/dates", response_model=list[date])
 async def list_daily_digest_dates(
-    profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
-    return await list_daily_digest_dates_service(db, profile_id=profile_id)
+    return await list_daily_digest_dates_service(db)
 
 
 @app.get("/digests/{digest_id}", response_model=DailyDigestRead)

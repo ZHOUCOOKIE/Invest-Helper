@@ -413,6 +413,58 @@ def test_dashboard_returns_top_assets_and_pending_count() -> None:
     assert body["active_kols_7d"][0]["handle"] == "alice"
 
 
+def test_dashboard_asset_new_views_counts_use_business_time() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    three_days_ago = now - timedelta(days=3)
+
+    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=21,
+            platform="x",
+            author_handle="alice",
+            external_id="old-post",
+            url="https://x.com/alice/status/old-post",
+            content_text="older post",
+            posted_at=three_days_ago,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    # created_at is recent, but business time (posted_at) is 3 days ago.
+    fake_db.seed(
+        KolView(
+            id=31,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=78,
+            summary="old business time",
+            source_url="https://x.com/alice/status/old-post",
+            as_of=three_days_ago.date(),
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/dashboard?days=7")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["new_views_24h"] == 0
+    assert body["new_views_7d"] == 1
+    assert body["assets"][0]["new_views_24h"] == 0
+    assert body["assets"][0]["new_views_7d"] == 1
+
+
 def test_dashboard_clarity_ranking_applies_weight_confidence_and_decay() -> None:
     fake_db = FakeAsyncSession()
     now = datetime.now(UTC)
@@ -588,6 +640,207 @@ def test_asset_views_feed_supports_horizon_and_pagination() -> None:
     assert len(body["items"]) == 1
     assert body["items"][0]["horizon"] == "1w"
     assert body["items"][0]["kol_handle"] == "alice"
+
+
+def test_asset_view_post_detail_returns_raw_post_and_summary() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+
+    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        KolView(
+            id=201,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=88,
+            summary="看多观点摘要",
+            source_url="https://x.com/alice/status/201",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=301,
+            platform="x",
+            author_handle="alice",
+            external_id="201",
+            url="https://x.com/alice/status/201",
+            content_text="这是对应的贴文原文内容。",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=401,
+            raw_post_id=301,
+            status=ExtractionStatus.approved,
+            extracted_json={"summary": "model summary"},
+            model_name="dummy-v1",
+            extractor_name="dummy",
+            applied_kol_view_id=201,
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/assets/1/views/201/post-detail")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["asset_id"] == 1
+    assert body["view_id"] == 201
+    assert body["extraction_id"] == 401
+    assert body["raw_post_id"] == 301
+    assert body["author_handle"] == "alice"
+    assert body["summary"] == "看多观点摘要"
+    assert body["content_text"] == "这是对应的贴文原文内容。"
+
+
+def test_kol_assets_summary_returns_top_assets() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Asset(id=2, symbol="ETH", name="Ethereum", market="CRYPTO", created_at=now))
+    fake_db.seed(
+        KolView(
+            id=501,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=80,
+            summary="btc view 1",
+            source_url="https://x.com/alice/status/501",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=502,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_month,
+            confidence=81,
+            summary="btc view 2",
+            source_url="https://x.com/alice/status/502",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=503,
+            kol_id=1,
+            asset_id=2,
+            stance=Stance.bear,
+            horizon=Horizon.one_week,
+            confidence=70,
+            summary="eth view",
+            source_url="https://x.com/alice/status/503",
+            as_of=now.date(),
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/kols/1/assets-summary?top=5")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["kol_id"] == 1
+    assert body["total_views"] == 3
+    assert body["top_assets"][0]["symbol"] == "BTC"
+    assert body["top_assets"][0]["views_count"] == 2
+    assert body["top_assets"][1]["symbol"] == "ETH"
+    assert body["top_assets"][1]["views_count"] == 1
+
+
+def test_kol_views_support_asset_filter_and_order() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
+    fake_db.seed(Asset(id=2, symbol="ETH", name="Ethereum", market="CRYPTO", created_at=now))
+    fake_db.seed(
+        KolView(
+            id=601,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=80,
+            summary="older",
+            source_url="https://x.com/alice/status/601",
+            as_of=date(2026, 3, 1),
+            created_at=now - timedelta(days=2),
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=602,
+            kol_id=1,
+            asset_id=1,
+            stance=Stance.bull,
+            horizon=Horizon.one_week,
+            confidence=82,
+            summary="newer",
+            source_url="https://x.com/alice/status/602",
+            as_of=date(2026, 3, 2),
+            created_at=now - timedelta(days=1),
+        )
+    )
+    fake_db.seed(
+        KolView(
+            id=603,
+            kol_id=1,
+            asset_id=2,
+            stance=Stance.bear,
+            horizon=Horizon.one_month,
+            confidence=74,
+            summary="eth",
+            source_url="https://x.com/alice/status/603",
+            as_of=date(2026, 3, 3),
+            created_at=now,
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/kols/1/views?asset_id=1&limit=10&offset=0")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["kol_id"] == 1
+    assert body["asset_id"] == 1
+    assert body["total"] == 2
+    assert len(body["items"]) == 2
+    assert body["items"][0]["summary"] == "newer"
+    assert body["items"][1]["summary"] == "older"
 
 
 def test_x_import_is_idempotent_by_platform_and_external_id(monkeypatch) -> None:  # noqa: ANN001

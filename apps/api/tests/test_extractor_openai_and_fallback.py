@@ -523,7 +523,7 @@ def test_non_library_hasview_zero_auto_rejected_even_if_asset_views_present() ->
     assert meta.get("auto_reject_reason") == "hasview_zero"
 
 
-def test_hasview_one_with_asset_views_and_confidence_ge_70_auto_approved() -> None:
+def test_hasview_one_with_asset_views_and_confidence_ge_80_auto_approved() -> None:
     raw_post = _raw_post()
     extraction = _extraction(
         {
@@ -537,7 +537,7 @@ def test_hasview_one_with_asset_views_and_confidence_ge_70_auto_approved() -> No
                     "market": "CRYPTO",
                     "stance": "bull",
                     "horizon": "1w",
-                    "confidence": 70,
+                    "confidence": 80,
                     "summary": "看多",
                 }
             ],

@@ -21,7 +21,7 @@ It extracts structured signals, supports review workflows, and provides Daily Di
 - Strict enum handling for `market`, `stance`, and `horizon`.
 - Auto-review flow:
   - `hasview=0` => auto reject
-  - `hasview=1` + valid confidence path => threshold review (`70`)
+  - `hasview=1` + valid confidence path => threshold review (`80`)
 - Traceability chain across `raw_posts -> post_extractions -> kol_views -> daily_digests`.
 - Replay-ready digests stored by `profile_id + digest_date`.
 

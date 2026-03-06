@@ -18,6 +18,10 @@ const HORIZON_INDEX = new Map(DISPLAY_HORIZONS.map((value, idx) => [value, idx])
 function toDate(value) {
   if (value instanceof Date) return value;
   if (typeof value === "string" || typeof value === "number") {
+    if (typeof value === "string") {
+      const parsedRawMs = parseRawDateTimeMs(value);
+      if (parsedRawMs !== null) return new Date(parsedRawMs);
+    }
     const parsed = new Date(value);
     if (!Number.isNaN(parsed.getTime())) return parsed;
   }
@@ -63,25 +67,46 @@ function normalizeStance(value) {
 
 function parseAsOfMs(item) {
   if (typeof item.as_of === "string" && item.as_of) {
-    const parsed = new Date(`${item.as_of.slice(0, 10)}T00:00:00Z`);
-    if (!Number.isNaN(parsed.getTime())) return parsed.getTime();
+    const parsed = parseRawDateTimeMs(item.as_of.slice(0, 10));
+    if (parsed !== null) return parsed;
   }
   return null;
 }
 
-function parseIsoMs(value) {
+function parseRawDateTimeMs(value) {
   if (typeof value !== "string" || !value) return null;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.getTime();
+  const trimmed = value.trim();
+  const matched = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2})(?::(\d{2})(?::(\d{2}))?)?)?/,
+  );
+  if (!matched) return null;
+  const year = Number(matched[1]);
+  const month = Number(matched[2]);
+  const day = Number(matched[3]);
+  const hour = Number(matched[4] ?? "0");
+  const minute = Number(matched[5] ?? "0");
+  const second = Number(matched[6] ?? "0");
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    !Number.isInteger(hour) ||
+    !Number.isInteger(minute) ||
+    !Number.isInteger(second)
+  ) {
+    return null;
+  }
+  return Date.UTC(year, Math.max(0, month - 1), day, hour, minute, second, 0);
 }
 
 function primaryTimeMs(item, fallbackNowMs) {
-  const postedAt = parseIsoMs(item.posted_at);
+  const postedAtRaw = parseRawDateTimeMs(item.posted_at_raw);
+  if (postedAtRaw !== null) return postedAtRaw;
+  const postedAt = parseRawDateTimeMs(item.posted_at);
   if (postedAt !== null) return postedAt;
   const asOf = parseAsOfMs(item);
   if (asOf !== null) return asOf;
-  const createdAt = parseIsoMs(item.created_at);
+  const createdAt = parseRawDateTimeMs(item.created_at);
   if (createdAt !== null) return createdAt;
   return fallbackNowMs;
 }

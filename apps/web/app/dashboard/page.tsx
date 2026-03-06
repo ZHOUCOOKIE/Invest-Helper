@@ -54,6 +54,9 @@ type DashboardClarityRankingItem = {
   clarity_score: number;
   n: number;
   k: number;
+  bull_count: number;
+  bear_count: number;
+  total_count: number;
   top_contributors: DashboardClarityContributor[];
 };
 
@@ -69,7 +72,47 @@ type DashboardResponse = {
 
 type WindowKey = "24h" | "7d";
 
-const horizonOrder: Array<DashboardAssetLatestView["horizon"]> = ["intraday", "1w", "1m", "3m", "1y"];
+const horizonRank: Record<string, number> = {
+  intraday: 0,
+  "1w": 1,
+  "1m": 2,
+  "3m": 3,
+  "1y": 4,
+};
+
+function horizonLabel(horizon: string): string {
+  const map: Record<string, string> = {
+    intraday: "日内",
+    "1w": "1周",
+    "1m": "1月",
+    "3m": "3月",
+    "1y": "1年",
+  };
+  return map[horizon] ?? horizon;
+}
+
+function stanceLabel(stance: string): string {
+  const map: Record<string, string> = {
+    bull: "看涨",
+    bear: "看跌",
+    neutral: "中性",
+  };
+  return map[stance] ?? stance;
+}
+
+function pickLatestViews(asset: DashboardAsset, limit = 3): DashboardAssetLatestView[] {
+  return [...asset.latest_views_by_horizon]
+    .sort((a, b) => {
+      const aTimeRaw = a.as_of || a.created_at;
+      const bTimeRaw = b.as_of || b.created_at;
+      if (aTimeRaw !== bTimeRaw) return bTimeRaw.localeCompare(aTimeRaw);
+      const aRank = horizonRank[a.horizon] ?? 999;
+      const bRank = horizonRank[b.horizon] ?? 999;
+      if (aRank !== bRank) return aRank - bRank;
+      return b.kol_view_id - a.kol_view_id;
+    })
+    .slice(0, Math.max(1, limit));
+}
 
 function cmpByWindow(a: DashboardAsset, b: DashboardAsset, windowKey: WindowKey): number {
   const delta =
@@ -83,8 +126,8 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [windowKey, setWindowKey] = useState<WindowKey>("24h");
-  const [clarityWindow, setClarityWindow] = useState<WindowKey>("7d");
+  const windowKey: WindowKey = "24h";
+  const [clarityWindow, setClarityWindow] = useState<WindowKey>("24h");
   const [showAllAssets, setShowAllAssets] = useState(false);
   const todayDigestDate = new Date().toISOString().slice(0, 10);
 
@@ -94,7 +137,6 @@ export default function DashboardPage() {
     try {
       const params = new URLSearchParams({
         days: "7",
-        profile_id: "1",
         window: clarityWindow,
         limit: "10",
         assets_window: windowKey,
@@ -111,7 +153,7 @@ export default function DashboardPage() {
       }
       setData(body as DashboardResponse);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      setError(err instanceof Error ? err.message : "未知错误");
     } finally {
       setLoading(false);
     }
@@ -136,31 +178,24 @@ export default function DashboardPage() {
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace", display: "grid", gap: "14px" }}>
-      <h1>Portfolio Dashboard</h1>
+      <h1>投资组合看板</h1>
 
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
         <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap" }}>
           <strong>新增观点: {windowKey === "24h" ? (data?.new_views_24h ?? "-") : (data?.new_views_7d ?? "-")}</strong>
-          <span>pending extractions: {data?.pending_extractions_count ?? "-"}</span>
-          <button type="button" onClick={() => setWindowKey("24h")} disabled={windowKey === "24h"}>
-            24h
-          </button>
-          <button type="button" onClick={() => setWindowKey("7d")} disabled={windowKey === "7d"}>
-            7d
-          </button>
+          <span>待处理抽取: {data?.pending_extractions_count ?? "-"}</span>
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="按 symbol/name 搜索"
+            placeholder="按资产代码/名称搜索"
             style={{ minWidth: "240px" }}
           />
           <button type="button" onClick={() => void load()} disabled={loading}>
-            {loading ? "Loading..." : "Refresh"}
+            {loading ? "加载中..." : "刷新"}
           </button>
           <Link href="/ingest">手动导入</Link>
           <Link href="/kols">KOL管理</Link>
           <Link href="/extractions">审核队列</Link>
-          <Link href="/profile">Profile 设置</Link>
           <Link href={`/digests/${todayDigestDate}`}>今日日报</Link>
         </div>
       </section>
@@ -210,12 +245,10 @@ export default function DashboardPage() {
                         color: item.direction === "bull" ? "green" : item.direction === "bear" ? "crimson" : "#666",
                       }}
                     >
-                      {item.direction}
+                      {item.direction === "bull" ? "看涨" : item.direction === "bear" ? "看跌" : "中性"}
                     </span>
-                    <span>score: {item.clarity_score.toFixed(4)}</span>
-                    <span>
-                      N/K: {item.n}/{item.k}
-                    </span>
+                    <span>清晰度: {item.clarity_score.toFixed(4)}</span>
+                    <span>看涨/看跌/总数: {item.bull_count}/{item.bear_count}/{item.total_count || item.n}</span>
                   </Link>
                 ))}
               </div>
@@ -225,7 +258,7 @@ export default function DashboardPage() {
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
               <h2 style={{ marginTop: 0, marginBottom: "8px" }}>
-                资产列表 {showAllAssets ? "(全部)" : "(Top 15)"}
+                资产列表 {showAllAssets ? "(全部)" : "(前 15)"}
               </h2>
               <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
                 {!showAllAssets && (data?.total_assets_count ?? 0) > 15 && (
@@ -235,7 +268,7 @@ export default function DashboardPage() {
                 )}
                 {showAllAssets && (
                   <button type="button" onClick={() => setShowAllAssets(false)}>
-                    收起到 Top 15
+                    收起到前 15
                   </button>
                 )}
               </div>
@@ -258,19 +291,30 @@ export default function DashboardPage() {
                       </div>
                     </div>
                     <div style={{ marginTop: "8px", display: "grid", gap: "6px" }}>
-                      {horizonOrder
-                        .map((horizon) =>
-                          asset.latest_views_by_horizon.find((item) => item.horizon === horizon),
-                        )
-                        .filter((item): item is DashboardAssetLatestView => Boolean(item))
-                        .map((item) => (
-                          <div key={item.kol_view_id} style={{ background: "#fafafa", borderRadius: "6px", padding: "6px 8px" }}>
-                            <strong>{item.horizon}</strong> [{item.stance}/{item.confidence}] {item.summary || "暂无摘要"}
-                            {" · "}
-                            {item.kol_display_name || item.kol_handle || `KOL#${item.kol_id}`}
-                          </div>
-                        ))}
-                      {asset.latest_views_by_horizon.length === 0 && <small style={{ color: "#666" }}>暂无观点</small>}
+                      {(() => {
+                        const items = pickLatestViews(asset, 3);
+                        if (items.length === 0) return <small key="none" style={{ color: "#666" }}>暂无观点</small>;
+                        return (
+                          <>
+                            {items.map((item) => (
+                              <div
+                                key={item.kol_view_id}
+                                style={{
+                                  background: "color-mix(in srgb, var(--bg-elev-strong) 86%, transparent 14%)",
+                                  border: "1px solid var(--line)",
+                                  borderRadius: "6px",
+                                  padding: "6px 8px",
+                                }}
+                              >
+                                <strong>{horizonLabel(item.horizon)}</strong> [{stanceLabel(item.stance)}/{item.confidence}]{" "}
+                                {item.summary || "暂无摘要"}
+                                {" · "}
+                                {item.kol_display_name || item.kol_handle || `KOL#${item.kol_id}`}
+                              </div>
+                            ))}
+                          </>
+                        );
+                      })()}
                     </div>
                   </article>
                 ))}
@@ -286,7 +330,7 @@ export default function DashboardPage() {
                 {data.active_kols_7d.map((kol) => (
                   <article key={kol.kol_id} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
                     <div>
-                      <strong>{kol.display_name || kol.handle}</strong> ({kol.platform}/@{kol.handle}) · views:{" "}
+                      <strong>{kol.display_name || kol.handle}</strong> ({kol.platform}/@{kol.handle}) · 观点数:{" "}
                       {kol.views_count_7d}
                     </div>
                     <small>

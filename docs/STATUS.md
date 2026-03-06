@@ -18,7 +18,7 @@
   - invalid/missing `library_entry` downgrades to `islibrary=0`
 - Auto review:
   - `hasview=0` auto reject
-  - auto approve requires `hasview=1` + threshold flow (`70`)
+  - auto approve requires `hasview=1` + threshold flow (`80`)
   - writes `meta.auto_policy_applied`
 - Daily Digest replay contract:
   - single-row overwrite by `profile_id + digest_date`
@@ -30,4 +30,4 @@
 
 ## Notes
 - Legacy read tolerance remains for historical records; old `library_tags` is ignored.
-- Prompt text currently asks model output `asset_views.confidence>=80`, while runtime normalize/auto-review thresholds remain `>=70`.
+- Prompt text currently asks model output `asset_views.confidence>=80`; runtime normalize threshold is `>=70`, and auto-review threshold is `>=80`.

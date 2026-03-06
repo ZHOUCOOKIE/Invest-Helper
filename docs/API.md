@@ -39,7 +39,7 @@ Top-level model output must include these 6 core keys:
 
 ## Auto Review
 - if `hasview=0`: auto reject (`hasview_zero`)
-- auto approve requires `hasview=1` and confidence path meeting threshold (`70`)
+- auto approve requires `hasview=1` and confidence path meeting threshold (`80`)
 - `meta.auto_policy_applied` is recorded (current values: `threshold_asset|no_auto_review_user_trigger`)
 
 ## Backward Read Tolerance

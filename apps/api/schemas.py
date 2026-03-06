@@ -605,6 +605,9 @@ class DashboardClarityRankingRead(BaseModel):
     clarity_score: float
     n: int
     k: int
+    bull_count: int = 0
+    bear_count: int = 0
+    total_count: int = 0
     top_contributors: list[DashboardClarityContributorRead] = []
 
 
@@ -715,6 +718,7 @@ class AssetViewsTimelineItemRead(BaseModel):
     as_of: date
     created_at: datetime
     posted_at: datetime | None = None
+    posted_at_raw: str | None = None
     extraction_id: int | None = None
 
 
@@ -724,6 +728,59 @@ class AssetViewsTimelineRead(BaseModel):
     since_date: date
     generated_at: datetime
     items: list[AssetViewsTimelineItemRead]
+
+
+class AssetViewPostDetailRead(BaseModel):
+    asset_id: int
+    view_id: int
+    extraction_id: int | None = None
+    raw_post_id: int | None = None
+    source_url: str
+    summary: str
+    posted_at: datetime | None = None
+    posted_at_raw: str | None = None
+    author_handle: str | None = None
+    content_text: str | None = None
+
+
+class KolAssetSummaryItemRead(BaseModel):
+    asset_id: int
+    symbol: str
+    name: str | None = None
+    market: str | None = None
+    views_count: int
+
+
+class KolAssetSummaryRead(BaseModel):
+    kol_id: int
+    total_views: int
+    top_assets: list[KolAssetSummaryItemRead] = Field(default_factory=list)
+
+
+class KolAssetViewItemRead(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
+    id: int
+    asset_id: int
+    asset_symbol: str
+    asset_name: str | None = None
+    stance: Stance
+    horizon: Horizon
+    confidence: int
+    summary: str
+    source_url: str
+    as_of: date
+    created_at: datetime
+
+
+class KolAssetViewsRead(BaseModel):
+    kol_id: int
+    asset_id: int | None = None
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+    items: list[KolAssetViewItemRead] = Field(default_factory=list)
 
 
 class DailyDigestPostSummaryRead(BaseModel):

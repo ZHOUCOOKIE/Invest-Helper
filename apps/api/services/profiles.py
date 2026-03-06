@@ -16,7 +16,7 @@ from schemas import (
 )
 
 DEFAULT_PROFILE_ID = 1
-DEFAULT_PROFILE_NAME = "default"
+SYSTEM_PROFILE_NAME = "system"
 
 
 def _normalize_market(value: str) -> str:
@@ -26,9 +26,14 @@ def _normalize_market(value: str) -> str:
 async def ensure_default_profile(db: AsyncSession) -> UserProfile:
     profile = await db.get(UserProfile, DEFAULT_PROFILE_ID)
     if profile is not None:
+        # Normalize legacy bootstrap names.
+        if profile.name.strip().lower() in {"default", "profile-1"}:
+            profile.name = SYSTEM_PROFILE_NAME
+            await db.commit()
+            await db.refresh(profile)
         return profile
 
-    profile = UserProfile(id=DEFAULT_PROFILE_ID, name=DEFAULT_PROFILE_NAME)
+    profile = UserProfile(id=DEFAULT_PROFILE_ID, name=SYSTEM_PROFILE_NAME)
     db.add(profile)
     await db.commit()
     await db.refresh(profile)

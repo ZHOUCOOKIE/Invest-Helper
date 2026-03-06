@@ -24,7 +24,7 @@
 - `horizon` 必须严格取值：`intraday|1w|1m|3m|1y`
 - `hasview` 必须是 `0|1`，且最终会按 `asset_views` 是否为空重算
 - `asset_views` 项固定：`{symbol,market,stance,horizon,confidence,summary}`
-- Prompt 对模型约束为 `confidence>=80`，服务端 normalize 最终保留阈值为 `confidence>=70`
+- Prompt 对模型约束为 `confidence>=80`，服务端 normalize 最终保留阈值为 `confidence>=70`，auto-review 阈值为 `confidence>=80`
 - `summary` 中文约束只检查：
   - `asset_views[*].summary`
   - `library_entry.summary`
@@ -43,7 +43,7 @@
 ## 4. Auto-review
 - asset 分支：沿用资产视图阈值流程
 - `hasview=0` 会自动拒绝
-- 自动通过必须满足 `hasview=1` 且走置信度阈值路径（`>=70`）
+- 自动通过必须满足 `hasview=1` 且走置信度阈值路径（`>=80`）
 - 记录 `meta.auto_policy_applied`
 
 ## 5. 可追溯性

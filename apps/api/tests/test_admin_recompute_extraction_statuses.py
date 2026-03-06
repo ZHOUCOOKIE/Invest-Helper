@@ -175,7 +175,7 @@ def _seed_data(fake_db: FakeAsyncSession) -> None:
                         "market": "CRYPTO",
                         "stance": "bull",
                         "horizon": "1w",
-                        "confidence": 70,
+                        "confidence": 80,
                         "summary": "看多",
                     }
                 ],
@@ -202,7 +202,7 @@ def _seed_data(fake_db: FakeAsyncSession) -> None:
                         "market": "CRYPTO",
                         "stance": "neutral",
                         "horizon": "1w",
-                        "confidence": 72,
+                        "confidence": 80,
                         "summary": "中性",
                     }
                 ],
@@ -309,7 +309,7 @@ def _seed_data(fake_db: FakeAsyncSession) -> None:
                         "market": "CRYPTO",
                         "stance": "bull",
                         "horizon": "3m",
-                        "confidence": 75,
+                        "confidence": 70,
                         "summary": "看多",
                     }
                 ],
@@ -355,11 +355,11 @@ def test_admin_recompute_extraction_statuses_updates_all_statuses_by_rules() -> 
 
     assert response.status_code == 200
     body = response.json()
-    assert body["updated"] == 6
-    assert body["approved_count"] == 4
-    assert body["rejected_count"] == 4
+    assert body["updated"] == 5
+    assert body["approved_count"] == 3
+    assert body["rejected_count"] == 5
     assert body["skipped_terminal_count"] == 0
-    assert set(body["updated_ids"]) == {101, 102, 103, 105, 106, 107}
+    assert set(body["updated_ids"]) == {101, 102, 103, 105, 106}
 
     assert fake_db._data[PostExtraction][101].status == ExtractionStatus.rejected
     assert fake_db._data[PostExtraction][102].status == ExtractionStatus.approved
@@ -367,5 +367,5 @@ def test_admin_recompute_extraction_statuses_updates_all_statuses_by_rules() -> 
     assert fake_db._data[PostExtraction][104].status == ExtractionStatus.approved
     assert fake_db._data[PostExtraction][105].status == ExtractionStatus.rejected
     assert fake_db._data[PostExtraction][106].status == ExtractionStatus.approved
-    assert fake_db._data[PostExtraction][107].status == ExtractionStatus.approved
+    assert fake_db._data[PostExtraction][107].status == ExtractionStatus.rejected
     assert fake_db._data[PostExtraction][108].status == ExtractionStatus.rejected

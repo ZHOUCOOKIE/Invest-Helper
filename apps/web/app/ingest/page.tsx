@@ -13,21 +13,6 @@ type ExtractorStatus = {
   max_output_tokens: number;
 };
 
-type Kol = {
-  id: number;
-  platform: string;
-  handle: string;
-  display_name: string | null;
-  enabled: boolean;
-};
-
-type AssetItem = {
-  id: number;
-  symbol: string;
-  name: string | null;
-  market: string | null;
-};
-
 type XImportItem = {
   external_id: string;
   author_handle: string;
@@ -134,21 +119,6 @@ type FollowingImportStats = {
   errors: FollowingImportError[];
 };
 
-type AdminClearPendingResponse = {
-  deleted_extractions_count: number;
-  deleted_raw_posts_count: number;
-  scoped_author_handle: string | null;
-};
-
-type AdminHardDeleteResponse = {
-  operation: string;
-  target: string;
-  derived_only: boolean;
-  enable_cascade: boolean;
-  also_delete_raw_posts: boolean;
-  counts: Record<string, number>;
-};
-
 type ExtractBatchStats = {
   requested_count: number;
   success_count: number;
@@ -233,9 +203,9 @@ function buildDirectConvertUrl(params: URLSearchParams): string {
 
 function formatConvertNetworkError(err: unknown): string {
   const baseUrl = getDirectApiBaseUrl();
-  const rawMessage = err instanceof Error ? err.message : String(err ?? "unknown error");
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "未知错误");
   return [
-    `Convert failed: 无法连接后端 ${baseUrl}`,
+    `转换失败：无法连接后端 ${baseUrl}`,
     "请确认后端服务已启动，或检查是否被代理层的大文件限制中断（例如 10MB 限制导致 ECONNRESET/socket hang up）。",
     `原始错误: ${rawMessage}`,
   ].join(" ");
@@ -243,9 +213,9 @@ function formatConvertNetworkError(err: unknown): string {
 
 function formatImportNetworkError(err: unknown): string {
   const baseUrl = getDirectApiBaseUrl();
-  const rawMessage = err instanceof Error ? err.message : String(err ?? "unknown error");
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "未知错误");
   return [
-    `Import failed: 无法连接后端 ${baseUrl}`,
+    `导入失败：无法连接后端 ${baseUrl}`,
     "请检查后端是否启动、CORS 是否允许当前前端域名，或网络是否中断。",
     `原始错误: ${rawMessage}`,
   ].join(" ");
@@ -253,10 +223,10 @@ function formatImportNetworkError(err: unknown): string {
 
 function formatExtractJobNetworkError(stage: "create" | "poll", err: unknown): string {
   const baseUrl = getDirectApiBaseUrl();
-  const rawMessage = err instanceof Error ? err.message : String(err ?? "unknown error");
+  const rawMessage = err instanceof Error ? err.message : String(err ?? "未知错误");
   const action = stage === "create" ? "创建抽取任务" : "轮询抽取任务";
   return [
-    `Extract job failed: ${action}时无法连接后端 ${baseUrl}`,
+    `抽取任务失败：${action}时无法连接后端 ${baseUrl}`,
     "请检查后端是否启动、CORS 是否允许当前前端域名，或网络是否中断。",
     `原始错误: ${rawMessage}`,
   ].join(" ");
@@ -278,13 +248,9 @@ function isStandardImportJson(value: unknown): value is XImportItem[] {
 }
 
 function toDateKeyFromIso(value: string): string | null {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.toISOString().slice(0, 10);
-}
-
-function normalizeDigestDateParam(value: string): string | null {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+  const trimmed = value.trim();
+  const matched = trimmed.match(/^(\d{4}-\d{2}-\d{2})/);
+  return matched ? matched[1] : null;
 }
 
 export default function IngestPage() {
@@ -292,9 +258,6 @@ export default function IngestPage() {
   const [extractBatchSize, setExtractBatchSize] = useState(20);
   const [statusError, setStatusError] = useState<string | null>(null);
 
-  const [kols, setKols] = useState<Kol[]>([]);
-  const [assets, setAssets] = useState<AssetItem[]>([]);
-  const [assetsError, setAssetsError] = useState<string | null>(null);
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [onlyFollowedKols, setOnlyFollowedKols] = useState(true);
@@ -313,26 +276,14 @@ export default function IngestPage() {
   const [extractStats, setExtractStats] = useState<ExtractBatchStats | null>(null);
   const [selectedHandles, setSelectedHandles] = useState<string[]>([]);
   const [extractByHandle, setExtractByHandle] = useState<Record<string, ExtractBatchStats>>({});
-  const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
   const [progress, setProgress] = useState<XProgress | null>(null);
-  const [generatedDigestDate, setGeneratedDigestDate] = useState<string | null>(null);
-  const [cleanupKolId, setCleanupKolId] = useState("");
-  const [cleanupKolCascade, setCleanupKolCascade] = useState(false);
-  const [cleanupKolDeleteRawPosts, setCleanupKolDeleteRawPosts] = useState(false);
-  const [cleanupAssetId, setCleanupAssetId] = useState("");
-  const [cleanupAssetCascade, setCleanupAssetCascade] = useState(false);
-  const [cleanupDigestDate, setCleanupDigestDate] = useState(new Date().toISOString().slice(0, 10));
-  const [cleanupDigestProfileId, setCleanupDigestProfileId] = useState("1");
   const [followingFile, setFollowingFile] = useState<File | null>(null);
+  const [followingDragActive, setFollowingDragActive] = useState(false);
   const [followingImportBusy, setFollowingImportBusy] = useState(false);
   const [followingImportError, setFollowingImportError] = useState<string | null>(null);
   const [followingImportStats, setFollowingImportStats] = useState<FollowingImportStats | null>(null);
   const extractPollControllerRef = useRef<AbortController | null>(null);
   const extractPollRunIdRef = useRef(0);
-  const safeDigestDateParam = useMemo(() => {
-    const normalized = normalizeDigestDateParam(generatedDigestDate ?? digestDate);
-    return normalized ?? new Date().toISOString().slice(0, 10);
-  }, [generatedDigestDate, digestDate]);
   const cancelExtractPolling = (reason?: string) => {
     extractPollRunIdRef.current += 1;
     extractPollControllerRef.current?.abort();
@@ -367,42 +318,14 @@ export default function IngestPage() {
         const extractorRes = await fetch("/api/extractor-status", { cache: "no-store" });
         const extractorParsed = await parseApiResponse<ExtractorStatus>(extractorRes);
         if (!extractorRes.ok || !extractorParsed.data) {
-          throw new Error(formatApiError("Load extractor status failed", extractorParsed.data, extractorParsed.textBody, extractorParsed.requestId));
+          throw new Error(formatApiError("加载抽取器状态失败", extractorParsed.data, extractorParsed.textBody, extractorParsed.requestId));
         }
         setExtractorStatus(extractorParsed.data as ExtractorStatus);
       } catch (err) {
-        setStatusError(err instanceof Error ? err.message : "Load extractor status failed");
-      }
-    };
-    const loadKols = async () => {
-      try {
-        const res = await fetch("/api/kols?enabled=true", { cache: "no-store" });
-        const parsed = await parseApiResponse<Kol[]>(res);
-        if (!res.ok || !Array.isArray(parsed.data)) {
-          throw new Error(formatApiError("Load kols failed", parsed.data, parsed.textBody, parsed.requestId));
-        }
-        const xKols = (parsed.data as Kol[]).filter((item) => item.platform === "x");
-        setKols(xKols);
-      } catch (err) {
-        setWorkflowError(err instanceof Error ? err.message : "Load kols failed");
-      }
-    };
-    const loadAssets = async () => {
-      try {
-        const res = await fetch("/api/assets", { cache: "no-store" });
-        const parsed = await parseApiResponse<AssetItem[]>(res);
-        if (!res.ok || !Array.isArray(parsed.data)) {
-          throw new Error(formatApiError("Load assets failed", parsed.data, parsed.textBody, parsed.requestId));
-        }
-        const sorted = [...(parsed.data as AssetItem[])].sort((a, b) => a.symbol.localeCompare(b.symbol));
-        setAssets(sorted);
-      } catch (err) {
-        setAssetsError(err instanceof Error ? err.message : "Load assets failed");
+        setStatusError(err instanceof Error ? err.message : "加载抽取器状态失败");
       }
     };
     void loadStatus();
-    void loadKols();
-    void loadAssets();
   }, []);
 
   const formatApiError = (
@@ -419,8 +342,8 @@ export default function IngestPage() {
       if (typeof obj.message === "string" && obj.message) message = obj.message;
       else if (typeof obj.detail === "string" && obj.detail) message = obj.detail;
     } else if (textBody) {
-      const statusPart = typeof statusCode === "number" ? `status=${statusCode}` : "status=unknown";
-      const pathPart = requestPath ? `path=${requestPath}` : "path=unknown";
+      const statusPart = typeof statusCode === "number" ? `状态=${statusCode}` : "状态=未知";
+      const pathPart = requestPath ? `路径=${requestPath}` : "路径=未知";
       message = `非 JSON 错误文本 (${statusPart}, ${pathPart}): ${textBody.slice(0, 300)}`;
     }
     return requestId ? `${message} (request_id=${requestId})` : message;
@@ -467,7 +390,7 @@ export default function IngestPage() {
     const res = await fetch(`/api/ingest/x/progress${query}`, { cache: "no-store" });
     const parsed = await parseApiResponse<XProgress>(res);
     if (!res.ok || !parsed.data) {
-      throw new Error(formatApiError("Load progress failed", parsed.data, parsed.textBody, parsed.requestId));
+      throw new Error(formatApiError("加载进度失败", parsed.data, parsed.textBody, parsed.requestId));
     }
     setProgress(parsed.data as XProgress);
   };
@@ -503,7 +426,7 @@ export default function IngestPage() {
     const parsed = await parseApiResponse<XConvertResult>(res);
     if (!res.ok || !parsed.data || !("items" in (parsed.data as Record<string, unknown>))) {
       setWorkflowRequestId(parsed.requestId);
-      throw new Error(formatApiError("Convert failed", parsed.data, parsed.textBody, parsed.requestId));
+      throw new Error(formatApiError("转换失败", parsed.data, parsed.textBody, parsed.requestId));
     }
     return parsed.data as XConvertResult;
   };
@@ -525,7 +448,7 @@ export default function IngestPage() {
     const parsed = await parseApiResponse<XImportStats>(res);
     setWorkflowRequestId(parsed.requestId);
     if (!res.ok || !parsed.data) {
-      throw new Error(formatApiError("Import failed", parsed.data, parsed.textBody, parsed.requestId));
+      throw new Error(formatApiError("导入失败", parsed.data, parsed.textBody, parsed.requestId));
     }
     return parsed.data as XImportStats;
   };
@@ -563,7 +486,7 @@ export default function IngestPage() {
       });
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        throw new Error("Extract job polling cancelled");
+        throw new Error("抽取任务轮询已取消");
       }
       throw new Error(formatExtractJobNetworkError("create", err));
     }
@@ -572,7 +495,7 @@ export default function IngestPage() {
     if (!createRes.ok || !createParsed.data || !("job_id" in (createParsed.data as Record<string, unknown>))) {
       throw new Error(
         formatApiError(
-          "Create extract job failed",
+          "创建抽取任务失败",
           createParsed.data,
           createParsed.textBody,
           createParsed.requestId,
@@ -586,7 +509,7 @@ export default function IngestPage() {
     try {
       for (let attempt = 0; attempt < 1800; attempt += 1) {
         if (extractPollRunIdRef.current !== runId) {
-          throw new Error("Extract job polling superseded by a newer run");
+          throw new Error("抽取任务轮询已被新的任务替代");
         }
         let res: Response;
         try {
@@ -596,7 +519,7 @@ export default function IngestPage() {
           });
         } catch (err) {
           if (err instanceof DOMException && err.name === "AbortError") {
-            throw new Error("Extract job polling cancelled");
+            throw new Error("抽取任务轮询已取消");
           }
           throw new Error(formatExtractJobNetworkError("poll", err));
         }
@@ -604,18 +527,18 @@ export default function IngestPage() {
         if (!res.ok || !parsed.data) {
           setWorkflowRequestId(parsed.requestId);
           throw new Error(
-            formatApiError("Load extract job failed", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath),
+            formatApiError("加载抽取任务失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath),
           );
         }
         const job = parsed.data as ExtractJob;
         setWorkflowRequestId(parsed.requestId);
         setWorkflowStep(
-          `Extract job ${job.status}: success=${job.success_count}, failed=${job.failed_count}, skipped=${job.skipped_count}, requested=${job.requested_count}, ai_used=${job.ai_call_used}${job.ai_call_limit_total !== null ? `/${job.ai_call_limit_total}` : ""}`,
+          `抽取任务 ${job.status}：成功=${job.success_count}，失败=${job.failed_count}，跳过=${job.skipped_count}，请求=${job.requested_count}，AI调用=${job.ai_call_used}${job.ai_call_limit_total !== null ? `/${job.ai_call_limit_total}` : ""}`,
         );
         if (job.is_terminal) {
           if (job.status === "failed" || job.status === "cancelled" || job.status === "timeout") {
             const summary = job.last_error_summary ? `: ${job.last_error_summary}` : "";
-            throw new Error(`Extract job failed${summary}${parsed.requestId ? ` (request_id=${parsed.requestId})` : ""}`);
+            throw new Error(`抽取任务失败${summary}${parsed.requestId ? ` (request_id=${parsed.requestId})` : ""}`);
           }
           return job;
         }
@@ -631,7 +554,7 @@ export default function IngestPage() {
           );
         });
       }
-      throw new Error("Extract job polling timeout");
+      throw new Error("抽取任务轮询超时");
     } finally {
       if (extractPollControllerRef.current === pollController) {
         extractPollControllerRef.current = null;
@@ -640,11 +563,10 @@ export default function IngestPage() {
   };
 
   const generateDigest = async (dateStr: string) => {
-    setWorkflowStep(`Generating digest for ${dateStr}...`);
-    const res = await fetch(`/api/digests/generate?date=${dateStr}&profile_id=1`, { method: "POST" });
+    setWorkflowStep(`正在生成 ${dateStr} 的日报...`);
+    const res = await fetch(`/api/digests/generate?date=${dateStr}`, { method: "POST" });
     const body = (await res.json()) as { detail?: string };
-    if (!res.ok) throw new Error(body.detail ?? "Generate digest failed");
-    setGeneratedDigestDate(dateStr);
+    if (!res.ok) throw new Error(body.detail ?? "生成日报失败");
   };
 
   const onSelectFile = (targetFile: File | null) => {
@@ -674,161 +596,31 @@ export default function IngestPage() {
     onSelectFile(dropped);
   };
 
-  const clearPending = async () => {
-    const confirmText = window.prompt(
-      "Dangerous operation: this will hard delete pending/failed extractions. Type YES to continue.",
-      "",
-    );
-    if (confirmText !== "YES") return;
-    cancelExtractPolling("Extract polling cancelled before cleanup.");
-    setWorkflowError(null);
-    try {
-      const params = new URLSearchParams({
-        confirm: "YES",
-        also_delete_raw_posts: clearAlsoDeleteRawPosts ? "true" : "false",
-        enable_cascade: clearAlsoDeleteRawPosts ? "true" : "false",
-      });
-      if (progressHandle) params.set("author_handle", progressHandle);
-      const res = await fetch(`/api/admin/extractions/pending?${params.toString()}`, { method: "DELETE" });
-      const body = (await res.json()) as AdminClearPendingResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Clear pending failed") : "Clear pending failed");
-      }
-      await refreshProgress();
-      setWorkflowStep(
-        `Deleted pending/failed extractions=${(body as AdminClearPendingResponse).deleted_extractions_count}, raw_posts=${(body as AdminClearPendingResponse).deleted_raw_posts_count}.`,
-      );
-    } catch (err) {
-      setWorkflowError(err instanceof Error ? err.message : "Clear pending failed");
-    }
+  const onSelectFollowingFile = (targetFile: File | null) => {
+    setFollowingFile(targetFile);
+    setFollowingImportError(null);
+    setFollowingImportStats(null);
   };
 
-  const askYes = (message: string): boolean => {
-    const confirmText = window.prompt(message, "");
-    return confirmText === "YES";
-  };
-
-  const refreshCleanupScope = async () => {
-    await refreshProgress();
-    const [kolsRes, assetsRes] = await Promise.all([
-      fetch("/api/kols?enabled=true", { cache: "no-store" }),
-      fetch("/api/assets", { cache: "no-store" }),
-    ]);
-    if (kolsRes.ok) {
-      const body = (await kolsRes.json()) as Kol[];
-      const xKols = body.filter((item) => item.platform === "x");
-      setKols(xKols);
-    }
-    if (assetsRes.ok) {
-      const body = (await assetsRes.json()) as AssetItem[];
-      setAssets([...body].sort((a, b) => a.symbol.localeCompare(b.symbol)));
-    }
-  };
-
-  const deleteKolCleanup = async () => {
-    const kolId = Number(cleanupKolId);
-    if (!Number.isFinite(kolId) || kolId <= 0) {
-      setWorkflowError("请输入合法的 KOL ID");
-      return;
-    }
-    if (!askYes("Dangerous operation: delete KOL derived data. Type YES to continue.")) return;
-    if ((cleanupKolCascade || cleanupKolDeleteRawPosts) && !askYes("Cascade/raw delete requested. Type YES again to continue.")) {
-      return;
-    }
-    setWorkflowError(null);
-    try {
-      const params = new URLSearchParams({
-        confirm: "YES",
-        enable_cascade: cleanupKolCascade ? "true" : "false",
-        also_delete_raw_posts: cleanupKolDeleteRawPosts ? "true" : "false",
-      });
-      const res = await fetch(`/api/admin/kols/${kolId}?${params.toString()}`, { method: "DELETE" });
-      const body = (await res.json()) as AdminHardDeleteResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Delete KOL failed") : "Delete KOL failed");
-      }
-      const done = body as AdminHardDeleteResponse;
-      await refreshCleanupScope();
-      setWorkflowStep(`KOL cleanup done: ${JSON.stringify(done.counts)}`);
-    } catch (err) {
-      setWorkflowError(err instanceof Error ? err.message : "Delete KOL failed");
-    }
-  };
-
-  const deleteAssetCleanup = async () => {
-    const assetId = Number(cleanupAssetId);
-    if (!Number.isFinite(assetId) || assetId <= 0) {
-      setWorkflowError("请输入合法的 Asset ID");
-      return;
-    }
-    if (!askYes("Dangerous operation: delete asset derived data. Type YES to continue.")) return;
-    if (cleanupAssetCascade && !askYes("Cascade asset base deletion requested. Type YES again to continue.")) {
-      return;
-    }
-    setWorkflowError(null);
-    try {
-      const params = new URLSearchParams({
-        confirm: "YES",
-        enable_cascade: cleanupAssetCascade ? "true" : "false",
-      });
-      const res = await fetch(`/api/admin/assets/${assetId}?${params.toString()}`, { method: "DELETE" });
-      const body = (await res.json()) as AdminHardDeleteResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Delete asset failed") : "Delete asset failed");
-      }
-      const done = body as AdminHardDeleteResponse;
-      await refreshCleanupScope();
-      setWorkflowStep(`Asset cleanup done: ${JSON.stringify(done.counts)}`);
-    } catch (err) {
-      setWorkflowError(err instanceof Error ? err.message : "Delete asset failed");
-    }
-  };
-
-  const deleteDigestByDateCleanup = async () => {
-    const profileId = Number(cleanupDigestProfileId);
-    if (!cleanupDigestDate) {
-      setWorkflowError("请选择 digest_date");
-      return;
-    }
-    if (!Number.isFinite(profileId) || profileId <= 0) {
-      setWorkflowError("请输入合法 profile_id");
-      return;
-    }
-    if (!askYes("Dangerous operation: delete digests by date/profile. Type YES to continue.")) return;
-    setWorkflowError(null);
-    try {
-      const params = new URLSearchParams({
-        confirm: "YES",
-        digest_date: cleanupDigestDate,
-        profile_id: String(profileId),
-      });
-      const res = await fetch(`/api/admin/digests?${params.toString()}`, { method: "DELETE" });
-      const body = (await res.json()) as AdminHardDeleteResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Delete digest failed") : "Delete digest failed");
-      }
-      const done = body as AdminHardDeleteResponse;
-      await refreshCleanupScope();
-      setGeneratedDigestDate(cleanupDigestDate);
-      setWorkflowStep(`Digest cleanup done: ${JSON.stringify(done.counts)}`);
-    } catch (err) {
-      setWorkflowError(err instanceof Error ? err.message : "Delete digest failed");
-    }
+  const onDropFollowingFile = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setFollowingDragActive(false);
+    const dropped = event.dataTransfer.files?.[0] ?? null;
+    onSelectFollowingFile(dropped);
   };
 
   const handleImportWorkflow = async () => {
     if (workflowBusy) return;
     if (!file) {
-      setWorkflowError("Please choose a file first.");
+      setWorkflowError("请先选择文件。");
       return;
     }
     setWorkflowBusy(true);
     setWorkflowError(null);
     setWorkflowRequestId(null);
-    setWorkflowStep("Reading file...");
+    setWorkflowStep("正在读取文件...");
     setConvertResult(null);
     setExtractByHandle({});
-    setGeneratedDigestDate(null);
     try {
       let rows: XImportItem[] = [];
       let detectedHandles: string[] = [];
@@ -839,7 +631,7 @@ export default function IngestPage() {
         try {
           const parsed = JSON.parse(text) as unknown;
           if (isStandardImportJson(parsed)) {
-            setWorkflowStep("Detected standard x_import.json, importing directly...");
+            setWorkflowStep("检测到标准 x_import.json，直接导入...");
             rows = applyOverridesForStandardRows(parsed);
             setConvertResult({
               converted_rows: parsed.length,
@@ -859,7 +651,7 @@ export default function IngestPage() {
             );
             convertedRowsTotal = parsed.length;
           } else {
-            setWorkflowStep("Detected raw export JSON, converting...");
+            setWorkflowStep("检测到原始导出 JSON，正在转换...");
             const converted = await convertViaApi(file);
             setConvertResult(converted);
             detectedHandles = converted.handles_summary.map((item) => item.author_handle);
@@ -868,7 +660,7 @@ export default function IngestPage() {
             convertedRowsTotal = converted.converted_rows;
           }
         } catch {
-          setWorkflowStep("JSON parse failed in browser, converting via backend...");
+          setWorkflowStep("浏览器解析 JSON 失败，改用后端转换...");
           const converted = await convertViaApi(file);
           setConvertResult(converted);
           detectedHandles = converted.handles_summary.map((item) => item.author_handle);
@@ -877,7 +669,7 @@ export default function IngestPage() {
           convertedRowsTotal = converted.converted_rows;
         }
       } else {
-        setWorkflowStep("Converting upload via backend...");
+        setWorkflowStep("正在通过后端转换上传文件...");
         const converted = await convertViaApi(file);
         setConvertResult(converted);
         detectedHandles = converted.handles_summary.map((item) => item.author_handle);
@@ -896,14 +688,14 @@ export default function IngestPage() {
       }
 
       setConvertedCount(convertedRowsTotal || rows.length);
-      if (rows.length === 0) throw new Error("No rows left after conversion/filtering.");
+      if (rows.length === 0) throw new Error("转换或筛选后无可导入数据。");
 
-      setWorkflowStep("Importing into raw_posts...");
+      setWorkflowStep("正在导入到 raw_posts...");
       const imported = await importRows(rows);
       setImportStats(imported);
 
       if (autoExtract && Object.keys(imported.imported_by_handle).length > 0) {
-        setWorkflowStep("Resuming extraction for pending/failed/no_extraction posts...");
+        setWorkflowStep("正在为 pending/failed/no_extraction 贴文续跑抽取...");
         const totals: ExtractBatchStats = {
           requested_count: 0,
           success_count: 0,
@@ -952,16 +744,16 @@ export default function IngestPage() {
         setExtractStats(totals);
       }
 
-      setWorkflowStep("Refreshing progress...");
+      setWorkflowStep("正在刷新进度...");
       await refreshProgress();
       if (autoExtract) {
         await new Promise((resolve) => window.setTimeout(resolve, 300));
         await refreshProgress();
       }
       if (autoGenerateDigest) await generateDigest(digestDate);
-      setWorkflowStep("Completed.");
+      setWorkflowStep("已完成。");
     } catch (err) {
-      setWorkflowError(err instanceof Error ? err.message : "Workflow failed");
+      setWorkflowError(err instanceof Error ? err.message : "流程执行失败");
       setWorkflowStep(null);
     } finally {
       setWorkflowBusy(false);
@@ -970,7 +762,7 @@ export default function IngestPage() {
 
   const handleFollowingImport = async () => {
     if (!followingFile) {
-      setFollowingImportError("Please choose a following JSON file first.");
+      setFollowingImportError("请先选择 following JSON 文件。");
       return;
     }
     setFollowingImportBusy(true);
@@ -985,12 +777,11 @@ export default function IngestPage() {
       });
       const body = (await res.json()) as FollowingImportStats | { detail?: string };
       if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Import following failed") : "Import following failed");
+        throw new Error("detail" in body ? (body.detail ?? "导入 following 失败") : "导入 following 失败");
       }
       setFollowingImportStats(body as FollowingImportStats);
-      await refreshCleanupScope();
     } catch (err) {
-      setFollowingImportError(err instanceof Error ? err.message : "Import following failed");
+      setFollowingImportError(err instanceof Error ? err.message : "导入 following 失败");
     } finally {
       setFollowingImportBusy(false);
     }
@@ -998,13 +789,11 @@ export default function IngestPage() {
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace", display: "grid", gap: "12px" }}>
-      <h1>Ingest</h1>
-      <p>
-        X 文件拖拽导入。<Link href="/dashboard">返回 Dashboard</Link>
-      </p>
+      <h1>导入中心</h1>
+      <p>X 文件拖拽导入。</p>
 
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "900px" }}>
-        <h2 style={{ marginTop: 0 }}>Drag & Drop X Import</h2>
+        <h2 style={{ marginTop: 0 }}>拖拽导入 X 数据</h2>
         <p style={{ marginTop: 0 }}>
           支持原始导出 JSON/CSV 与标准 x_import.json。标准 JSON 会走直导入路径；否则先调用转换接口。
         </p>
@@ -1014,7 +803,7 @@ export default function IngestPage() {
             checked={onlyFollowedKols}
             onChange={(event) => setOnlyFollowedKols(event.target.checked)}
           />{" "}
-          Only import/analyze followed KOLs (enabled only)
+          仅导入/分析已关注的 KOL（仅启用状态）
         </label>
         <p style={{ margin: "4px 0 0 0", color: "#555" }}>
           服务端默认也会开启该保护；关闭时会允许未知 handle 入库并自动建 KOL。
@@ -1023,7 +812,7 @@ export default function IngestPage() {
         <div style={{ display: "grid", gap: "8px", maxWidth: "700px" }}>
           {convertResult && convertResult.handles_summary.length > 1 && (
             <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "8px", display: "grid", gap: "6px" }}>
-              <strong>Import all handles（默认）</strong>
+              <strong>导入全部账号（默认）</strong>
               {convertResult.handles_summary.map((item) => {
                 const checked = selectedHandles.includes(item.author_handle);
                 return (
@@ -1038,7 +827,7 @@ export default function IngestPage() {
                         });
                       }}
                     />
-                    @{item.author_handle} count={item.count} {item.will_create_kol ? "（将自动创建 KOL）" : ""}
+                    @{item.author_handle} 数量={item.count} {item.will_create_kol ? "（将自动创建 KOL）" : ""}
                   </label>
                 );
               })}
@@ -1047,11 +836,11 @@ export default function IngestPage() {
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
             <label>
-              start_date
+              开始日期
               <input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} style={{ display: "block", width: "100%" }} />
             </label>
             <label>
-              end_date
+              结束日期
               <input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} style={{ display: "block", width: "100%" }} />
             </label>
           </div>
@@ -1060,10 +849,10 @@ export default function IngestPage() {
           </p>
 
           <label>
-            <input type="checkbox" checked={autoExtract} onChange={(event) => setAutoExtract(event.target.checked)} /> 导入后自动批量抽取（按 batch size 分批）
+            <input type="checkbox" checked={autoExtract} onChange={(event) => setAutoExtract(event.target.checked)} /> 导入后自动批量抽取（按批次大小分批）
           </label>
           <label>
-            extract batch size
+            抽取批次大小
             <select
               value={extractBatchSize}
               onChange={(event) => setExtractBatchSize(Number(event.target.value))}
@@ -1075,10 +864,10 @@ export default function IngestPage() {
             </select>
           </label>
           <label>
-            <input type="checkbox" checked={autoGenerateDigest} onChange={(event) => setAutoGenerateDigest(event.target.checked)} /> 导入后自动生成 digest
+            <input type="checkbox" checked={autoGenerateDigest} onChange={(event) => setAutoGenerateDigest(event.target.checked)} /> 导入后自动生成日报
           </label>
           <label>
-            digest date
+            日报日期
             <input type="date" value={digestDate} onChange={(event) => setDigestDate(event.target.value)} style={{ display: "block", width: "100%" }} />
           </label>
         </div>
@@ -1095,183 +884,57 @@ export default function IngestPage() {
           onDrop={onDropFile}
           style={{
             marginTop: "10px",
-            border: `2px dashed ${dragActive ? "#2684ff" : "#999"}`,
+            border: `2px dashed ${dragActive ? "var(--accent)" : "var(--line-strong)"}`,
             borderRadius: "8px",
             padding: "16px",
-            background: dragActive ? "#f2f8ff" : "#fafafa",
+            background: dragActive
+              ? "color-mix(in srgb, var(--accent-soft) 70%, var(--bg-elev-strong) 30%)"
+              : "color-mix(in srgb, var(--bg-elev-strong) 88%, transparent 12%)",
           }}
         >
-          <p style={{ marginTop: 0 }}>Drop JSON/CSV here, or choose file:</p>
+          <p style={{ marginTop: 0 }}>将 JSON/CSV 拖拽到这里，或选择文件：</p>
           <input
             type="file"
             accept=".json,.csv,application/json,text/csv"
             onChange={(event) => onSelectFile(event.target.files?.[0] ?? null)}
           />
-          <p style={{ marginBottom: 0 }}>Selected: {file ? file.name : "none"}</p>
+          <p style={{ marginBottom: 0 }}>已选择：{file ? file.name : "无"}</p>
         </div>
 
         <div style={{ marginTop: "10px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
           <button type="button" onClick={() => void handleImportWorkflow()} disabled={workflowBusy}>
-            {workflowBusy ? "Running..." : "Convert + Import"}
-          </button>
-          <button
-            type="button"
-            onClick={() => void generateDigest(digestDate)}
-            disabled={workflowBusy}
-          >
-            Generate Digest Now
+            {workflowBusy ? "执行中..." : "转换并导入"}
           </button>
           <button type="button" onClick={() => void refreshProgress()} disabled={workflowBusy}>
             刷新进度
           </button>
-          <button type="button" onClick={() => cancelExtractPolling("Extract polling cancelled by user.")}>
+          <button type="button" onClick={() => cancelExtractPolling("用户已取消抽取任务轮询。")}>
             停止轮询
           </button>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
-            <input
-              type="checkbox"
-              checked={clearAlsoDeleteRawPosts}
-              onChange={(event) => setClearAlsoDeleteRawPosts(event.target.checked)}
-              disabled={workflowBusy}
-            />
-            also delete raw posts
-          </label>
-          <button type="button" onClick={() => void clearPending()} disabled={workflowBusy}>
-            Clear Pending (Delete)
-          </button>
-          <Link href={`/digests/${encodeURIComponent(safeDigestDateParam)}`}>Open Digest</Link>
         </div>
+      </section>
 
-        <section style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px", marginTop: "10px" }}>
-          <h3 style={{ marginTop: 0 }}>Admin Cleanup</h3>
-          <p style={{ marginTop: 0 }}>
-            所有操作都需要输入 YES；raw_posts 删除必须同时满足 enable_cascade=true。
-          </p>
-
-          <div style={{ display: "grid", gap: "10px" }}>
-            <div style={{ border: "1px solid #f0f0f0", borderRadius: "6px", padding: "8px", display: "grid", gap: "6px" }}>
-              <strong>Delete KOL</strong>
-              <label>
-                KOL ID
-                <input
-                  list="cleanup-kol-list"
-                  value={cleanupKolId}
-                  onChange={(event) => setCleanupKolId(event.target.value)}
-                  style={{ display: "block", width: "100%" }}
-                />
-                <datalist id="cleanup-kol-list">
-                  {kols.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      @{item.handle}
-                    </option>
-                  ))}
-                </datalist>
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={cleanupKolCascade}
-                  onChange={(event) => setCleanupKolCascade(event.target.checked)}
-                />{" "}
-                enable_cascade
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={cleanupKolDeleteRawPosts}
-                  onChange={(event) => setCleanupKolDeleteRawPosts(event.target.checked)}
-                />{" "}
-                also_delete_raw_posts
-              </label>
-              <button type="button" onClick={() => void deleteKolCleanup()} disabled={workflowBusy}>
-                Delete KOL (Hard)
-              </button>
-            </div>
-
-            <div style={{ border: "1px solid #f0f0f0", borderRadius: "6px", padding: "8px", display: "grid", gap: "6px" }}>
-              <strong>Delete Asset</strong>
-              <label>
-                Asset ID
-                <input
-                  list="cleanup-asset-list"
-                  value={cleanupAssetId}
-                  onChange={(event) => setCleanupAssetId(event.target.value)}
-                  style={{ display: "block", width: "100%" }}
-                />
-                <datalist id="cleanup-asset-list">
-                  {assets.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.symbol}
-                    </option>
-                  ))}
-                </datalist>
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={cleanupAssetCascade}
-                  onChange={(event) => setCleanupAssetCascade(event.target.checked)}
-                />{" "}
-                enable_cascade (delete asset + aliases)
-              </label>
-              <button type="button" onClick={() => void deleteAssetCleanup()} disabled={workflowBusy}>
-                Delete Asset (Hard)
-              </button>
-            </div>
-
-            <div style={{ border: "1px solid #f0f0f0", borderRadius: "6px", padding: "8px", display: "grid", gap: "6px" }}>
-              <strong>Delete Digest By Date/Profile</strong>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                <label>
-                  profile_id
-                  <input
-                    type="number"
-                    min={1}
-                    value={cleanupDigestProfileId}
-                    onChange={(event) => setCleanupDigestProfileId(event.target.value)}
-                    style={{ display: "block", width: "100%" }}
-                  />
-                </label>
-                <label>
-                  digest_date
-                  <input
-                    type="date"
-                    value={cleanupDigestDate}
-                    onChange={(event) => setCleanupDigestDate(event.target.value)}
-                    style={{ display: "block", width: "100%" }}
-                  />
-                </label>
-              </div>
-              <button type="button" onClick={() => void deleteDigestByDateCleanup()} disabled={workflowBusy}>
-                Delete Digest By Date
-              </button>
-            </div>
-          </div>
-
-          {assetsError && <p style={{ color: "crimson", marginBottom: 0 }}>{assetsError}</p>}
-        </section>
-
-        {workflowStep && <p style={{ marginBottom: 0 }}>step: {workflowStep}</p>}
+        {workflowStep && <p style={{ marginBottom: 0 }}>步骤：{workflowStep}</p>}
         {workflowError && <p style={{ color: "crimson", marginBottom: 0 }}>{workflowError}</p>}
-        {workflowRequestId && <p style={{ color: "#666", marginTop: "4px", marginBottom: 0 }}>request_id: {workflowRequestId}</p>}
+        {workflowRequestId && <p style={{ color: "#666", marginTop: "4px", marginBottom: 0 }}>请求 ID：{workflowRequestId}</p>}
 
-        {convertedCount !== null && <p style={{ marginBottom: 0 }}>converted_rows={convertedCount}</p>}
+        {convertedCount !== null && <p style={{ marginBottom: 0 }}>转换行数={convertedCount}</p>}
         {convertResult && (
           <p style={{ margin: 0 }}>
-            converted_ok={convertResult.converted_ok}, converted_failed={convertResult.converted_failed},
-            skipped_not_followed={convertResult.skipped_not_followed_count}
+            转换成功={convertResult.converted_ok}, 转换失败={convertResult.converted_failed},
+            非关注跳过={convertResult.skipped_not_followed_count}
           </p>
         )}
         {convertResult && convertResult.skipped_not_followed_samples.length > 0 && (
           <details>
             <summary>
-              skipped_not_followed_samples ({convertResult.skipped_not_followed_count}) - showing first{" "}
+              非关注跳过样本（{convertResult.skipped_not_followed_count}）- 仅显示前{" "}
               {Math.min(20, convertResult.skipped_not_followed_samples.length)}
             </summary>
             <ul>
               {convertResult.skipped_not_followed_samples.slice(0, 20).map((item) => (
                 <li key={`${item.row_index}-${item.author_handle ?? "-"}-${item.external_id ?? "-"}`}>
-                  row={item.row_index}, handle={item.author_handle ?? "-"}, external_id={item.external_id ?? "-"}, reason=
+                  行={item.row_index}, handle={item.author_handle ?? "-"}, external_id={item.external_id ?? "-"}, 原因=
                   {item.reason}
                 </li>
               ))}
@@ -1280,11 +943,11 @@ export default function IngestPage() {
         )}
         {convertResult && convertResult.handles_summary.length > 0 && (
           <div>
-            <strong>handles_summary</strong>
+            <strong>账号汇总</strong>
             <ul>
               {convertResult.handles_summary.map((item) => (
                 <li key={item.author_handle}>
-                  @{item.author_handle}: count={item.count}, will_create_kol={item.will_create_kol ? "true" : "false"}
+                  @{item.author_handle}: 数量={item.count}, 将创建KOL={item.will_create_kol ? "是" : "否"}
                 </li>
               ))}
             </ul>
@@ -1292,19 +955,19 @@ export default function IngestPage() {
         )}
         {convertResult && convertResult.resolved_author_handle && (
           <p style={{ margin: 0 }}>
-            Detected handle: @{convertResult.resolved_author_handle} (Create/Use KOL on import)
+            检测到账号：@{convertResult.resolved_author_handle}（导入时自动创建/复用 KOL）
           </p>
         )}
         {convertResult && convertResult.errors.length > 0 && (
           <details>
             <summary>
-              convert errors ({convertResult.errors.length}) - showing first{" "}
+              转换错误（{convertResult.errors.length}）- 仅显示前{" "}
               {Math.min(20, convertResult.errors.length)}
             </summary>
             <ul>
               {convertResult.errors.slice(0, 20).map((item) => (
                 <li key={`${item.row_index}-${item.external_id ?? "none"}-${item.reason}`}>
-                  row={item.row_index}, external_id={item.external_id ?? "-"}, url={item.url ?? "-"}, reason=
+                  行={item.row_index}, external_id={item.external_id ?? "-"}, url={item.url ?? "-"}, 原因=
                   {item.reason}
                 </li>
               ))}
@@ -1323,37 +986,37 @@ export default function IngestPage() {
                 URL.revokeObjectURL(href);
               }}
             >
-              Download errors JSON
+              下载错误 JSON
             </button>
           </details>
         )}
         {importStats && (
           <div style={{ marginBottom: 0 }}>
             <p style={{ margin: 0 }}>
-              imported_rows={importStats.inserted_raw_posts_count}, dedup_skipped_count={importStats.dedup_skipped_count},
-              dedup_existing_ids={importStats.dedup_existing_raw_post_ids.length}, warnings={importStats.warnings_count}
+              导入行数={importStats.inserted_raw_posts_count}, 去重跳过={importStats.dedup_skipped_count},
+              已存在ID={importStats.dedup_existing_raw_post_ids.length}, 警告数={importStats.warnings_count}
             </p>
             <p style={{ margin: 0 }}>
-              import-trigger-extract: success={importStats.extract_success_count}, failed={importStats.extract_failed_count},
-              skipped_already_extracted={importStats.skipped_already_extracted_count}, skipped_not_followed=
+              导入触发抽取：成功={importStats.extract_success_count}, 失败={importStats.extract_failed_count},
+              已抽取跳过={importStats.skipped_already_extracted_count}, 非关注跳过=
               {importStats.skipped_not_followed_count}
             </p>
             {(importStats.resolved_author_handle || importStats.resolved_kol_id) && (
               <p style={{ margin: 0 }}>
-                resolved_author_handle={importStats.resolved_author_handle ?? "-"}, resolved_kol_id=
-                {importStats.resolved_kol_id ?? "-"}, kol_created={importStats.kol_created ? "true" : "false"}
+                解析账号={importStats.resolved_author_handle ?? "-"}, 解析 KOL ID=
+                {importStats.resolved_kol_id ?? "-"}, 是否创建KOL={importStats.kol_created ? "是" : "否"}
               </p>
             )}
             {Object.keys(importStats.imported_by_handle).length > 0 && (
               <div>
-                <strong>imported_by_handle</strong>
+                <strong>按账号导入统计</strong>
                 <ul>
                   {Object.entries(importStats.imported_by_handle).map(([handle, stats]) => (
                     <li key={handle}>
-                      @{handle}: received={stats.received}, inserted={stats.inserted}, dedup={stats.dedup}, warnings=
+                      @{handle}: 接收={stats.received}, 插入={stats.inserted}, 去重={stats.dedup}, 警告=
                       {stats.warnings}
                       {extractByHandle[handle]
-                        ? `, extracted=${extractByHandle[handle].success_count}, resumed=${extractByHandle[handle].resumed_success}, skipped=${extractByHandle[handle].resumed_skipped}`
+                        ? `, 抽取成功=${extractByHandle[handle].success_count}, 续跑成功=${extractByHandle[handle].resumed_success}, 跳过=${extractByHandle[handle].resumed_skipped}`
                         : ""}
                     </li>
                   ))}
@@ -1362,7 +1025,7 @@ export default function IngestPage() {
             )}
             {importStats.created_kols.length > 0 && (
               <div>
-                <strong>created_kols</strong>
+                <strong>新建 KOL</strong>
                 <ul>
                   {importStats.created_kols.map((item) => (
                     <li key={item.id}>
@@ -1377,13 +1040,13 @@ export default function IngestPage() {
         {importStats && importStats.skipped_not_followed_samples.length > 0 && (
           <details>
             <summary>
-              import skipped_not_followed_samples ({importStats.skipped_not_followed_count}) - showing first{" "}
+              导入时非关注跳过样本（{importStats.skipped_not_followed_count}）- 仅显示前{" "}
               {Math.min(20, importStats.skipped_not_followed_samples.length)}
             </summary>
             <ul>
               {importStats.skipped_not_followed_samples.slice(0, 20).map((item) => (
                 <li key={`${item.row_index}-${item.author_handle ?? "-"}-${item.external_id ?? "-"}`}>
-                  row={item.row_index}, handle={item.author_handle ?? "-"}, external_id={item.external_id ?? "-"}, reason=
+                  行={item.row_index}, handle={item.author_handle ?? "-"}, external_id={item.external_id ?? "-"}, 原因=
                   {item.reason}
                 </li>
               ))}
@@ -1393,41 +1056,41 @@ export default function IngestPage() {
         {extractStats && (
           <div style={{ marginBottom: 0 }}>
             <p style={{ margin: 0 }}>
-              extracted_rows={extractStats.success_count}, extract_requested={extractStats.requested_count}, extract_failed=
-              {extractStats.failed_count}, extract_skipped={extractStats.skipped_count}, skipped_already_extracted=
+              抽取成功={extractStats.success_count}, 请求数={extractStats.requested_count}, 抽取失败=
+              {extractStats.failed_count}, 抽取跳过={extractStats.skipped_count}, 已抽取跳过=
               {extractStats.skipped_already_extracted_count}
             </p>
             <p style={{ margin: 0 }}>
-              skipped_already_pending={extractStats.skipped_already_pending_count}, skipped_already_success=
+              已待处理跳过={extractStats.skipped_already_pending_count}, 已成功跳过=
               {extractStats.skipped_already_success_count}
             </p>
             <p style={{ margin: 0 }}>
-              skipped_already_has_result={extractStats.skipped_already_has_result_count}, auto_rejected=
+              已有结果跳过={extractStats.skipped_already_has_result_count}, 自动拒绝=
               {extractStats.auto_rejected_count}
             </p>
             <p style={{ margin: 0 }}>
-              skipped_already_rejected={extractStats.skipped_already_rejected_count}, skipped_already_approved=
-              {extractStats.skipped_already_approved_count}, skipped_due_to_import_limit=
-              {extractStats.skipped_due_to_import_limit_count}, skipped_not_followed={extractStats.skipped_not_followed_count}
+              已拒绝跳过={extractStats.skipped_already_rejected_count}, 已通过跳过=
+              {extractStats.skipped_already_approved_count}, 导入上限跳过=
+              {extractStats.skipped_due_to_import_limit_count}, 非关注跳过={extractStats.skipped_not_followed_count}
             </p>
             <p style={{ margin: 0 }}>
-              resumed_requested_count={extractStats.resumed_requested_count}, resumed_success={extractStats.resumed_success},
-              resumed_failed={extractStats.resumed_failed}, resumed_skipped={extractStats.resumed_skipped}
+              续跑请求={extractStats.resumed_requested_count}, 续跑成功={extractStats.resumed_success},
+              续跑失败={extractStats.resumed_failed}, 续跑跳过={extractStats.resumed_skipped}
             </p>
           </div>
         )}
         {!workflowBusy && extractStats && (
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <Link href="/extractions?status=pending">Open pending list</Link>
+            <Link href="/extractions?status=pending">打开待审核列表</Link>
             <button type="button" onClick={() => void refreshProgress()}>
               刷新进度
             </button>
-            <Link href={`/extractions?status=pending&t=${Date.now()}`}>刷新 extractions</Link>
+            <Link href={`/extractions?status=pending&t=${Date.now()}`}>刷新审核页</Link>
           </div>
         )}
         {importStats && importStats.warnings.length > 0 && (
           <div>
-            <strong>warnings</strong>
+            <strong>警告</strong>
             <ul>
               {importStats.warnings.slice(0, 10).map((item, idx) => (
                 <li key={`${idx}-${item}`}>{item}</li>
@@ -1437,51 +1100,71 @@ export default function IngestPage() {
         )}
         {progress && (
           <p style={{ marginBottom: 0 }}>
-            progress[{progress.scope}] total={progress.total_raw_posts}, success={progress.extracted_success_count},
-            pending={progress.pending_count}, failed={progress.failed_count}, no_extraction={progress.no_extraction_count}
+            进度[{progress.scope}] 总数={progress.total_raw_posts}, 成功={progress.extracted_success_count},
+            待处理={progress.pending_count}, 失败={progress.failed_count}, 无抽取={progress.no_extraction_count}
           </p>
         )}
-      </section>
-
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "900px" }}>
-        <h2 style={{ marginTop: 0 }}>Import Following → KOLs</h2>
+        <h2 style={{ marginTop: 0 }}>导入关注列表 → KOL</h2>
         <p style={{ marginTop: 0 }}>上传 twitter-正在关注-*.json，自动同步 following=true 的 KOL 到数据库并启用。</p>
-        <input
-          type="file"
-          accept=".json,application/json"
-          onChange={(event) => setFollowingFile(event.target.files?.[0] ?? null)}
-        />
-        <p style={{ margin: "8px 0 0 0" }}>Selected: {followingFile ? followingFile.name : "none"}</p>
+        <div
+          onDragOver={(event) => {
+            event.preventDefault();
+            setFollowingDragActive(true);
+          }}
+          onDragLeave={(event) => {
+            event.preventDefault();
+            setFollowingDragActive(false);
+          }}
+          onDrop={onDropFollowingFile}
+          style={{
+            marginTop: "8px",
+            border: `2px dashed ${followingDragActive ? "var(--accent)" : "var(--line-strong)"}`,
+            borderRadius: "8px",
+            padding: "16px",
+            background: followingDragActive
+              ? "color-mix(in srgb, var(--accent-soft) 70%, var(--bg-elev-strong) 30%)"
+              : "color-mix(in srgb, var(--bg-elev-strong) 88%, transparent 12%)",
+          }}
+        >
+          <p style={{ marginTop: 0 }}>将 following JSON 拖拽到这里，或选择文件：</p>
+          <input
+            type="file"
+            accept=".json,application/json"
+            onChange={(event) => onSelectFollowingFile(event.target.files?.[0] ?? null)}
+          />
+          <p style={{ margin: "8px 0 0 0" }}>已选择：{followingFile ? followingFile.name : "无"}</p>
+        </div>
         <button type="button" onClick={() => void handleFollowingImport()} disabled={followingImportBusy} style={{ marginTop: "8px" }}>
-          {followingImportBusy ? "Importing..." : "Import Following"}
+          {followingImportBusy ? "导入中..." : "导入关注列表"}
         </button>
         {followingImportError && <p style={{ color: "crimson", marginBottom: 0 }}>{followingImportError}</p>}
         {followingImportStats && (
           <div style={{ marginTop: "8px" }}>
             <p style={{ margin: 0 }}>
-              received_rows={followingImportStats.received_rows}, following_true_rows={followingImportStats.following_true_rows},
-              created={followingImportStats.created_kols_count}, updated={followingImportStats.updated_kols_count},
-              skipped={followingImportStats.skipped_count}
+              接收行数={followingImportStats.received_rows}, following=true 行数={followingImportStats.following_true_rows},
+              新建={followingImportStats.created_kols_count}, 更新={followingImportStats.updated_kols_count},
+              跳过={followingImportStats.skipped_count}
             </p>
             {followingImportStats.created_kols.length > 0 && (
               <p style={{ margin: "4px 0 0 0" }}>
-                created: {followingImportStats.created_kols.map((item) => `#${item.id}@${item.handle}`).join(", ")}
+                新建：{followingImportStats.created_kols.map((item) => `#${item.id}@${item.handle}`).join(", ")}
               </p>
             )}
             {followingImportStats.updated_kols.length > 0 && (
               <p style={{ margin: "4px 0 0 0" }}>
-                updated: {followingImportStats.updated_kols.map((item) => `#${item.id}@${item.handle}`).join(", ")}
+                更新：{followingImportStats.updated_kols.map((item) => `#${item.id}@${item.handle}`).join(", ")}
               </p>
             )}
             {followingImportStats.errors.length > 0 && (
               <details>
                 <summary>
-                  errors ({followingImportStats.errors.length}) - showing first {Math.min(20, followingImportStats.errors.length)}
+                  错误（{followingImportStats.errors.length}）- 仅显示前 {Math.min(20, followingImportStats.errors.length)}
                 </summary>
                 <ul>
                   {followingImportStats.errors.slice(0, 20).map((item) => (
                     <li key={`${item.row_index}-${item.reason}`}>
-                      row={item.row_index}, reason={item.reason}, raw={item.raw_snippet}
+                      行={item.row_index}, 原因={item.reason}, 原文片段={item.raw_snippet}
                     </li>
                   ))}
                 </ul>
@@ -1492,17 +1175,17 @@ export default function IngestPage() {
       </section>
 
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "760px" }}>
-        <h2 style={{ marginTop: 0 }}>Extractor Status</h2>
+        <h2 style={{ marginTop: 0 }}>抽取器状态</h2>
         {statusError && <p style={{ color: "crimson" }}>{statusError}</p>}
-        {!statusError && !extractorStatus && <p>Loading extractor status...</p>}
+        {!statusError && !extractorStatus && <p>正在加载抽取器状态...</p>}
         {extractorStatus && (
           <div style={{ display: "grid", gap: "4px" }}>
             <p style={{ margin: 0 }}>
-              EXTRACTOR_MODE: <strong>{extractorStatus.mode}</strong> | base_url: {extractorStatus.base_url}
+              抽取模式：<strong>{extractorStatus.mode}</strong> | 服务地址：{extractorStatus.base_url}
             </p>
             <p style={{ margin: 0 }}>
-              default_model: {extractorStatus.default_model} | has_api_key: {extractorStatus.has_api_key ? "yes" : "no"} |
-              call_budget_remaining: {extractorStatus.call_budget_remaining ?? "unlimited"} | max_output_tokens: {extractorStatus.max_output_tokens}
+              默认模型：{extractorStatus.default_model} | 已配置 API Key：{extractorStatus.has_api_key ? "是" : "否"} |
+              剩余额度：{extractorStatus.call_budget_remaining ?? "无限制"} | 最大输出令牌：{extractorStatus.max_output_tokens}
             </p>
           </div>
         )}

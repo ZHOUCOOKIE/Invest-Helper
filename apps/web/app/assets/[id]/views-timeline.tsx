@@ -15,6 +15,7 @@ type TimelineItem = {
   as_of: string;
   created_at: string;
   posted_at?: string | null;
+  posted_at_raw?: string | null;
   extraction_id?: number | null;
 };
 
@@ -56,10 +57,30 @@ type TimelinePoint = {
 };
 
 const stanceStyle = {
-  bull: { color: "#12803c", fill: "#dff7e8" },
-  bear: { color: "#bd1f2d", fill: "#fde7ea" },
-  neutral: { color: "#677285", fill: "#eef0f3" },
+  bull: { color: "#15803d", fill: "#22c55e", glow: "rgba(21, 128, 61, 0.38)" },
+  bear: { color: "#b91c1c", fill: "#ef4444", glow: "rgba(185, 28, 28, 0.34)" },
+  neutral: { color: "#677285", fill: "#cbd5e1", glow: "rgba(107, 114, 128, 0.2)" },
 } as const;
+
+function getHorizonLabel(horizon: string): string {
+  const labels: Record<string, string> = {
+    intraday: "日内",
+    "1w": "1周",
+    "1m": "1月",
+    "3m": "3月",
+    "1y": "1年",
+  };
+  return labels[horizon] ?? horizon;
+}
+
+function getStanceLabel(stance: string): string {
+  const labels: Record<string, string> = {
+    bull: "看涨",
+    bear: "看跌",
+    neutral: "中性",
+  };
+  return labels[stance] ?? stance;
+}
 
 function toDisplayName(item: TimelineItem): string {
   if (item.kol_display_name && item.kol_display_name.trim()) return item.kol_display_name.trim();
@@ -68,15 +89,15 @@ function toDisplayName(item: TimelineItem): string {
 }
 
 function formatBucketLabel(bucketLabel: string, bucketUnit: string): string {
-  if (bucketUnit === "hour") return bucketLabel.replace("T", " ").replace(":00Z", ":00 UTC");
-  return `${bucketLabel} UTC`;
+  if (bucketUnit === "hour") return bucketLabel.replace("T", " ").replace(/Z$/, "");
+  return bucketLabel.replace(/Z$/, "");
 }
 
 function formatRowRange(row: { bucketUnit: string; windowStartLabel: string; windowEndLabel: string }): string {
   if (row.bucketUnit === "hour") {
-    return `${row.windowStartLabel.replace("T", " ")} ~ ${row.windowEndLabel.replace("T", " ")}`;
+    return `${row.windowStartLabel.replace("T", " ").replace(/Z$/, "")} ~ ${row.windowEndLabel.replace("T", " ").replace(/Z$/, "")}`;
   }
-  return `${row.windowStartLabel} ~ ${row.windowEndLabel}`;
+  return `${row.windowStartLabel.replace(/Z$/, "")} ~ ${row.windowEndLabel.replace(/Z$/, "")}`;
 }
 
 export function AssetViewsTimeline({ data, loading, error }: Props) {
@@ -103,8 +124,8 @@ export function AssetViewsTimeline({ data, loading, error }: Props) {
 
   return (
     <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "12px" }}>
-      <h2 style={{ marginTop: 0, marginBottom: "8px" }}>观点时间线（24h / 1w / 1m / 3m / 1y）</h2>
-      {loading && <p>Loading timeline...</p>}
+      <h2 style={{ marginTop: 0, marginBottom: "8px" }}>观点时间线（日内 / 1周 / 1月 / 3月 / 1年）</h2>
+      {loading && <p>时间线加载中...</p>}
       {error && <p style={{ color: "crimson" }}>{error}</p>}
       {!loading && !error && (
         <div style={{ display: "grid", gap: "10px" }}>
@@ -113,7 +134,7 @@ export function AssetViewsTimeline({ data, loading, error }: Props) {
             return (
               <div key={row.horizon} style={{ display: "grid", gap: "4px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "11px", color: "#5a6473" }}>
-                  <strong style={{ fontSize: "12px", color: "#2c3440" }}>{row.horizon}</strong>
+                  <strong style={{ fontSize: "12px", color: "#2c3440" }}>{getHorizonLabel(row.horizon)}</strong>
                   <span>{formatRowRange(row)}</span>
                 </div>
                 <div style={{ position: "relative", height: "72px", borderBottom: "1px dashed #e5e7eb" }}>
@@ -145,13 +166,14 @@ export function AssetViewsTimeline({ data, loading, error }: Props) {
                           width: `${point.pointRadius * 2}px`,
                           height: `${point.pointRadius * 2}px`,
                           borderRadius: "999px",
-                          border: `1px solid ${style.color}`,
+                          border: `2px solid ${style.color}`,
                           backgroundColor: style.fill,
+                          boxShadow: `0 0 0 2px rgba(255,255,255,0.8), 0 0 10px ${style.glow}`,
                           cursor: "pointer",
                           padding: 0,
                         }}
-                        title={`${row.horizon} ${formatBucketLabel(point.bucketLabel, point.bucketUnit)} count=${point.count}`}
-                        aria-label={`${row.horizon} point ${point.bucketLabel}`}
+                        title={`${getHorizonLabel(row.horizon)} ${formatBucketLabel(point.bucketLabel, point.bucketUnit)}，数量=${point.count}`}
+                        aria-label={`${getHorizonLabel(row.horizon)} 点位 ${point.bucketLabel}`}
                       />
                     );
                   })}
@@ -175,10 +197,10 @@ export function AssetViewsTimeline({ data, loading, error }: Props) {
                     >
                       <div>{formatBucketLabel(hoveredBucket.bucketLabel, hoveredBucket.bucketUnit)}</div>
                       <div>
-                        bull {hoveredBucket.counts.bull} / bear {hoveredBucket.counts.bear} / neutral {hoveredBucket.counts.neutral}
+                        看涨 {hoveredBucket.counts.bull} / 看跌 {hoveredBucket.counts.bear} / 中性 {hoveredBucket.counts.neutral}
                       </div>
-                      <div>total {hoveredBucket.count}, avg confidence {hoveredBucket.avgConfidence}</div>
-                      <div>top KOL: {hoveredBucket.topKols.join(", ") || "N/A"}</div>
+                      <div>总计 {hoveredBucket.count}，平均置信度 {hoveredBucket.avgConfidence}</div>
+                      <div>主要 KOL: {hoveredBucket.topKols.join(", ") || "无"}</div>
                     </div>
                   )}
                 </div>
@@ -218,7 +240,7 @@ export function AssetViewsTimeline({ data, loading, error }: Props) {
           >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
               <h3 style={{ margin: 0, fontSize: "16px" }}>
-                {selectedBucket.horizon} {formatBucketLabel(selectedBucket.bucketLabel, selectedBucket.bucketUnit)} | {selectedBucket.count} 条
+                {getHorizonLabel(selectedBucket.horizon)} {formatBucketLabel(selectedBucket.bucketLabel, selectedBucket.bucketUnit)} | {selectedBucket.count} 条
               </h3>
               <button type="button" onClick={() => setSelectedKey(null)}>
                 关闭
@@ -231,23 +253,23 @@ export function AssetViewsTimeline({ data, loading, error }: Props) {
                   <article key={item.id} style={{ border: "1px solid #e5e7eb", borderRadius: "8px", padding: "8px", fontSize: "12px" }}>
                     <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
                       <strong>{toDisplayName(item)}</strong>
-                      <span style={{ color: style.color, fontWeight: 700 }}>{item.stance}</span>
-                      <span>horizon: {item.horizon}</span>
-                      <span>confidence: {item.confidence}</span>
+                      <span style={{ color: style.color, fontWeight: 700 }}>{getStanceLabel(item.stance)}</span>
+                      <span>周期: {getHorizonLabel(item.horizon)}</span>
+                      <span>置信度: {item.confidence}</span>
                     </div>
                     <div style={{ marginTop: "4px", color: "#374151" }}>{item.summary?.trim() ? item.summary : "未提供理由"}</div>
                     <div style={{ marginTop: "4px", display: "flex", gap: "10px", flexWrap: "wrap" }}>
                       <span>
-                        source:{" "}
+                        来源:{" "}
                         {item.source_url ? (
                           <a href={item.source_url} target="_blank" rel="noreferrer">
                             {item.source_url}
                           </a>
                         ) : (
-                          "N/A"
+                          "无"
                         )}
                       </span>
-                      {item.extraction_id ? <Link href={`/extractions/${item.extraction_id}`}>查看 extraction #{item.extraction_id}</Link> : <span>extraction: N/A</span>}
+                      {item.extraction_id ? <Link href={`/extractions/${item.extraction_id}`}>查看抽取 #{item.extraction_id}</Link> : <span>抽取: 无</span>}
                     </div>
                   </article>
                 );

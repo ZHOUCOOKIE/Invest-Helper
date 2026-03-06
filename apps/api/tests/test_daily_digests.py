@@ -416,7 +416,8 @@ def test_generate_digest_returns_json_when_service_raises(monkeypatch) -> None: 
     assert isinstance(body.get("request_id"), str)
     assert body.get("error_code") == "digest_generate_failed"
     assert body.get("message") == "Generate digest failed"
-    assert "digest route boom" in str(body.get("detail"))
+    assert body.get("detail") == "Generate digest failed"
+    assert "digest route boom" not in str(body.get("detail"))
 
 
 def test_generate_digest_ai_author_summaries_include_asset_fields() -> None:

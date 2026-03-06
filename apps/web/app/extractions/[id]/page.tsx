@@ -127,6 +127,44 @@ function getHttpErrorMessage(status: number, detail: string | undefined, fallbac
   return detail ?? fallback;
 }
 
+function statusText(status: Extraction["status"]): string {
+  if (status === "pending") return "待处理";
+  if (status === "approved") return "已通过";
+  if (status === "rejected") return "已拒绝";
+  return status;
+}
+
+function pickRawCreatedAtValue(rawJson: Record<string, unknown> | null): string | null {
+  if (!rawJson) return null;
+  const candidates: Array<Record<string, unknown>> = [rawJson];
+  for (const key of ["tweet", "post", "row"]) {
+    const nested = rawJson[key];
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      candidates.push(nested as Record<string, unknown>);
+    }
+  }
+  for (const item of candidates) {
+    for (const key of ["created_at", "createdAt"]) {
+      const value = item[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+  }
+  return null;
+}
+
+function stripTimezoneSuffix(value: string | null | undefined): string {
+  if (typeof value !== "string") return "-";
+  const trimmed = value.trim();
+  if (!trimmed) return "-";
+  return trimmed.replace(/\s?(?:Z|[+-]\d{2}:\d{2})$/i, "").trim();
+}
+
+function displayPostedTime(rawPost: RawPost): string {
+  return stripTimezoneSuffix(pickRawCreatedAtValue(rawPost.raw_json) ?? rawPost.posted_at);
+}
+
 export default function ExtractionDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -168,7 +206,7 @@ export default function ExtractionDetailPage() {
       setStatusError(null);
 
       if (Number.isNaN(extractionId)) {
-        setError("Invalid extraction id");
+        setError("无效的 extraction id");
         setLoading(false);
         return;
       }
@@ -188,23 +226,23 @@ export default function ExtractionDetailPage() {
             getHttpErrorMessage(
               extractionRes.status,
               "detail" in extractionBody ? extractionBody.detail : undefined,
-              "Load extraction failed",
+              "加载抽取记录失败",
             ),
           );
         }
 
         const assetsBody = (await assetsRes.json()) as Asset[] | { detail?: string };
         if (!assetsRes.ok) {
-          throw new Error("detail" in assetsBody ? (assetsBody.detail ?? "Load assets failed") : "Load assets failed");
+          throw new Error("detail" in assetsBody ? (assetsBody.detail ?? "加载资产失败") : "加载资产失败");
         }
 
         const kolsBody = (await kolsRes.json()) as Kol[] | { detail?: string };
         if (!kolsRes.ok) {
-          throw new Error("detail" in kolsBody ? (kolsBody.detail ?? "Load kols failed") : "Load kols failed");
+          throw new Error("detail" in kolsBody ? (kolsBody.detail ?? "加载 KOL 失败") : "加载 KOL 失败");
         }
         const statusBody = (await statusRes.json()) as ExtractorStatus | { detail?: string };
         if (!statusRes.ok) {
-          setStatusError("detail" in statusBody ? (statusBody.detail ?? "Load extractor status failed") : "Load failed");
+          setStatusError("detail" in statusBody ? (statusBody.detail ?? "加载抽取器状态失败") : "加载失败");
         } else {
           setExtractorStatus(statusBody as ExtractorStatus);
         }
@@ -245,7 +283,7 @@ export default function ExtractionDetailPage() {
         });
 
         const extractedViews = pickAssetViews(extractionData.extracted_json);
-        const threshold = extractionData.auto_approve_confidence_threshold ?? 70;
+        const threshold = extractionData.auto_approve_confidence_threshold ?? 80;
         const extractedAsOf = normalizeAsOfDate(
           typeof extractionData.extracted_json.as_of === "string"
             ? (extractionData.extracted_json.as_of as string)
@@ -269,7 +307,7 @@ export default function ExtractionDetailPage() {
           setSelectedBatchKeys([]);
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Unknown error");
+      setError(err instanceof Error ? err.message : "未知错误");
       } finally {
         setLoading(false);
       }
@@ -292,12 +330,12 @@ export default function ExtractionDetailPage() {
       const res = await fetch(`/api/extractions/${extraction.id}/re-extract`, { method: "POST" });
       const body = (await res.json()) as { id?: number; detail?: string };
       if (!res.ok || typeof body.id !== "number") {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `Re-extract failed: ${res.status}`));
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `重新抽取失败: ${res.status}`));
       }
       setActionInfo(`已创建新 extraction #${body.id}，正在跳转...`);
       router.push(`/extractions/${body.id}`);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Re-extract failed");
+      setActionError(err instanceof Error ? err.message : "重新抽取失败");
     } finally {
       setReExtracting(false);
     }
@@ -330,11 +368,11 @@ export default function ExtractionDetailPage() {
       });
       const body = (await res.json()) as { detail?: string };
       if (!res.ok) {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `Approve failed: ${res.status}`));
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `审核通过失败: ${res.status}`));
       }
-      router.push("/extractions?msg=Approve%20success&status=pending");
+      router.push("/extractions?msg=%E5%AE%A1%E6%A0%B8%E9%80%9A%E8%BF%87&status=pending");
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Approve failed");
+      setActionError(err instanceof Error ? err.message : "审核通过失败");
     } finally {
       setSubmitting(false);
     }
@@ -388,11 +426,11 @@ export default function ExtractionDetailPage() {
       });
       const body = (await res.json()) as { detail?: string };
       if (!res.ok) {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `Approve batch failed: ${res.status}`));
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `批量审核通过失败: ${res.status}`));
       }
-      router.push("/extractions?msg=Approve%20success&status=pending");
+      router.push("/extractions?msg=%E6%89%B9%E9%87%8F%E5%AE%A1%E6%A0%B8%E9%80%9A%E8%BF%87&status=pending");
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Approve batch failed");
+      setActionError(err instanceof Error ? err.message : "批量审核通过失败");
     } finally {
       setSubmitting(false);
     }
@@ -411,11 +449,11 @@ export default function ExtractionDetailPage() {
       });
       const body = (await res.json()) as { detail?: string };
       if (!res.ok) {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `Reject failed: ${res.status}`));
+        throw new Error(getHttpErrorMessage(res.status, body.detail, `审核拒绝失败: ${res.status}`));
       }
-      router.push("/extractions?msg=Reject%20success&status=pending");
+      router.push("/extractions?msg=%E5%AE%A1%E6%A0%B8%E6%8B%92%E7%BB%9D&status=pending");
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Reject failed");
+      setActionError(err instanceof Error ? err.message : "审核拒绝失败");
     } finally {
       setSubmitting(false);
     }
@@ -476,7 +514,7 @@ export default function ExtractionDetailPage() {
     }
     try {
       await navigator.clipboard.writeText(extraction.raw_model_output);
-      setCopyMessage("已复制 raw output");
+      setCopyMessage("已复制原始输出");
       window.setTimeout(() => setCopyMessage(null), 1200);
     } catch {
       setCopyMessage("复制失败");
@@ -486,18 +524,16 @@ export default function ExtractionDetailPage() {
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
-      <h1>Extraction #{Number.isNaN(extractionId) ? "?" : extractionId}</h1>
+      <h1>抽取详情 #{Number.isNaN(extractionId) ? "?" : extractionId}</h1>
       <p>
         <Link href="/extractions">返回审核列表</Link>
-        {" | "}
-        <Link href="/dashboard">返回 Dashboard</Link>
       </p>
 
-      {loading && <p>Loading...</p>}
+      {loading && <p>加载中...</p>}
       {error && (
         <section style={{ border: "1px solid #f0bcbc", background: "#fff6f6", borderRadius: "8px", padding: "10px" }}>
           <p style={{ color: "crimson", margin: 0 }}>{error}</p>
-          {errorStatus === 422 && <p style={{ marginBottom: 0 }}>请检查 extraction id 或请求参数。</p>}
+          {errorStatus === 422 && <p style={{ marginBottom: 0 }}>请检查抽取 ID 或请求参数。</p>}
           {errorStatus === 409 && <p style={{ marginBottom: 0 }}>资源状态冲突，请返回列表刷新后重试。</p>}
           {errorStatus && errorStatus >= 500 && <p style={{ marginBottom: 0 }}>服务暂时不可用，请稍后重试。</p>}
           <p style={{ marginBottom: 0 }}>
@@ -505,17 +541,17 @@ export default function ExtractionDetailPage() {
           </p>
         </section>
       )}
-      {!loading && !error && !extraction && <p>空状态：未找到 extraction 数据。</p>}
+      {!loading && !error && !extraction && <p>空状态：未找到抽取数据。</p>}
 
       {!loading && !error && extraction && (
         <div style={{ display: "grid", gap: "12px" }}>
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>Raw Post</h2>
-            <div>platform: {extraction.raw_post.platform}</div>
-            <div>author: @{extraction.raw_post.author_handle}</div>
-            <div>posted_at: {extraction.raw_post.posted_at}</div>
+            <h2 style={{ marginTop: 0 }}>原始贴文</h2>
+            <div>平台: {extraction.raw_post.platform}</div>
+            <div>作者: @{extraction.raw_post.author_handle}</div>
+            <div>发布时间: {displayPostedTime(extraction.raw_post)}</div>
             <div>
-              url:{" "}
+              链接:{" "}
               <a href={extraction.raw_post.url} target="_blank" rel="noreferrer">
                 {extraction.raw_post.url}
               </a>
@@ -534,22 +570,22 @@ export default function ExtractionDetailPage() {
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>Extracted JSON</h2>
-            <div>extractor: {extraction.extractor_name}</div>
-            <div>model: {extraction.model_name}</div>
-            {statusError && <div style={{ color: "crimson" }}>extractor_status_error: {statusError}</div>}
+            <h2 style={{ marginTop: 0 }}>抽取结果 JSON</h2>
+            <div>抽取器: {extraction.extractor_name}</div>
+            <div>模型: {extraction.model_name}</div>
+            {statusError && <div style={{ color: "crimson" }}>抽取器状态错误: {statusError}</div>}
             {extractorStatus && (
               <div style={{ marginTop: "4px" }}>
-                status: mode={extractorStatus.mode}, base_url={extractorStatus.base_url}, default_model=
-                {extractorStatus.default_model}, has_api_key={extractorStatus.has_api_key ? "yes" : "no"}, budget=
-                {extractorStatus.call_budget_remaining ?? "unlimited"}
+                状态: mode={extractorStatus.mode}, base_url={extractorStatus.base_url}, default_model=
+                {extractorStatus.default_model}, has_api_key={extractorStatus.has_api_key ? "是" : "否"}, budget=
+                {extractorStatus.call_budget_remaining ?? "无限制"}
               </div>
             )}
-            {extraction.last_error && <div style={{ color: "crimson" }}>last_error: {extraction.last_error}</div>}
+            {extraction.last_error && <div style={{ color: "crimson" }}>最后错误: {extraction.last_error}</div>}
             {autoRejectMeta && (
               <div style={{ color: "#8a5800", marginTop: "4px" }}>
-                auto_rejected=true, reason={autoRejectMeta.reason}, threshold={autoRejectMeta.threshold},
-                model_confidence={autoRejectMeta.modelConfidence}
+                自动拒绝=true, 原因={autoRejectMeta.reason}, 阈值={autoRejectMeta.threshold},
+                模型置信度={autoRejectMeta.modelConfidence}
               </div>
             )}
             {typeof extraction.extracted_json["meta"] === "object" && extraction.extracted_json["meta"] !== null && (
@@ -576,14 +612,14 @@ export default function ExtractionDetailPage() {
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>Per-Asset Views</h2>
-            {extractedAssetViews.length === 0 && <div>(none)</div>}
+            <h2 style={{ marginTop: 0 }}>按资产观点</h2>
+            {extractedAssetViews.length === 0 && <div>（无）</div>}
             {extractedAssetViews.length > 0 && (
               <div style={{ display: "grid", gap: "8px" }}>
                 {extractedAssetViews.map((item, index) => (
                   <div key={`${index}:${item.symbol}:${item.horizon}`} style={{ border: "1px solid #eee", padding: "8px" }}>
                     <div>
-                      {item.symbol} | {item.stance} | {item.horizon} | confidence={item.confidence}
+                      {item.symbol} | {item.stance} | {item.horizon} | 置信度={item.confidence}
                       {autoAppliedKeySet.has(buildAssetViewKey(item, extractedAsOf)) && (
                         <span
                           style={{
@@ -595,18 +631,18 @@ export default function ExtractionDetailPage() {
                             background: "#f0f0f0",
                           }}
                         >
-                          Auto approved
+                          自动通过
                         </span>
                       )}
                     </div>
-                    <div>summary: {item.summary || "(none)"}</div>
+                    <div>摘要: {item.summary || "（无）"}</div>
                   </div>
                 ))}
               </div>
             )}
             <div style={{ marginTop: "8px" }}>
-              auto_applied_count={extraction.auto_applied_count}, auto_policy={extraction.auto_policy || "null"},
-              auto_applied_kol_view_ids=
+              自动应用数量={extraction.auto_applied_count}, 自动策略={extraction.auto_policy || "null"},
+              自动应用观点ID=
               {extraction.auto_applied_kol_view_ids ? extraction.auto_applied_kol_view_ids.join(",") : "[]"}
             </div>
             {extraction.auto_policy === "top1_fallback" && (
@@ -616,24 +652,24 @@ export default function ExtractionDetailPage() {
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
             <details>
-              <summary style={{ cursor: "pointer", fontWeight: 700 }}>Debug / 模型输出</summary>
+              <summary style={{ cursor: "pointer", fontWeight: 700 }}>调试 / 模型输出</summary>
               <div style={{ marginTop: "10px", display: "grid", gap: "6px" }}>
-                <div>prompt_version: {extraction.prompt_version || "(none)"}</div>
-                <div>prompt_hash: {extraction.prompt_hash || "(none)"}</div>
-                <div>model_name: {extraction.model_name}</div>
-                <div>extractor_name: {extraction.extractor_name}</div>
-                <div>latency_ms: {extraction.model_latency_ms ?? "(none)"}</div>
+                <div>提示词版本: {extraction.prompt_version || "（无）"}</div>
+                <div>提示词哈希: {extraction.prompt_hash || "（无）"}</div>
+                <div>模型名: {extraction.model_name}</div>
+                <div>抽取器名: {extraction.extractor_name}</div>
+                <div>延迟(ms): {extraction.model_latency_ms ?? "（无）"}</div>
                 <div>
-                  tokens: in={extraction.model_input_tokens ?? "(none)"} / out=
-                  {extraction.model_output_tokens ?? "(none)"}
+                  tokens: 输入={extraction.model_input_tokens ?? "（无）"} / 输出=
+                  {extraction.model_output_tokens ?? "（无）"}
                 </div>
                 <div>
                   <button type="button" onClick={() => void copyRawOutput()} disabled={!extraction.raw_model_output}>
-                    Copy raw output
+                    复制原始输出
                   </button>
                   {copyMessage && <span style={{ marginLeft: "8px" }}>{copyMessage}</span>}
                 </div>
-                <div>raw_model_output:</div>
+                <div>原始模型输出:</div>
                 <pre
                   style={{
                     whiteSpace: "pre-wrap",
@@ -645,9 +681,9 @@ export default function ExtractionDetailPage() {
                     margin: 0,
                   }}
                 >
-                  {extraction.raw_model_output || "(empty)"}
+                  {extraction.raw_model_output || "（空）"}
                 </pre>
-                <div>parsed_model_output:</div>
+                <div>解析后模型输出:</div>
                 <pre
                   style={{
                     whiteSpace: "pre-wrap",
@@ -659,14 +695,14 @@ export default function ExtractionDetailPage() {
                     margin: 0,
                   }}
                 >
-                  {extraction.parsed_model_output ? JSON.stringify(extraction.parsed_model_output, null, 2) : "(none)"}
+                  {extraction.parsed_model_output ? JSON.stringify(extraction.parsed_model_output, null, 2) : "（无）"}
                 </pre>
               </div>
             </details>
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>通过</h2>
+            <h2 style={{ marginTop: 0 }}>审核通过</h2>
             <button
               type="button"
               onClick={() => void reExtract()}
@@ -676,7 +712,7 @@ export default function ExtractionDetailPage() {
               {reExtracting ? "重新解构中..." : "用 AI 重新解构（强制）"}
             </button>
             <p style={{ marginTop: 0, color: "#555" }}>
-              Auto-review 规则：`hasview=0` 自动拒绝；`hasview=1` 时按阈值 70 执行（&gt;=70 auto approved，&lt;70 auto rejected）；手动 force re-extract 默认进入待人工审核。
+              自动审核规则：`hasview=0` 自动拒绝；`hasview=1` 时按阈值 80 执行（&gt;=80 自动通过，&lt;80 自动拒绝）；手动强制重抽默认进入待人工审核。
             </p>
             {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
             <form
@@ -685,7 +721,7 @@ export default function ExtractionDetailPage() {
             >
               {extractedAssetViews.length === 0 && (
                 <label>
-                  Asset
+                  资产
                   <select
                     value={form.asset_id}
                     onChange={(event) => setForm((prev) => ({ ...prev, asset_id: event.target.value }))}
@@ -723,7 +759,7 @@ export default function ExtractionDetailPage() {
               </label>
               {extractedAssetViews.length > 0 && (
                 <div>
-                  <div style={{ marginBottom: "6px" }}>Asset views（可多选）</div>
+                  <div style={{ marginBottom: "6px" }}>资产观点（可多选）</div>
                   <div style={{ display: "grid", gap: "4px" }}>
                     {extractedAssetViews.map((item, index) => {
                       const key = buildAssetViewKey(item, extractedAsOf);
@@ -750,8 +786,8 @@ export default function ExtractionDetailPage() {
                               });
                             }}
                           />{" "}
-                          {item.symbol} | {item.stance} | {item.horizon} | confidence={item.confidence} |{" "}
-                          {item.summary || "(none)"}
+                          {item.symbol} | {item.stance} | {item.horizon} | 置信度={item.confidence} |{" "}
+                          {item.summary || "（无）"}
                           {isAutoApproved && (
                             <span
                               style={{
@@ -763,7 +799,7 @@ export default function ExtractionDetailPage() {
                                 background: "#f0f0f0",
                               }}
                             >
-                              Auto approved
+                              自动通过
                             </span>
                           )}
                         </label>
@@ -775,23 +811,23 @@ export default function ExtractionDetailPage() {
 
               {extractedAssetViews.length === 0 && (
                 <label>
-                  stance
+                  方向
                   <select
                     value={form.stance}
                     onChange={(event) => setForm((prev) => ({ ...prev, stance: event.target.value as FormState["stance"] }))}
                     style={{ display: "block", width: "100%" }}
                     required
                   >
-                    <option value="bull">bull</option>
-                    <option value="bear">bear</option>
-                    <option value="neutral">neutral</option>
+                    <option value="bull">看涨</option>
+                    <option value="bear">看跌</option>
+                    <option value="neutral">中性</option>
                   </select>
                 </label>
               )}
 
               {extractedAssetViews.length === 0 && (
                 <label>
-                  horizon
+                  影响周期
                   <select
                     value={form.horizon}
                     onChange={(event) =>
@@ -800,7 +836,7 @@ export default function ExtractionDetailPage() {
                     style={{ display: "block", width: "100%" }}
                     required
                   >
-                    <option value="intraday">intraday</option>
+                    <option value="intraday">日内</option>
                     <option value="1w">1w</option>
                     <option value="1m">1m</option>
                     <option value="3m">3m</option>
@@ -811,7 +847,7 @@ export default function ExtractionDetailPage() {
 
               {extractedAssetViews.length === 0 && (
                 <label>
-                  confidence (0-100)
+                  置信度（0-100）
                   <input
                     type="number"
                     min={0}
@@ -826,7 +862,7 @@ export default function ExtractionDetailPage() {
 
               {extractedAssetViews.length === 0 && (
                 <label>
-                  summary
+                  观点摘要
                   <textarea
                     rows={3}
                     value={form.summary}
@@ -838,7 +874,7 @@ export default function ExtractionDetailPage() {
               )}
 
               <label>
-                source_url
+                来源链接
                 <input
                   type="url"
                   value={form.source_url}
@@ -849,7 +885,7 @@ export default function ExtractionDetailPage() {
               </label>
 
               <label>
-                as_of
+                观点日期
                 <input
                   type="date"
                   value={form.as_of}
@@ -860,15 +896,15 @@ export default function ExtractionDetailPage() {
               </label>
 
               <button type="submit" disabled={submitting || extraction.status !== "pending"}>
-                {submitting ? "提交中..." : extractedAssetViews.length > 0 ? "批量通过" : "通过"}
+                {submitting ? "提交中..." : extractedAssetViews.length > 0 ? "批量通过" : "审核通过"}
               </button>
             </form>
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>拒绝</h2>
+            <h2 style={{ marginTop: 0 }}>审核拒绝</h2>
             <label>
-              reason (optional)
+              拒绝原因（可选）
               <textarea
                 rows={2}
                 value={rejectReason}
@@ -890,7 +926,7 @@ export default function ExtractionDetailPage() {
           {actionInfo && <p style={{ color: "green" }}>{actionInfo}</p>}
           {extraction.status !== "pending" && (
             <p style={{ color: "#666" }}>
-              当前状态是 {extraction.status}，不可再次审核。reviewed_by={extraction.reviewed_by ?? "N/A"}
+              当前状态是 {statusText(extraction.status)}，不可再次审核。reviewed_by={extraction.reviewed_by ?? "N/A"}
             </p>
           )}
         </div>

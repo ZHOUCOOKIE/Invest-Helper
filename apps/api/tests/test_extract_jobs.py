@@ -883,7 +883,8 @@ def test_exception_handler_returns_json_and_frontend_can_render_text_fallback(mo
     assert isinstance(body.get("request_id"), str)
     assert body.get("error_code") == "internal_server_error"
     assert body.get("message") == "Internal Server Error"
-    assert "boom-json" in str(body.get("detail"))
+    assert body.get("detail") == "Internal Server Error"
+    assert "boom-json" not in str(body.get("detail"))
     assert response.headers.get("x-request-id") == body.get("request_id")
 
 

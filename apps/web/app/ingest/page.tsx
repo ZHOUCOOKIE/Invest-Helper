@@ -283,6 +283,10 @@ function toDateKeyFromIso(value: string): string | null {
   return parsed.toISOString().slice(0, 10);
 }
 
+function normalizeDigestDateParam(value: string): string | null {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+}
+
 export default function IngestPage() {
   const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
   const [extractBatchSize, setExtractBatchSize] = useState(20);
@@ -325,6 +329,10 @@ export default function IngestPage() {
   const [followingImportStats, setFollowingImportStats] = useState<FollowingImportStats | null>(null);
   const extractPollControllerRef = useRef<AbortController | null>(null);
   const extractPollRunIdRef = useRef(0);
+  const safeDigestDateParam = useMemo(() => {
+    const normalized = normalizeDigestDateParam(generatedDigestDate ?? digestDate);
+    return normalized ?? new Date().toISOString().slice(0, 10);
+  }, [generatedDigestDate, digestDate]);
   const cancelExtractPolling = (reason?: string) => {
     extractPollRunIdRef.current += 1;
     extractPollControllerRef.current?.abort();
@@ -1131,7 +1139,7 @@ export default function IngestPage() {
           <button type="button" onClick={() => void clearPending()} disabled={workflowBusy}>
             Clear Pending (Delete)
           </button>
-          <Link href={`/digests/${generatedDigestDate ?? digestDate}`}>Open Digest</Link>
+          <Link href={`/digests/${encodeURIComponent(safeDigestDateParam)}`}>Open Digest</Link>
         </div>
 
         <section style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px", marginTop: "10px" }}>

@@ -24,6 +24,6 @@ When changing extraction rules, update all of:
 - Docs (`docs/API.md`, `docs/STATUS.md`, `docs/RUNBOOK.md`, `docs/PROMPT_AND_FLOW_REASONING_ZH.md`)
 
 ## Current Extraction Contract
-- Top-level strict business keys: `as_of/source_url/islibrary/assets/asset_views/library_entry`
+- Top-level strict business keys: `as_of/source_url/islibrary/hasview/asset_views/library_entry`
 - Asset views keep `confidence>=70`
-- Library review key: `library_entry.confidence`
+- Library entry shape: `library_entry={tag,summary}` (`summary` 必须是 `测试`)

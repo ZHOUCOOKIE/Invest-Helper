@@ -1,25 +1,24 @@
 # STATUS
 
 ## Implemented
-- Extraction prompt rules upgraded to strict 6-key JSON: `as_of/source_url/islibrary/assets/asset_views/library_entry`.
+- Extraction prompt rules upgraded to strict 6-key JSON: `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
 - Prompt SSOT is `apps/api/services/prompts/extraction_prompt.py` only.
 - Structured schema and normalize logic aligned to `islibrary` contract.
-- `assets` final shape is object array `{symbol, market}`.
-- NoneAny sentinel enforced: `[{"symbol":"NoneAny","market":"OTHER"}]`.
+- Top-level contract is `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
 - `market` enum is `CRYPTO|STOCK|ETF|FOREX|OTHER`; legacy auto enum value is removed.
 - `stance/horizon/market` must be model-direct exact enum output; server does not apply alias-map keyword/synonym normalization.
 - `asset_views` keeps only `confidence>=70`.
 - Chinese summary validation is enforced for:
   - `asset_views[*].summary`
   - `library_entry.summary`
-- Library boundary (A2) enforced with new contract:
-  - `library_entry` final shape is `{confidence, tags, summary}`
-  - `confidence` is required int in `0..100`; when `islibrary=1` it must be `>=70`
-  - `tags` is required array length `1..2` with enum `macro|industry|thesis|strategy|risk|events`
+- Library boundary current contract:
+  - `library_entry` final shape is `{tag, summary}`
+  - `tag` enum: `macro|industry|thesis|strategy|risk|events`
+  - `library_entry.summary` must be exact `测试`
   - invalid/missing `library_entry` downgrades to `islibrary=0`
 - Auto review:
-  - asset path keeps existing threshold flow
-  - library path uses `library_entry.confidence` (`>=70` approve, `<70` reject)
+  - asset path: `hasview=0` auto reject; otherwise threshold flow (`70`)
+  - library path: `islibrary=1` auto approve (`library_flag`)
   - writes `meta.auto_policy_applied`
 
 ## Not Implemented
@@ -27,3 +26,4 @@
 
 ## Notes
 - Legacy read tolerance remains for historical records; old `library_tags` is ignored.
+- Prompt text currently asks model output `asset_views.confidence>=80`, while runtime normalize/auto-review thresholds remain `>=70`.

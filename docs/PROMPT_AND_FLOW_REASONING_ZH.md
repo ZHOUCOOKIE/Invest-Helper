@@ -13,7 +13,7 @@
 - `as_of`
 - `source_url`
 - `islibrary`
-- `assets`
+- `hasview`
 - `asset_views`
 - `library_entry`
 
@@ -22,29 +22,28 @@
 - `market` 必须严格取值：`CRYPTO|STOCK|ETF|FOREX|OTHER`（legacy auto 枚举已删除）
 - `stance` 必须严格取值：`bull|bear|neutral`
 - `horizon` 必须严格取值：`intraday|1w|1m|3m|1y`
-- `assets` 只能是 `{symbol, market}` 对象数组，不能为空
-- 无法映射标的时必须输出 `[{"symbol":"NoneAny","market":"OTHER"}]`
+- `hasview` 必须是 `0|1`，且最终会按 `asset_views` 是否为空重算
 - `asset_views` 项固定：`{symbol,market,stance,horizon,confidence,summary}`
-- `asset_views` 仅保留 `confidence>=70`
+- Prompt 对模型约束为 `confidence>=80`，服务端 normalize 最终保留阈值为 `confidence>=70`
 - `summary` 中文约束只检查：
   - `asset_views[*].summary`
   - `library_entry.summary`
 - `library_entry`:
   - `islibrary=0` 时必须是 `null`
-  - `islibrary=1` 时必须是 `{confidence,tags,summary}`
-  - tags 枚举：`macro/industry/thesis/strategy/risk/events`，长度 `1..2`
+  - `islibrary=1` 时必须是 `{tag,summary}`
+  - `tag` 枚举：`macro/industry/thesis/strategy/risk/events`
+  - `summary` 必须精确等于 `测试`
 
 ## 3. Normalize 策略
 - 保留 parse/repair/unwrap 既有能力（BOM/code fence/outer object/最外层 JSON）
 - 不再使用 alias map 做 `stance/horizon/market` 关键词/同义词归一化
-- `assets=[]` 自动补 `NoneAny`
+- `hasview` 由最终 `asset_views` 自动回填（空数组则为 `0`）
 - `islibrary=1` 且 `library_entry` 无效时：降级为 `islibrary=0`
 
 ## 4. Auto-review
 - asset 分支：沿用资产视图阈值流程
-- library 分支：使用 `library_entry.confidence`
-  - `>=70` 自动通过
-  - `<70` 自动拒绝
+- `hasview=0`（非 library）会自动拒绝
+- library 分支：`islibrary=1` 自动通过（`library_flag`）
 - 记录 `meta.auto_policy_applied`
 
 ## 5. 可追溯性

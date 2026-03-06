@@ -29,13 +29,13 @@ Expected business keys:
 - `as_of`
 - `source_url`
 - `islibrary`
-- `assets`
+- `hasview`
 - `asset_views`
 - `library_entry`
 
 ## Inspect Normalize/Auto-Review Meta
 ```bash
-curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_error,extracted_json:{as_of:.extracted_json.as_of,source_url:.extracted_json.source_url,islibrary:.extracted_json.islibrary,assets:.extracted_json.assets,asset_views:.extracted_json.asset_views,library_entry:.extracted_json.library_entry},meta:.extracted_json.meta}'
+curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_error,extracted_json:{as_of:.extracted_json.as_of,source_url:.extracted_json.source_url,islibrary:.extracted_json.islibrary,hasview:.extracted_json.hasview,asset_views:.extracted_json.asset_views,library_entry:.extracted_json.library_entry},meta:.extracted_json.meta}'
 ```
 
 ## Typical Checks
@@ -46,11 +46,12 @@ curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_
   - no alias-map keyword/synonym normalization for these enum fields
 - Asset post:
   - `islibrary=0`
-  - `asset_views` only contains `confidence>=70`
-  - no valid target => `assets=[{"symbol":"NoneAny","market":"OTHER"}]`
+  - `asset_views` only contains `confidence>=70` (prompt 文本要求模型输出 `>=80`)
+  - `hasview` 由归一化后的 `asset_views` 自动回填
 - Library post:
   - `islibrary=1`
-  - valid `library_entry`
+  - valid `library_entry={tag,summary}`
+  - `library_entry.summary` 必须是 `测试`
 - Invalid library entry:
   - downgraded to `islibrary=0`
   - `library_entry=null`

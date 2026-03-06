@@ -3,13 +3,13 @@
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
 InvestPulse is an evidence-traceable investment signal dashboard built from multi-source posts.  
-It extracts structured signals, supports review workflows, and provides versioned Daily Digest replay by `profile_id + digest_date + version`.
+It extracts structured signals, supports review workflows, and provides Daily Digest generation/replay by `profile_id + digest_date`.
 
 ## Why InvestPulse
 
 - Keep signal extraction auditable with source-linked evidence.
 - Turn unstructured post streams into structured `asset_views`.
-- Support profile-scoped decision views and versioned digest playback.
+- Support profile-scoped decision views and date-scoped digest playback.
 - Keep operations practical for local development and CI verification.
 
 ## Current Implementation (Code-Verified)
@@ -24,7 +24,7 @@ It extracts structured signals, supports review workflows, and provides versione
   - non-library + valid confidence path => threshold review (`70`)
   - `islibrary=1` => auto approve (`library_flag`)
 - Traceability chain across `raw_posts -> post_extractions -> kol_views -> daily_digests`.
-- Replay-ready digests with monotonic `version` per `profile_id + digest_date`.
+- Replay-ready digests stored by `profile_id + digest_date`.
 
 ## Product Surfaces
 
@@ -85,7 +85,7 @@ X/Source Posts
    -> post_extractions
    -> review/auto-review
    -> kol_views
-   -> daily_digests (profile_id + digest_date + version)
+   -> daily_digests (profile_id + digest_date)
    -> dashboard / digest replay
 ```
 

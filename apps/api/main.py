@@ -1050,6 +1050,11 @@ def _admin_delete_counts_template() -> dict[str, int]:
 def _digest_mentions_kol(content: dict | None, *, kol_id: int) -> bool:
     if not isinstance(content, dict):
         return False
+    post_summaries = content.get("post_summaries")
+    if isinstance(post_summaries, list):
+        for item in post_summaries:
+            if isinstance(item, dict) and item.get("kol_id") == kol_id:
+                return True
     per_asset_summary = content.get("per_asset_summary")
     if not isinstance(per_asset_summary, list):
         return False
@@ -1069,6 +1074,11 @@ def _digest_mentions_kol(content: dict | None, *, kol_id: int) -> bool:
 def _digest_mentions_asset(content: dict | None, *, asset_id: int) -> bool:
     if not isinstance(content, dict):
         return False
+    post_summaries = content.get("post_summaries")
+    if isinstance(post_summaries, list):
+        for item in post_summaries:
+            if isinstance(item, dict) and item.get("asset_id") == asset_id:
+                return True
     top_assets = content.get("top_assets")
     if isinstance(top_assets, list):
         for item in top_assets:
@@ -4919,19 +4929,40 @@ async def get_dashboard(
 
 @app.post("/digests/generate", response_model=DailyDigestRead)
 async def generate_daily_digest(
+    request: Request,
     digest_date: date = Query(alias="date"),
     days: int = Query(default=7, ge=1, le=90),
     to_ts: datetime | None = Query(default=None),
     profile_id: int = Query(default=1, ge=1),
     db: AsyncSession = Depends(get_db),
 ):
-    return await generate_daily_digest_service(
-        db,
-        digest_date=digest_date,
-        days=days,
-        to_ts=to_ts,
-        profile_id=profile_id,
-    )
+    try:
+        return await generate_daily_digest_service(
+            db,
+            digest_date=digest_date,
+            days=days,
+            to_ts=to_ts,
+            profile_id=profile_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("rollback failed after /digests/generate error")
+        logger.exception(
+            "generate digest failed: profile_id=%s date=%s",
+            profile_id,
+            digest_date.isoformat(),
+        )
+        return _json_error(
+            request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="digest_generate_failed",
+            message="Generate digest failed",
+            detail=str(exc),
+        )
 
 
 @app.get("/digests", response_model=DailyDigestRead)

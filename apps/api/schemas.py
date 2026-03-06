@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -726,75 +726,53 @@ class AssetViewsTimelineRead(BaseModel):
     items: list[AssetViewsTimelineItemRead]
 
 
-class DailyDigestTopAssetRead(BaseModel):
-    asset_id: int
-    symbol: str
-    name: str | None
-    market: str | None
-    new_views_24h: int
-    new_views_7d: int
-    weighted_views_24h: float = 0.0
-    weighted_views_7d: float = 0.0
-
-
-class DailyDigestHorizonCountRead(BaseModel):
-    model_config = ConfigDict(use_enum_values=True)
-
-    horizon: Horizon
-    bull_count: int
-    bear_count: int
-    neutral_count: int
-
-
-class DailyDigestTopViewRead(BaseModel):
-    model_config = ConfigDict(use_enum_values=True)
-
-    kol_id: int
-    kol_display_name: str | None
-    kol_handle: str | None
-    stance: Stance
-    horizon: Horizon
-    confidence: int
-    summary: str
+class DailyDigestPostSummaryRead(BaseModel):
+    raw_post_id: int
+    extraction_id: int
+    kol_id: int | None = None
+    business_ts: datetime
+    time_field_used: Literal["as_of", "posted_at", "created_at"]
+    posted_at: datetime | None = None
+    author_handle: str
+    author_display_name: str | None = None
+    title: str | None = None
     source_url: str
-    as_of: date
-    created_at: datetime
-    kol_weight: float = 1.0
-    weighted_score: float = 0.0
+    summary: str
 
 
-class DailyDigestAssetSummaryRead(BaseModel):
-    asset_id: int
-    symbol: str
-    name: str | None
-    market: str | None
-    horizon_counts: list[DailyDigestHorizonCountRead]
-    clarity: float
-    top_views_bull: list[DailyDigestTopViewRead]
-    top_views_bear: list[DailyDigestTopViewRead]
-    top_views_neutral: list[DailyDigestTopViewRead]
+class DailyDigestAuthorSummaryInputRead(BaseModel):
+    author_handle: str
+    author_display_name: str | None = None
+    post_count: int
+    summaries: list[dict[str, Any]]
+
+
+class DailyDigestAIAnalysisRead(BaseModel):
+    market_overview: str
+    market_signals: str
+    focus_points: list[str]
+    key_news: list[str]
+    trading_observations: str | None = None
 
 
 class DailyDigestMetadataRead(BaseModel):
     generated_at: datetime
-    days: int
-    summary_window_start: datetime
-    summary_window_end: datetime
-    generated_from_ts: datetime
-    generated_to_ts: datetime
-    time_field_used: Literal["as_of", "posted_at", "created_at"]
+    window_start: datetime
+    window_end: datetime
+    source_post_count: int
+    ai_status: str
+    ai_error: str | None = None
+    time_field_priority: list[Literal["as_of", "posted_at", "created_at"]]
 
 
 class DailyDigestRead(BaseModel):
-    model_config = ConfigDict(use_enum_values=True)
-
     id: int
     profile_id: int = 1
     digest_date: date
-    version: int
     generated_at: datetime
-    top_assets: list[DailyDigestTopAssetRead]
-    per_asset_summary: list[DailyDigestAssetSummaryRead]
+    post_summaries: list[DailyDigestPostSummaryRead]
+    ai_input_by_author: list[DailyDigestAuthorSummaryInputRead]
+    ai_analysis: DailyDigestAIAnalysisRead
     metadata: DailyDigestMetadataRead
 
 

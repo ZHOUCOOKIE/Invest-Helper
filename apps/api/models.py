@@ -296,8 +296,8 @@ class ProfileMarket(Base):
 class DailyDigest(Base):
     __tablename__ = "daily_digests"
     __table_args__ = (
-        UniqueConstraint("profile_id", "digest_date", "version", name="uq_daily_digests_profile_date_version"),
-        Index("ix_daily_digests_profile_date_version", "profile_id", "digest_date", "version"),
+        UniqueConstraint("profile_id", "digest_date", name="uq_daily_digests_profile_date"),
+        Index("ix_daily_digests_profile_date", "profile_id", "digest_date"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)

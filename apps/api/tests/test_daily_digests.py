@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+import json
 from pathlib import Path
 import sys
 
@@ -9,15 +10,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import main as main_module
 from db import get_db
-from enums import Horizon, Stance
+from enums import ExtractionStatus
 from main import app, reset_runtime_counters
-from models import Asset, DailyDigest, Kol, KolView, ProfileKolWeight, ProfileMarket, RawPost, UserProfile
+from models import DailyDigest, Kol, PostExtraction, ProfileKolWeight, RawPost, UserProfile
+from services.digests import _author_summary_field_guide_text
 from settings import get_settings
 
 
 @pytest.fixture(autouse=True)
-def clear_settings_cache():
+def clear_settings_cache() -> None:
     get_settings.cache_clear()
     reset_runtime_counters()
     yield
@@ -39,14 +42,12 @@ class FakeResult:
 class FakeAsyncSession:
     def __init__(self) -> None:
         self._data: dict[type[object], dict[int, object]] = {
-            Asset: {},
-            Kol: {},
-            KolView: {},
             DailyDigest: {},
-            UserProfile: {},
+            Kol: {},
+            PostExtraction: {},
             ProfileKolWeight: {},
-            ProfileMarket: {},
             RawPost: {},
+            UserProfile: {},
         }
         self._new: list[object] = []
         self._to_delete: list[object] = []
@@ -72,19 +73,11 @@ class FakeAsyncSession:
             operator_name = getattr(getattr(criterion, "operator", None), "__name__", "eq")
             if operator_name == "eq":
                 items = [item for item in items if getattr(item, key) == value]
-            elif operator_name == "ge":
-                items = [item for item in items if getattr(item, key) >= value]
-            elif operator_name == "le":
-                items = [item for item in items if getattr(item, key) <= value]
-            else:
-                items = [item for item in items if getattr(item, key) == value]
 
-        if entity is KolView:
+        if entity is PostExtraction:
             items.sort(key=lambda item: (item.created_at, item.id), reverse=True)
         elif entity is DailyDigest:
-            items.sort(key=lambda item: (item.digest_date, item.version, item.id), reverse=True)
-        elif entity is RawPost:
-            items.sort(key=lambda item: (item.posted_at, item.id), reverse=True)
+            items.sort(key=lambda item: (item.digest_date, item.id), reverse=True)
         else:
             items.sort(key=lambda item: item.id)
         return FakeResult(items)
@@ -134,259 +127,365 @@ def _client_with_db(fake_db: FakeAsyncSession) -> TestClient:
     return TestClient(app)
 
 
-def test_generate_digest_and_get_latest_and_version_and_by_id() -> None:
+def test_generate_digest_uses_approved_latest_extraction_only() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime.now(UTC)
+    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
     today = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
-    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
-    fake_db.seed(Asset(id=2, symbol="ETH", name="Ethereum", market="CRYPTO", created_at=now))
     fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
-    fake_db.seed(Kol(id=2, platform="x", handle="bob", display_name="Bob", enabled=True, created_at=now))
 
     fake_db.seed(
-        KolView(
+        RawPost(
             id=11,
+            platform="x",
             kol_id=1,
-            asset_id=1,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=92,
-            summary="BTC momentum strong",
-            source_url="https://x.com/alice/11",
-            as_of=today,
-            created_at=now - timedelta(hours=2),
+            author_handle="alice",
+            external_id="p1",
+            url="https://x.com/alice/1",
+            content_text="raw content one",
+            posted_at=now - timedelta(hours=4),
+            fetched_at=now,
+            raw_json={"title": "title 1"},
         )
     )
     fake_db.seed(
-        KolView(
-            id=12,
-            kol_id=2,
-            asset_id=1,
-            stance=Stance.bear,
-            horizon=Horizon.one_week,
-            confidence=70,
-            summary="BTC may pull back",
-            source_url="https://x.com/bob/12",
-            as_of=today,
-            created_at=now - timedelta(hours=3),
+        PostExtraction(
+            id=101,
+            raw_post_id=11,
+            status=ExtractionStatus.approved,
+            extracted_json={
+                "as_of": today.isoformat(),
+                "summary": "approved summary should be used",
+                "asset_views": [],
+            },
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now - timedelta(hours=1),
+        )
+    )
+
+    # same raw_post newer rejected => this post should not be included
+    fake_db.seed(
+        PostExtraction(
+            id=102,
+            raw_post_id=11,
+            status=ExtractionStatus.rejected,
+            extracted_json={"as_of": today.isoformat(), "summary": "newer rejected"},
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now,
         )
     )
 
     client = _client_with_db(fake_db)
-
-    first = client.post(f"/digests/generate?date={today.isoformat()}&days=7")
-    assert first.status_code == 200
-    first_body = first.json()
-    assert first_body["profile_id"] == 1
-    assert first_body["version"] == 1
-    assert first_body["metadata"]["time_field_used"] == "as_of"
-
-    second = client.post(f"/digests/generate?date={today.isoformat()}&days=7")
-    assert second.status_code == 200
-    assert second.json()["version"] == 2
-
-    latest = client.get(f"/digests?date={today.isoformat()}")
-    assert latest.status_code == 200
-    digest_id = latest.json()["id"]
-
-    by_id = client.get(f"/digests/{digest_id}")
-    assert by_id.status_code == 200
-    assert by_id.json()["id"] == digest_id
-
-    app.dependency_overrides.clear()
-
-
-def test_digest_uses_as_of_window_over_created_at() -> None:
-    fake_db = FakeAsyncSession()
-    to_ts = datetime(2026, 2, 23, 12, 0, 0, tzinfo=UTC)
-    digest_date = to_ts.date()
-
-    fake_db.seed(UserProfile(id=1, name="default", created_at=to_ts))
-    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=to_ts))
-    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=to_ts))
-
-    fake_db.seed(
-        KolView(
-            id=1,
-            kol_id=1,
-            asset_id=1,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=90,
-            summary="old as_of, new created_at",
-            source_url="https://x.com/alice/1",
-            as_of=date(2026, 1, 1),
-            created_at=to_ts - timedelta(hours=2),
-        )
-    )
-
-    client = _client_with_db(fake_db)
-    response = client.post(
-        "/digests/generate",
-        params={
-            "date": digest_date.isoformat(),
-            "days": 7,
-            "to_ts": to_ts.isoformat(),
-        },
-    )
+    response = client.post(f"/digests/generate?date={today.isoformat()}&profile_id=1")
     app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
-    assert body["metadata"]["time_field_used"] == "as_of"
-    assert body["top_assets"] == []
+    assert body["digest_date"] == today.isoformat()
+    assert body["post_summaries"] == []
+    assert body["metadata"]["source_post_count"] == 0
 
 
-def test_digest_weighted_sort_and_top_view_weighted_score() -> None:
+def test_generate_digest_window_and_time_priority_sorting() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 2, 23, 12, 0, 0, tzinfo=UTC)
-    today = now.date()
+    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    digest_date = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
-    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
-    fake_db.seed(Asset(id=2, symbol="ETH", name="Ethereum", market="CRYPTO", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
 
-    fake_db.seed(Kol(id=1, platform="x", handle="a", display_name="A", enabled=True, created_at=now))
-    fake_db.seed(Kol(id=2, platform="x", handle="b", display_name="B", enabled=True, created_at=now))
-
-    fake_db.seed(ProfileKolWeight(id=1, profile_id=1, kol_id=1, weight=2.0, enabled=True, created_at=now))
-    fake_db.seed(ProfileKolWeight(id=2, profile_id=1, kol_id=2, weight=0.5, enabled=True, created_at=now))
-
+    # row A: as_of => business_ts=2026-03-05 00:00 UTC
     fake_db.seed(
-        KolView(
-            id=11,
-            kol_id=1,
-            asset_id=1,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=60,
-            summary="btc by heavy kol",
-            source_url="https://x.com/a/11",
-            as_of=today,
-            created_at=now - timedelta(hours=1),
-        )
-    )
-    fake_db.seed(
-        KolView(
-            id=12,
-            kol_id=2,
-            asset_id=1,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=99,
-            summary="btc by light kol",
-            source_url="https://x.com/b/12",
-            as_of=today,
-            created_at=now - timedelta(hours=2),
-        )
-    )
-    fake_db.seed(
-        KolView(
+        RawPost(
             id=21,
-            kol_id=2,
-            asset_id=2,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=95,
-            summary="eth by light kol",
-            source_url="https://x.com/b/21",
-            as_of=today,
-            created_at=now - timedelta(hours=1),
+            platform="x",
+            kol_id=1,
+            author_handle="alice",
+            external_id="p21",
+            url="https://x.com/alice/21",
+            content_text="content a",
+            posted_at=datetime(2026, 3, 5, 6, 0, 0, tzinfo=UTC),
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=201,
+            raw_post_id=21,
+            status=ExtractionStatus.approved,
+            extracted_json={"as_of": "2026-03-05", "summary": "A"},
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now - timedelta(hours=6),
+        )
+    )
+
+    # row B: no as_of => use posted_at=2026-03-06 03:00 UTC
+    fake_db.seed(
+        RawPost(
+            id=22,
+            platform="x",
+            kol_id=1,
+            author_handle="alice",
+            external_id="p22",
+            url="https://x.com/alice/22",
+            content_text="content b",
+            posted_at=datetime(2026, 3, 6, 3, 0, 0, tzinfo=UTC),
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=202,
+            raw_post_id=22,
+            status=ExtractionStatus.approved,
+            extracted_json={"summary": "B", "asset_views": [{"summary": "B1"}]},
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now - timedelta(hours=5),
+        )
+    )
+
+    # row C: no as_of and no posted_at => fallback created_at
+    fake_db.seed(
+        RawPost(
+            id=23,
+            platform="x",
+            kol_id=1,
+            author_handle="alice",
+            external_id="p23",
+            url="https://x.com/alice/23",
+            content_text="content c",
+            posted_at=datetime(2026, 3, 7, 1, 0, 0, tzinfo=UTC),  # outside window but should be ignored by posted_at if used
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=203,
+            raw_post_id=23,
+            status=ExtractionStatus.approved,
+            extracted_json={"as_of": "", "summary": "C"},
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=datetime(2026, 3, 6, 5, 0, 0, tzinfo=UTC),
         )
     )
 
     client = _client_with_db(fake_db)
-    response = client.post(
-        "/digests/generate",
-        params={"date": today.isoformat(), "days": 7, "to_ts": now.isoformat(), "profile_id": 1},
-    )
+    response = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
     app.dependency_overrides.clear()
 
     assert response.status_code == 200
     body = response.json()
-    assert body["top_assets"][0]["symbol"] == "BTC"
-    assert body["top_assets"][0]["weighted_views_24h"] > body["top_assets"][1]["weighted_views_24h"]
+    rows = body["post_summaries"]
 
-    btc_summary = next(item for item in body["per_asset_summary"] if item["symbol"] == "BTC")
-    assert btc_summary["top_views_bull"][0]["kol_handle"] == "a"
-    assert btc_summary["top_views_bull"][0]["weighted_score"] > btc_summary["top_views_bull"][1]["weighted_score"]
+    # row 23 excluded because posted_at is preferred over created_at and posted_at is out of window
+    assert [item["raw_post_id"] for item in rows] == [21, 22]
+    assert rows[0]["time_field_used"] == "as_of"
+    assert rows[1]["time_field_used"] == "posted_at"
 
 
-def test_digest_profile_filters_kols_and_markets() -> None:
+def test_generate_digest_replaces_same_profile_date() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 2, 23, 12, 0, 0, tzinfo=UTC)
-    today = now.date()
+    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    digest_date = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
-    fake_db.seed(UserProfile(id=2, name="crypto-only", created_at=now))
-
-    fake_db.seed(Asset(id=1, symbol="BTC", name="Bitcoin", market="CRYPTO", created_at=now))
-    fake_db.seed(Asset(id=2, symbol="AAPL", name="Apple", market="US", created_at=now))
-
-    fake_db.seed(Kol(id=1, platform="x", handle="a", display_name="A", enabled=True, created_at=now))
-    fake_db.seed(Kol(id=2, platform="x", handle="b", display_name="B", enabled=True, created_at=now))
-
-    fake_db.seed(ProfileKolWeight(id=11, profile_id=2, kol_id=1, weight=1.5, enabled=True, created_at=now))
-    fake_db.seed(ProfileKolWeight(id=12, profile_id=2, kol_id=2, weight=1.0, enabled=False, created_at=now))
-    fake_db.seed(ProfileMarket(id=21, profile_id=2, market="CRYPTO", created_at=now))
-
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
     fake_db.seed(
-        KolView(
+        RawPost(
             id=31,
+            platform="x",
             kol_id=1,
-            asset_id=1,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=80,
-            summary="btc allowed",
-            source_url="https://x.com/a/31",
-            as_of=today,
-            created_at=now - timedelta(hours=2),
+            author_handle="alice",
+            external_id="p31",
+            url="https://x.com/alice/31",
+            content_text="content",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
         )
     )
     fake_db.seed(
-        KolView(
-            id=32,
-            kol_id=2,
-            asset_id=1,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=88,
-            summary="btc by disabled kol",
-            source_url="https://x.com/b/32",
-            as_of=today,
-            created_at=now - timedelta(hours=2),
-        )
-    )
-    fake_db.seed(
-        KolView(
-            id=33,
-            kol_id=1,
-            asset_id=2,
-            stance=Stance.bull,
-            horizon=Horizon.one_week,
-            confidence=90,
-            summary="us asset filtered",
-            source_url="https://x.com/a/33",
-            as_of=today,
-            created_at=now - timedelta(hours=2),
+        PostExtraction(
+            id=301,
+            raw_post_id=31,
+            status=ExtractionStatus.approved,
+            extracted_json={"as_of": digest_date.isoformat(), "summary": "v1"},
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now,
         )
     )
 
     client = _client_with_db(fake_db)
-    response = client.post(
-        "/digests/generate",
-        params={"date": today.isoformat(), "days": 7, "to_ts": now.isoformat(), "profile_id": 2},
+    first = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
+    extraction = fake_db._data[PostExtraction][301]
+    extraction.extracted_json = {"as_of": digest_date.isoformat(), "summary": "v2"}
+    extraction.created_at = now + timedelta(minutes=1)
+    second = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(fake_db._data[DailyDigest]) == 1
+    assert second.json()["post_summaries"][0]["summary"] == "v2"
+
+
+def test_get_digest_not_found() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+
+    client = _client_with_db(fake_db)
+    response = client.get("/digests", params={"date": date(2026, 3, 6).isoformat(), "profile_id": 1})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "digest not found"
+
+
+def test_generate_digest_content_is_json_safe_before_persist() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    digest_date = now.date()
+
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=41,
+            platform="x",
+            kol_id=1,
+            author_handle="alice",
+            external_id="p41",
+            url="https://x.com/alice/41",
+            content_text="content",
+            posted_at=now - timedelta(hours=1),
+            fetched_at=now,
+            raw_json={"title": "title"},
+        )
     )
+    fake_db.seed(
+        PostExtraction(
+            id=401,
+            raw_post_id=41,
+            status=ExtractionStatus.approved,
+            extracted_json={"as_of": digest_date.isoformat(), "summary": "summary"},
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now,
+        )
+    )
+
+    client = _client_with_db(fake_db)
+    response = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    stored = next(iter(fake_db._data[DailyDigest].values()))
+    metadata = stored.content["metadata"]
+    assert isinstance(metadata["generated_at"], str)
+    assert isinstance(metadata["window_start"], str)
+    assert isinstance(metadata["window_end"], str)
+    json.dumps(stored.content, ensure_ascii=False)
+
+
+def test_generate_digest_returns_json_when_service_raises(monkeypatch) -> None:  # noqa: ANN001
+    async def _boom(*args, **kwargs):  # noqa: ANN001
+        raise RuntimeError("digest route boom")
+
+    monkeypatch.setattr(main_module, "generate_daily_digest_service", _boom)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/digests/generate?date=2026-03-06&profile_id=1")
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+
+    body = response.json()
+    assert isinstance(body.get("request_id"), str)
+    assert body.get("error_code") == "digest_generate_failed"
+    assert body.get("message") == "Generate digest failed"
+    assert "digest route boom" in str(body.get("detail"))
+
+
+def test_generate_digest_ai_author_summaries_include_asset_fields() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    digest_date = now.date()
+
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=51,
+            platform="x",
+            kol_id=1,
+            author_handle="alice",
+            external_id="p51",
+            url="https://x.com/alice/51",
+            content_text="content",
+            posted_at=now - timedelta(hours=1),
+            fetched_at=now,
+            raw_json={"title": "title"},
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=501,
+            raw_post_id=51,
+            status=ExtractionStatus.approved,
+            extracted_json={
+                "as_of": digest_date.isoformat(),
+                "summary": "fallback summary",
+                "asset_views": [
+                    {
+                        "symbol": "BTC",
+                        "market": "CRYPTO",
+                        "stance": "bull",
+                        "horizon": "1w",
+                        "summary": "btc summary",
+                    }
+                ],
+            },
+            model_name="dummy",
+            extractor_name="dummy",
+            created_at=now,
+        )
+    )
+
+    client = _client_with_db(fake_db)
+    response = client.post(f"/digests/generate?date={digest_date.isoformat()}&profile_id=1")
+    app.dependency_overrides.clear()
+
     assert response.status_code == 200
     body = response.json()
-    assert body["profile_id"] == 2
-    assert [item["symbol"] for item in body["top_assets"]] == ["BTC"]
+    assert len(body["ai_input_by_author"]) == 1
+    summaries = body["ai_input_by_author"][0]["summaries"]
+    assert len(summaries) == 1
+    assert summaries[0]["symbol"] == "BTC"
+    assert summaries[0]["market"] == "CRYPTO"
+    assert summaries[0]["stance"] == "bull"
+    assert summaries[0]["horizon"] == "1w"
+    assert summaries[0]["summary"] == "btc summary"
 
-    load_response = client.get("/digests", params={"date": today.isoformat(), "profile_id": 2})
-    assert load_response.status_code == 200
-    assert load_response.json()["profile_id"] == 2
 
-    app.dependency_overrides.clear()
+def test_author_summary_field_guide_mentions_core_fields() -> None:
+    text = _author_summary_field_guide_text()
+    assert "symbol" in text
+    assert "market" in text
+    assert "stance" in text
+    assert "horizon" in text
+    assert "bull=看多" in text
+    assert "bear=看空" in text
+    assert "neutral=中性" in text
+    assert "summary" not in text
+    assert "source_url" not in text
+    assert "title" not in text

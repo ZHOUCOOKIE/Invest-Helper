@@ -4,7 +4,7 @@ Authoritative
 
 TL;DR
 - 所有输出都必须可回链证据。
-- Digest 回放键为 `profile_id + digest_date + version`。
+- Digest 当前以 `profile_id + digest_date` 单条覆盖存储。
 - 回放操作命令以 `docs/RUNBOOK.md` 为准；本文定义语义与约束。
 
 ## Evidence Chain (Storage-Level)
@@ -22,24 +22,23 @@ TL;DR
 - 观点证据：`source_url`, `kol_id`, `asset_id`, `horizon`, `stance`, `confidence`, `as_of`
 
 4. `daily_digests`
-- 回放核心：`profile_id`, `digest_date`, `version`, `content`
+- 回放核心：`profile_id`, `digest_date`, `content`
+- `content` 关键字段：`post_summaries`, `ai_input_by_author`, `ai_analysis`, `metadata`
 
 ## Replay Semantics
 
-- 唯一键：`(profile_id, digest_date, version)`。
-- `POST /digests/generate` 对同一 `profile_id + digest_date` 递增 `version`。
-- `GET /digests` 不传 `version` 时返回该日该 profile 最新版本。
+- 唯一键：`(profile_id, digest_date)`。
+- `POST /digests/generate` 对同一 `profile_id + digest_date` 覆盖重生成。
+- `GET /digests` 读取该日该 profile 的单条日报。
 - `GET /digests/{digest_id}` 支持按主键直接回放。
 - `GET /digests/dates?profile_id=...` 返回可回放日期集合。
 
 ## Time-Field Policy
 
-Digest 时间字段回退顺序：
+Digest 摘要流排序时间字段回退顺序：
 - `as_of`（preferred）
 - `posted_at`
 - `created_at`
-
-输出元数据包含 `time_field_used`。
 
 ## Verification Rule
 

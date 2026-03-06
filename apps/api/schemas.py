@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from enums import ExtractionStatus, Horizon, Stance
 
-ExtractionListStatus = Literal["pending", "approved", "rejected", "all", ""]
+ExtractionListStatus = Literal["pending", "approved", "rejected", "library", "all", ""]
 
 
 class AssetCreate(BaseModel):
@@ -415,6 +415,18 @@ class AdminRefreshWrongExtractedJsonRead(BaseModel):
     updated_ids: list[int] = Field(default_factory=list)
 
 
+class AdminRecomputeExtractionStatusesRead(BaseModel):
+    scanned: int
+    updated: int
+    dry_run: bool
+    pending_count: int
+    approved_count: int
+    rejected_count: int
+    skipped_terminal_count: int
+    skipped_no_result_count: int
+    updated_ids: list[int] = Field(default_factory=list)
+
+
 class AdminFixApprovedMissingViewsRead(BaseModel):
     scanned: int
     fixed: int
@@ -712,11 +724,6 @@ class AssetViewsTimelineRead(BaseModel):
     since_date: date
     generated_at: datetime
     items: list[AssetViewsTimelineItemRead]
-
-
-class ExtractionsStatsRead(BaseModel):
-    bad_count: int
-    total_count: int
 
 
 class DailyDigestTopAssetRead(BaseModel):

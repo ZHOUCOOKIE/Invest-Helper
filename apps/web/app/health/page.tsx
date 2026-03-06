@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 type HealthResponse = {
@@ -37,6 +38,9 @@ export default function HealthPage() {
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
       <h1>/health</h1>
+      <p>
+        <Link href="/dashboard">返回 Dashboard</Link>
+      </p>
       <button type="button" onClick={() => void loadHealth()} disabled={loading}>
         {loading ? "Loading..." : "Refresh"}
       </button>

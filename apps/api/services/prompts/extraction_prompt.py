@@ -63,7 +63,7 @@ hasview: must be integer 0 or 1.
 market: MUST be one of CRYPTO, STOCK, ETF, FOREX, OTHER.
 
 stance: must be one of bull, bear, neutral.
-Stance rule: Prefer the author’s explicit stance. If only macro/trend is described, infer stance from the author’s implied direction ONLY when you are highly confident; otherwise output neutral.
+Stance rule: Prefer the author’s explicit stance. If the post describes an event/trend and you map it to a likely impacted tradable target, infer stance only when the direction is strongly implied by the post; otherwise output neutral.
 
 horizon: must be one of intraday, 1w, 1m, 3m, 1y.
 Horizon rule: Prefer the author’s explicit time point / holding window / expected duration. If none is stated, choose the most reliable horizon implied by the content (nearest reasonable window).
@@ -71,7 +71,7 @@ Horizon rule: Prefer the author’s explicit time point / holding window / expec
 summary: MUST be Chinese (only validate summary language) and concise (avoid long explanations; keep it short).
 
 confidence: MUST be integer 70..100.
-Meaning: confidence is your certainty that the post content meaningfully impacts THIS asset.
+Meaning: confidence is your certainty that the post content meaningfully impacts or is strongly associated with THIS asset (including plausible, directly-impacted targets) given the event/trend described.
 
 85..100: clearly about a specific asset / direct event / concrete claim.
 
@@ -80,7 +80,7 @@ If you think confidence < 70 for an asset: DO NOT output that asset at all.
 
 Extraction rules:
 
-Build asset_views first, then remove any item with confidence < 70.
+You may include asset_views for (a) assets explicitly mentioned OR (b) assets that are very likely impacted by the described event/trend, as long as your confidence is >= 70.
 
 If there is NO valid investable view after filtering: set hasview=0 and output asset_views as [].
 
@@ -90,9 +90,13 @@ Symbol rules:
 
 CN/HK stocks: symbol MUST be the full Chinese stock name.
 
-Other stocks: symbol MUST be a tradable ticker.
+US/overseas stocks: symbol MUST be a tradable ticker.
 
-Others: prefer standard codes / tradable symbols.
+ETF/Index: allow common tickers/symbols.
+
+CRYPTO: use standard symbols/pairs.
+
+FOREX/Commodities: prefer standard codes / tradable symbols.
 
 Example symbols: "贵州茅台", "NVDA", "SPX", "IGV", "BTC", "XAUUSD", "WTI"
 

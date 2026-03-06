@@ -141,7 +141,7 @@ def test_extractions_search_filters_by_keyword() -> None:
     assert len(all_items) == 2
 
 
-def test_extractions_bad_only_and_stats() -> None:
+def test_extractions_status_library_filters_islibrary_rows() -> None:
     get_settings.cache_clear()
     reset_runtime_counters()
     fake_db = _FakeSession()
@@ -150,10 +150,10 @@ def test_extractions_bad_only_and_stats() -> None:
         id=1,
         platform="x",
         kol_id=1,
-        author_handle="kol_1",
-        external_id="rp-1",
-        url="https://x.com/kol_1/status/1",
-        content_text="post 1",
+        author_handle="lib_kol",
+        external_id="rp-lib-1",
+        url="https://x.com/lib/status/1",
+        content_text="library post",
         posted_at=now,
         fetched_at=now,
         review_status=ReviewStatus.unreviewed,
@@ -165,10 +165,10 @@ def test_extractions_bad_only_and_stats() -> None:
         id=2,
         platform="x",
         kol_id=2,
-        author_handle="kol_2",
-        external_id="rp-2",
-        url="https://x.com/kol_2/status/2",
-        content_text="post 2",
+        author_handle="view_kol",
+        external_id="rp-view-2",
+        url="https://x.com/view/status/2",
+        content_text="view post",
         posted_at=now,
         fetched_at=now,
         review_status=ReviewStatus.unreviewed,
@@ -176,77 +176,50 @@ def test_extractions_bad_only_and_stats() -> None:
         reviewed_by=None,
         raw_json=None,
     )
-    fake_db.raw_posts[3] = RawPost(
-        id=3,
-        platform="x",
-        kol_id=3,
-        author_handle="kol_3",
-        external_id="rp-3",
-        url="https://x.com/kol_3/status/3",
-        content_text="post 3",
-        posted_at=now,
-        fetched_at=now,
-        review_status=ReviewStatus.unreviewed,
-        reviewed_at=None,
-        reviewed_by=None,
-        raw_json=None,
-    )
-    fake_db.extractions[21] = PostExtraction(
-        id=21,
+    fake_db.extractions[31] = PostExtraction(
+        id=31,
         raw_post_id=1,
-        status=ExtractionStatus.pending,
-        extracted_json={},
-        model_name="test-model",
-        extractor_name="openai_structured",
-        raw_model_output="{\"oops\":true}",
-        parsed_model_output=None,
-        last_error=None,
-        auto_applied_count=0,
-        auto_policy=None,
-        auto_applied_kol_view_ids=None,
-        created_at=now,
-    )
-    fake_db.extractions[22] = PostExtraction(
-        id=22,
-        raw_post_id=2,
-        status=ExtractionStatus.pending,
-        extracted_json={
-            "asset_views": [],
-            "reasoning": "ok",
-            "summary": "ok",
-            "stance": "neutral",
-            "horizon": "1w",
-            "confidence": 50,
-            "as_of": now.date().isoformat(),
-        },
-        model_name="test-model",
-        extractor_name="openai_structured",
-        raw_model_output=None,
-        parsed_model_output=None,
-        last_error=None,
-        auto_applied_count=0,
-        auto_policy=None,
-        auto_applied_kol_view_ids=None,
-        created_at=now,
-    )
-    fake_db.extractions[23] = PostExtraction(
-        id=23,
-        raw_post_id=3,
         status=ExtractionStatus.approved,
         extracted_json={
-            "asset_views": [],
-            "reasoning": "ok",
-            "summary": "bad approved",
-            "stance": "neutral",
-            "horizon": "1w",
-            "confidence": 50,
             "as_of": now.date().isoformat(),
+            "source_url": "https://x.com/lib/status/1",
+            "islibrary": 1,
+            "hasview": 0,
+            "asset_views": [],
+            "library_entry": {"tag": "macro", "summary": "测试"},
         },
         model_name="test-model",
         extractor_name="openai_structured",
-        raw_model_output=None,
-        parsed_model_output=None,
-        last_error="json validation failed",
+        last_error=None,
+        auto_applied_count=0,
+        auto_policy=None,
+        auto_applied_kol_view_ids=None,
+        created_at=now,
+    )
+    fake_db.extractions[32] = PostExtraction(
+        id=32,
+        raw_post_id=2,
+        status=ExtractionStatus.approved,
+        extracted_json={
+            "as_of": now.date().isoformat(),
+            "source_url": "https://x.com/view/status/2",
+            "islibrary": 0,
+            "hasview": 1,
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "market": "CRYPTO",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 80,
+                    "summary": "看多",
+                }
+            ],
+            "library_entry": None,
+        },
+        model_name="test-model",
+        extractor_name="openai_structured",
+        last_error=None,
         auto_applied_count=0,
         auto_policy=None,
         auto_applied_kol_view_ids=None,
@@ -258,18 +231,13 @@ def test_extractions_bad_only_and_stats() -> None:
 
     app.dependency_overrides[get_db] = override_get_db
     client = TestClient(app)
-    pending_bad_only = client.get("/extractions?status=pending&bad_only=true&limit=20&offset=0")
-    stats = client.get("/extractions/stats")
+    response = client.get("/extractions?status=library&limit=20&offset=0")
     app.dependency_overrides.clear()
 
-    assert pending_bad_only.status_code == 200
-    pending_items = pending_bad_only.json()
-    assert [item["id"] for item in pending_items] == [22, 21]
-
-    assert stats.status_code == 200
-    stats_payload = stats.json()
-    assert stats_payload["bad_count"] == 3
-    assert stats_payload["total_count"] == 3
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == 1
+    assert items[0]["id"] == 31
 
 
 def test_extractions_status_all_does_not_filter_by_status() -> None:
@@ -348,7 +316,7 @@ def test_extractions_status_all_does_not_filter_by_status() -> None:
     assert {item["status"] for item in payload} == {"pending", "approved"}
 
 
-def test_extractions_default_latest_only_and_show_history_toggle() -> None:
+def test_extractions_default_latest_only() -> None:
     get_settings.cache_clear()
     reset_runtime_counters()
     fake_db = _FakeSession()
@@ -402,7 +370,6 @@ def test_extractions_default_latest_only_and_show_history_toggle() -> None:
     client = TestClient(app)
     latest_only = client.get("/extractions?status=all&limit=20&offset=0")
     pending_latest_only = client.get("/extractions?status=pending&limit=20&offset=0")
-    with_history = client.get("/extractions?status=all&show_history=true&limit=20&offset=0")
     app.dependency_overrides.clear()
 
     assert latest_only.status_code == 200
@@ -411,6 +378,3 @@ def test_extractions_default_latest_only_and_show_history_toggle() -> None:
 
     assert pending_latest_only.status_code == 200
     assert pending_latest_only.json() == []
-
-    assert with_history.status_code == 200
-    assert {item["id"] for item in with_history.json()} == {100, 101}

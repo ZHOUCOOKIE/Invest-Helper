@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 
 type Kol = {
@@ -75,6 +76,9 @@ export default function KolsPage() {
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
       <h1>KOLs</h1>
+      <p>
+        <Link href="/dashboard">返回 Dashboard</Link>
+      </p>
       <form onSubmit={onSubmit} style={{ display: "grid", gap: "8px", maxWidth: "360px" }}>
         <input
           value={platform}

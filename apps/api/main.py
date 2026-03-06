@@ -38,6 +38,7 @@ from schemas import (
     AssetRead,
     AdminDeletePendingExtractionsRead,
     AdminFixApprovedMissingViewsRead,
+    AdminRecomputeExtractionStatusesRead,
     AdminRefreshWrongExtractedJsonRead,
     AdminHardDeleteRead,
     AssetViewsRead,
@@ -73,7 +74,6 @@ from schemas import (
     ProfileSummaryRead,
     RawPostsExtractBatchRead,
     RawPostsExtractBatchRequest,
-    ExtractionsStatsRead,
     XImportItemCreate,
     XConvertResponseRead,
     XConvertErrorRead,
@@ -1873,33 +1873,6 @@ def _attach_extraction_auto_approve_settings(extraction: PostExtraction) -> None
     setattr(extraction, "auto_reject_confidence_threshold", max(0, min(100, settings.auto_reject_confidence_threshold)))
 
 
-def _has_reviewable_asset_views(extraction: PostExtraction) -> bool:
-    payload = extraction.extracted_json if isinstance(extraction.extracted_json, dict) else {}
-    asset_views = payload.get("asset_views")
-    if not isinstance(asset_views, list):
-        return False
-    for item in asset_views:
-        if not isinstance(item, dict):
-            continue
-        symbol = _normalize_asset_symbol(item.get("symbol"))
-        if symbol:
-            return True
-    return False
-
-
-def _force_reextract_triggered_by(extraction: PostExtraction) -> str | None:
-    if not isinstance(extraction.extracted_json, dict):
-        return None
-    raw_meta = extraction.extracted_json.get("meta")
-    if not isinstance(raw_meta, dict):
-        return None
-    value = raw_meta.get("force_reextract_triggered_by")
-    if not isinstance(value, str):
-        return None
-    normalized = _normalize_force_reextract_trigger_value(value)
-    return normalized
-
-
 def _normalize_force_reextract_trigger_value(value: str | None) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1959,6 +1932,60 @@ def _coerce_islibrary(extracted_json: dict[str, Any]) -> int:
     return 0
 
 
+def _coerce_hasview(extracted_json: dict[str, Any]) -> int:
+    raw = extracted_json.get("hasview")
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    if isinstance(raw, int):
+        return 1 if raw == 1 else 0
+    if isinstance(raw, float):
+        return 1 if raw == 1.0 else 0
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return 1
+    return 0
+
+
+def _is_library_extraction_payload(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return _coerce_islibrary(payload) == 1
+
+
+def _evaluate_auto_review_decision(
+    extracted_json: dict[str, Any],
+    *,
+    threshold: int,
+) -> tuple[Literal["approved", "rejected", "pending"], str | None, int | None]:
+    islibrary = _coerce_islibrary(extracted_json)
+    if islibrary == 1:
+        return ("approved", "library_flag", None)
+    hasview = _coerce_hasview(extracted_json)
+    if islibrary == 0 and hasview == 0:
+        return ("rejected", "hasview_zero", 0)
+
+    asset_views = extracted_json.get("asset_views")
+    has_asset_views = isinstance(asset_views, list) and len(asset_views) > 0
+    if not ((hasview == 1 or islibrary == 1) and has_asset_views):
+        return ("pending", None, None)
+
+    model_confidence = _coerce_extraction_confidence(extracted_json)
+    if model_confidence is None:
+        return ("pending", None, None)
+    if model_confidence < threshold:
+        return ("rejected", "confidence_below_threshold", model_confidence)
+    return ("approved", "confidence_at_or_above_threshold", model_confidence)
+
+
+def _auto_review_decision_rank(decision: Literal["approved", "rejected", "pending"]) -> int:
+    if decision == "approved":
+        return 2
+    if decision == "rejected":
+        return 1
+    return 0
+
+
 async def postprocess_auto_review(
     *,
     db: AsyncSession,
@@ -1973,35 +2000,38 @@ async def postprocess_auto_review(
         return None
     islibrary = _coerce_islibrary(extraction.extracted_json)
     if trigger not in {"auto", "bulk"}:
-        base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
-        extraction.extracted_json = {
-            **extraction.extracted_json,
-            "meta": {
-                **base_meta,
-                "auto_policy_applied": "no_auto_review_user_trigger",
-            },
-        }
-        return None
-    if islibrary == 0 and not _has_reviewable_asset_views(extraction):
-        return None
-    if islibrary == 1:
-        return None
-    model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
-    if model_confidence is None:
+        if islibrary == 1:
+            # Library entries are auto-routed even for user-triggered force re-extract.
+            pass
+        else:
+            base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
+            extraction.extracted_json = {
+                **extraction.extracted_json,
+                "meta": {
+                    **base_meta,
+                    "auto_policy_applied": "no_auto_review_user_trigger",
+                },
+            }
+            return None
+    decision, reason, model_confidence = _evaluate_auto_review_decision(
+        extraction.extracted_json,
+        threshold=threshold,
+    )
+    if decision == "pending":
         return None
 
     base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
     reviewed_at = datetime.now(UTC)
-    if model_confidence < threshold:
+    if decision == "rejected":
         extraction.extracted_json = {
             **extraction.extracted_json,
             "meta": {
                 **base_meta,
                 "auto_rejected": True,
                 "auto_review_threshold": threshold,
-                "auto_review_reason": "confidence_below_threshold",
+                "auto_review_reason": reason,
                 "model_confidence": model_confidence,
-                "auto_reject_reason": "confidence_below_threshold",
+                "auto_reject_reason": reason,
                 "auto_reject_threshold": threshold,
                 "auto_policy_applied": "threshold_asset",
             },
@@ -2009,7 +2039,7 @@ async def postprocess_auto_review(
         extraction.status = ExtractionStatus.rejected
         extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
         extraction.reviewed_at = reviewed_at
-        extraction.review_note = "auto-rejected: confidence_below_threshold"
+        extraction.review_note = f"auto-rejected: {reason}"
         raw_post.review_status = ReviewStatus.rejected
         raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
         raw_post.reviewed_at = reviewed_at
@@ -2020,8 +2050,9 @@ async def postprocess_auto_review(
         "meta": {
             **base_meta,
             "auto_approved": True,
+            "auto_library": reason == "library_flag",
             "auto_review_threshold": threshold,
-            "auto_review_reason": "confidence_at_or_above_threshold",
+            "auto_review_reason": reason,
             "model_confidence": model_confidence,
             "auto_policy_applied": "threshold_asset",
         },
@@ -2032,7 +2063,7 @@ async def postprocess_auto_review(
         extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
         extraction.reviewed_at = reviewed_at
         if not extraction.review_note:
-            extraction.review_note = "auto-approved"
+            extraction.review_note = "auto-library" if reason == "library_flag" else "auto-approved"
         raw_post.review_status = ReviewStatus.approved
         raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
         raw_post.reviewed_at = reviewed_at
@@ -5042,8 +5073,6 @@ async def get_daily_digest_by_id(
 async def list_extractions(
     status: ExtractionListStatus = Query(default="all"),
     q: str = Query(default=""),
-    bad_only: bool = Query(default=False),
-    show_history: bool = Query(default=False),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -5062,41 +5091,27 @@ async def list_extractions(
         query = query.where(PostExtraction.status == ExtractionStatus(normalized_status))
     result = await db.execute(query)
     items = list(result.scalars().all())
-    if not show_history:
-        latest_by_raw_post_id: dict[int, PostExtraction] = {}
-        for item in items:
-            if item.raw_post_id not in latest_by_raw_post_id:
-                latest_by_raw_post_id[item.raw_post_id] = item
-        items = list(latest_by_raw_post_id.values())
+    latest_by_raw_post_id: dict[int, PostExtraction] = {}
+    for item in items:
+        if item.raw_post_id not in latest_by_raw_post_id:
+            latest_by_raw_post_id[item.raw_post_id] = item
+    items = list(latest_by_raw_post_id.values())
     if normalized_status in {
         ExtractionStatus.pending.value,
         ExtractionStatus.approved.value,
         ExtractionStatus.rejected.value,
     }:
         items = [item for item in items if _extraction_status_key(item) == normalized_status]
+    elif normalized_status == "library":
+        items = [item for item in items if _is_library_extraction_payload(item.extracted_json if isinstance(item.extracted_json, dict) else None)]
     keyword = q.strip()
     if keyword:
         items = [item for item in items if _extraction_matches_keyword(item, keyword)]
-    if bad_only:
-        items = [item for item in items if _is_bad_extracted_json(item)]
     items = items[offset : offset + limit]
     for extraction in items:
         _prepare_extraction_for_read(extraction)
         _attach_extraction_auto_approve_settings(extraction)
     return items
-
-
-@app.get("/extractions/stats", response_model=ExtractionsStatsRead)
-async def get_extractions_stats(
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(PostExtraction))
-    items = list(result.scalars().all())
-    bad_count = sum(1 for item in items if _is_bad_extracted_json(item))
-    return ExtractionsStatsRead(
-        bad_count=bad_count,
-        total_count=len(items),
-    )
 
 
 @app.post("/admin/extractions/refresh-wrong-extracted-json", response_model=AdminRefreshWrongExtractedJsonRead)
@@ -5181,6 +5196,157 @@ async def refresh_wrong_extracted_json(
         scanned=scanned,
         updated=len(updated_ids),
         dry_run=dry_run,
+        updated_ids=updated_ids,
+    )
+
+
+@app.post("/admin/extractions/recompute-statuses", response_model=AdminRecomputeExtractionStatusesRead)
+async def recompute_extraction_statuses(
+    confirm: str = Query(...),
+    days: int = Query(default=365, ge=1, le=3650),
+    limit: int = Query(default=5000, ge=1, le=50000),
+    dry_run: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+
+    now = datetime.now(UTC)
+    since_ts = now - timedelta(days=days)
+    threshold = AUTO_REVIEW_CONFIDENCE_THRESHOLD
+    result = await db.execute(
+        select(PostExtraction)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(limit)
+    )
+    rows = [item for item in result.scalars().all() if item.created_at is None or item.created_at >= since_ts]
+
+    updated_ids: list[int] = []
+    skipped_terminal_count = 0
+    skipped_no_result_count = 0
+    pending_count = 0
+    approved_count = 0
+    rejected_count = 0
+    scanned = 0
+
+    for extraction in rows:
+        scanned += 1
+        raw_post = await db.get(RawPost, extraction.raw_post_id)
+        if raw_post is None:
+            skipped_no_result_count += 1
+            continue
+
+        status_key = _extraction_status_key(extraction)
+        if not isinstance(extraction.extracted_json, dict):
+            skipped_no_result_count += 1
+            continue
+
+        payload = _coerce_extracted_json_for_read(extraction.extracted_json)
+        decision, reason, model_confidence = _evaluate_auto_review_decision(
+            payload,
+            threshold=threshold,
+        )
+        parsed_payload_raw = extraction.parsed_model_output if isinstance(extraction.parsed_model_output, dict) else None
+        if isinstance(parsed_payload_raw, dict):
+            parsed_payload_unwrapped, _ = _unwrap_extracted_json_payload(parsed_payload_raw)
+            parsed_payload = _coerce_extracted_json_for_read(parsed_payload_unwrapped)
+            parsed_decision, parsed_reason, parsed_confidence = _evaluate_auto_review_decision(
+                parsed_payload,
+                threshold=threshold,
+            )
+            # Prefer parsed payload when it yields a stronger decision than persisted extracted_json.
+            if _auto_review_decision_rank(parsed_decision) > _auto_review_decision_rank(decision):
+                payload = parsed_payload
+                decision = parsed_decision
+                reason = parsed_reason
+                model_confidence = parsed_confidence
+
+        final_status_key = decision
+        if final_status_key == ExtractionStatus.pending.value:
+            pending_count += 1
+        elif final_status_key == ExtractionStatus.approved.value:
+            approved_count += 1
+        else:
+            rejected_count += 1
+
+        if final_status_key == status_key:
+            continue
+
+        updated_ids.append(extraction.id)
+        if dry_run:
+            continue
+
+        reviewed_at = datetime.now(UTC)
+        base_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        if decision == "pending":
+            extraction.extracted_json = {
+                **payload,
+                "meta": {
+                    **base_meta,
+                    "auto_policy_applied": "threshold_asset",
+                    "auto_review_reason": "pending_by_rules",
+                    "auto_review_threshold": threshold,
+                },
+            }
+            extraction.status = ExtractionStatus.pending
+            extraction.reviewed_by = None
+            extraction.reviewed_at = None
+            extraction.review_note = None
+            raw_post.review_status = ReviewStatus.unreviewed
+            raw_post.reviewed_by = None
+            raw_post.reviewed_at = None
+        elif decision == "approved":
+            extraction.extracted_json = {
+                **payload,
+                "meta": {
+                    **base_meta,
+                    "auto_approved": True,
+                    "auto_library": reason == "library_flag",
+                    "auto_review_threshold": threshold,
+                    "auto_review_reason": reason,
+                    "model_confidence": model_confidence,
+                    "auto_policy_applied": "threshold_asset",
+                },
+            }
+            extraction.status = ExtractionStatus.approved
+            extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
+            extraction.reviewed_at = reviewed_at
+            extraction.review_note = "auto-library" if reason == "library_flag" else "auto-approved"
+            raw_post.review_status = ReviewStatus.approved
+            raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
+            raw_post.reviewed_at = reviewed_at
+        elif decision == "rejected":
+            extraction.extracted_json = {
+                **payload,
+                "meta": {
+                    **base_meta,
+                    "auto_rejected": True,
+                    "auto_review_threshold": threshold,
+                    "auto_review_reason": reason,
+                    "model_confidence": model_confidence,
+                    "auto_reject_reason": reason,
+                    "auto_reject_threshold": threshold,
+                    "auto_policy_applied": "threshold_asset",
+                },
+            }
+            extraction.status = ExtractionStatus.rejected
+            extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
+            extraction.reviewed_at = reviewed_at
+            extraction.review_note = f"auto-rejected: {reason}"
+            raw_post.review_status = ReviewStatus.rejected
+            raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
+            raw_post.reviewed_at = reviewed_at
+
+    if not dry_run:
+        await db.commit()
+    return AdminRecomputeExtractionStatusesRead(
+        scanned=scanned,
+        updated=len(updated_ids),
+        dry_run=dry_run,
+        pending_count=pending_count,
+        approved_count=approved_count,
+        rejected_count=rejected_count,
+        skipped_terminal_count=skipped_terminal_count,
+        skipped_no_result_count=skipped_no_result_count,
         updated_ids=updated_ids,
     )
 

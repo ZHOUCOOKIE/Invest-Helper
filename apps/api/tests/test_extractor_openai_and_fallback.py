@@ -430,7 +430,7 @@ def test_summary_language_check_only_asset_views_and_library_entry() -> None:
     assert _detect_extracted_summary_language(payload) == "zh"
 
 
-def test_library_auto_review_skips_without_library_confidence() -> None:
+def test_library_auto_review_auto_approved_without_asset_views() -> None:
     raw_post = _raw_post()
     extraction = _extraction(
         {
@@ -451,4 +451,169 @@ def test_library_auto_review_skips_without_library_confidence() -> None:
             trigger="auto",
         )
     )
-    assert outcome is None
+    assert outcome == "approved"
+    assert extraction.status == ExtractionStatus.approved
+
+
+def test_non_library_without_asset_views_auto_rejected() -> None:
+    raw_post = _raw_post()
+    extraction = _extraction(
+        {
+            "as_of": "2026-02-21",
+            "source_url": raw_post.url,
+            "islibrary": 0,
+            "hasview": 0,
+            "asset_views": [],
+            "library_entry": None,
+        }
+    )
+
+    outcome = asyncio.run(
+        postprocess_auto_review(
+            db=FakeAsyncSession(),
+            extraction=extraction,
+            raw_post=raw_post,
+            trigger="auto",
+        )
+    )
+
+    assert outcome == "rejected"
+    assert extraction.status == ExtractionStatus.rejected
+    meta = extraction.extracted_json.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("auto_rejected") is True
+    assert meta.get("auto_reject_reason") == "hasview_zero"
+
+
+def test_non_library_hasview_zero_auto_rejected_even_if_asset_views_present() -> None:
+    raw_post = _raw_post()
+    extraction = _extraction(
+        {
+            "as_of": "2026-02-21",
+            "source_url": raw_post.url,
+            "islibrary": 0,
+            "hasview": 0,
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "market": "CRYPTO",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 95,
+                    "summary": "看多",
+                }
+            ],
+            "library_entry": None,
+        }
+    )
+
+    outcome = asyncio.run(
+        postprocess_auto_review(
+            db=FakeAsyncSession(),
+            extraction=extraction,
+            raw_post=raw_post,
+            trigger="auto",
+        )
+    )
+
+    assert outcome == "rejected"
+    assert extraction.status == ExtractionStatus.rejected
+    meta = extraction.extracted_json.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("auto_reject_reason") == "hasview_zero"
+
+
+def test_hasview_one_with_asset_views_and_confidence_ge_70_auto_approved() -> None:
+    raw_post = _raw_post()
+    extraction = _extraction(
+        {
+            "as_of": "2026-02-21",
+            "source_url": raw_post.url,
+            "islibrary": 0,
+            "hasview": 1,
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "market": "CRYPTO",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 70,
+                    "summary": "看多",
+                }
+            ],
+            "library_entry": None,
+        }
+    )
+
+    outcome = asyncio.run(
+        postprocess_auto_review(
+            db=FakeAsyncSession(),
+            extraction=extraction,
+            raw_post=raw_post,
+            trigger="auto",
+        )
+    )
+
+    assert outcome == "approved"
+    assert extraction.status == ExtractionStatus.approved
+
+
+def test_islibrary_one_with_asset_views_and_confidence_ge_70_auto_approved() -> None:
+    raw_post = _raw_post()
+    extraction = _extraction(
+        {
+            "as_of": "2026-02-21",
+            "source_url": raw_post.url,
+            "islibrary": 1,
+            "hasview": 0,
+            "asset_views": [
+                {
+                    "symbol": "BTC",
+                    "market": "CRYPTO",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 80,
+                    "summary": "看多",
+                }
+            ],
+            "library_entry": {"tag": "thesis", "summary": "测试"},
+        }
+    )
+
+    outcome = asyncio.run(
+        postprocess_auto_review(
+            db=FakeAsyncSession(),
+            extraction=extraction,
+            raw_post=raw_post,
+            trigger="auto",
+        )
+    )
+
+    assert outcome == "approved"
+    assert extraction.status == ExtractionStatus.approved
+
+
+def test_islibrary_one_auto_approved_even_when_trigger_is_user() -> None:
+    raw_post = _raw_post()
+    extraction = _extraction(
+        {
+            "as_of": "2026-02-21",
+            "source_url": raw_post.url,
+            "islibrary": 1,
+            "hasview": 0,
+            "asset_views": [],
+            "library_entry": {"tag": "macro", "summary": "测试"},
+        }
+    )
+
+    outcome = asyncio.run(
+        postprocess_auto_review(
+            db=FakeAsyncSession(),
+            extraction=extraction,
+            raw_post=raw_post,
+            trigger="user",
+        )
+    )
+
+    assert outcome == "approved"
+    assert extraction.status == ExtractionStatus.approved

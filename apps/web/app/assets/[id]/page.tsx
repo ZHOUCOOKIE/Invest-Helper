@@ -173,6 +173,8 @@ export default function AssetDetailPage() {
       <h1>Asset {Number.isNaN(assetId) ? "?" : assetId} Views</h1>
       <p>
         <Link href="/assets">返回资产列表</Link>
+        {" | "}
+        <Link href="/dashboard">返回 Dashboard</Link>
       </p>
       {loading && <p>Loading...</p>}
       {error && <p style={{ color: "crimson" }}>{error}</p>}

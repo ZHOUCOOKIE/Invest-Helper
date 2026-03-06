@@ -1,37 +1,102 @@
 # InvestPulse
 
-Authoritative
+[English](./README.md) | [简体中文](./README.zh-CN.md)
 
-TL;DR
-- InvestPulse 从帖子中抽取结构化投资观点，提供可追溯、可回放的看板与 Daily Digest。
-- 文档单一入口：`docs/INDEX.md`。
-- 统一验收命令：`make verify`。
+InvestPulse is an evidence-traceable investment signal dashboard built from multi-source posts.  
+It extracts structured signals, supports review workflows, and provides versioned Daily Digest replay by `profile_id + digest_date + version`.
 
-## Product Scope (Code-Verified)
+## Why InvestPulse
 
-Implemented
-- X 导入与原始帖子入库（convert/import/following/retry）。
-- 抽取与审核流程（single/batch/async jobs，approve/reject/re-extract）。
-- OpenRouter 抽取默认模型：`deepseek/deepseek-v3.2`（可被环境变量 `OPENAI_MODEL` 覆盖）。
-- Prompt 限制已在代码 enforce：JSON-only 输出、OpenRouter `text_json` 模式、reasoning 中文检测与一次纠正重试。
-- Prompt 组装单一事实来源：`apps/api/services/prompts/extraction_prompt.py`；官方构建入口：`apps/api/services/prompts/__init__.py::build_extract_prompt`（`prompt_version` 当前固定为 `extract_v1`）。
-- 抽取并发与节流已在批量/异步任务生效：`max_concurrency` + `max_rpm` + `batch_size` + `batch_sleep_ms` + retry backoff。
-- Profile 规则（KOL 权重、market 过滤）。
-- 按 `profile_id + digest_date + version` 的 Digest 版本化生成与回放。
-- 证据链字段贯通 `raw_posts -> post_extractions -> kol_views -> daily_digests`。
+- Keep signal extraction auditable with source-linked evidence.
+- Turn unstructured post streams into structured `asset_views`.
+- Support profile-scoped decision views and versioned digest playback.
+- Keep operations practical for local development and CI verification.
 
-Not Implemented
-- Event reminder scheduling/triggering。
-- Prediction-market integration。
+## Current Implementation (Code-Verified)
 
-Non-goal (current)
-- 非 X 平台不是当前核心产品流水线。
+- Ingestion and raw post persistence for X workflows.
+- Extraction pipeline with single, batch, and async execution paths.
+- Prompt SSOT in `apps/api/services/prompts/extraction_prompt.py`.
+- Runtime normalize contract: `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
+- Strict enum handling for `market`, `stance`, and `horizon`.
+- Auto-review flow:
+  - non-library + `hasview=0` => auto reject
+  - non-library + valid confidence path => threshold review (`70`)
+  - `islibrary=1` => auto approve (`library_flag`)
+- Traceability chain across `raw_posts -> post_extractions -> kol_views -> daily_digests`.
+- Replay-ready digests with monotonic `version` per `profile_id + digest_date`.
 
-## Start Here
+## Product Surfaces
 
-- 本地运行与回放：`docs/RUNBOOK.md`
-- 开发/测试/lint/迁移：`docs/DEV_WORKFLOW.md`
-- API 端点与示例：`docs/API.md`
-- 可追溯与回放策略：`docs/TRACEABILITY_AND_REPLAY.md`
-- 能力边界账本：`docs/STATUS.md`
-- 术语：`docs/GLOSSARY.md`
+- API: FastAPI + SQLAlchemy + Alembic
+- Web: Next.js dashboard/review/profile/digest pages
+- Storage: PostgreSQL (dev + test), Redis
+
+Main routes:
+- `/dashboard`
+- `/ingest`
+- `/extractions`
+- `/assets`
+- `/profile`
+- `/digests/[date]`
+
+## Quick Start
+
+```bash
+# 1) Infra
+docker compose up -d db db_test redis
+
+# 2) API
+cd apps/api
+uv sync
+ENV=local DEBUG=true DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse uv run uvicorn main:app --reload
+```
+
+In another shell:
+
+```bash
+# 3) Web
+cd apps/web
+pnpm install
+pnpm dev
+```
+
+Unified verification (required after changes):
+
+```bash
+DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@localhost:5433/investpulse_test make verify
+```
+
+## Documentation Map (SSOT)
+
+- [docs/INDEX.md](./docs/INDEX.md): documentation authority and navigation
+- [docs/RUNBOOK.md](./docs/RUNBOOK.md): run and replay commands
+- [docs/DEV_WORKFLOW.md](./docs/DEV_WORKFLOW.md): dev/test/lint/migrate/verify workflow
+- [docs/API.md](./docs/API.md): API contract and examples
+- [docs/TRACEABILITY_AND_REPLAY.md](./docs/TRACEABILITY_AND_REPLAY.md): evidence and replay semantics
+- [docs/STATUS.md](./docs/STATUS.md): implemented capability ledger
+
+## Architecture Snapshot
+
+```text
+X/Source Posts
+   -> raw_posts
+   -> extraction (prompt + model + normalize)
+   -> post_extractions
+   -> review/auto-review
+   -> kol_views
+   -> daily_digests (profile_id + digest_date + version)
+   -> dashboard / digest replay
+```
+
+## Roadmap
+
+- Improve extraction quality controls and evaluation benchmarks.
+- Add richer profile-level signal ranking and filtering.
+- Strengthen digest explainability with clearer evidence summaries.
+- Prepare event/reminder lifecycle capabilities (currently not implemented).
+- Continue reducing legacy/non-core paths outside the X-centric workflow.
+
+## License
+
+MIT. See [LICENSE](./LICENSE).

@@ -28,4 +28,4 @@ TL;DR
 
 ## Scope Note
 
-- Reddit-related UI remnants are legacy, not a core product target.
+- Non-X UI remnants are legacy, not a core product target.

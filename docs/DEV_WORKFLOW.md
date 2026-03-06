@@ -1,99 +1,29 @@
-# Dev Workflow
+# DEV WORKFLOW
 
-Authoritative
-
-TL;DR
-- 本文是开发、测试、lint、迁移与验收命令的唯一权威来源。
-- 统一验收命令：`make verify`。
-- API 测试必须使用 test DB（`DATABASE_URL_TEST`/`DATABASE_URL` 必须包含 `test`）。
-
-## One-Command Acceptance
-
-```bash
-make verify
-```
-
-`make verify` 当前执行顺序（来自 `Makefile`）：
-- `verify-migrate`
-- `verify-ruff`
-- `lint`
-- `verify-api`
-- `verify-web`
-- `pnpm test`
-
-## Focused Commands
-
-- API migration: `cd apps/api && ENV=local DEBUG=false DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse} uv run alembic upgrade head`
-- API lint: `cd apps/api && uv run ruff check .`
-- API tests (guarded): `./scripts/test_api.sh`
+## Core Commands
+- Install deps: `pnpm install` and `cd apps/api && uv sync`
+- API tests: `./scripts/test_api.sh`
 - Web tests: `pnpm test:web`
-- Monorepo tests: `pnpm test`
-- Web lint: `pnpm lint`
+- Lint: `pnpm lint` and `cd apps/api && uv run ruff check .`
+- Migrate: `cd apps/api && ENV=local DEBUG=false DATABASE_URL=... uv run alembic upgrade head`
+- Unified verification (required): `make verify`
 
-Extraction 规则专项（方案A关键用例）：
-```bash
-cd apps/api
-DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse_test \
-uv run pytest -q \
-  tests/test_extractor_openai_and_fallback.py \
-  tests/test_admin_reextract_pending_bulk.py \
-  tests/test_extraction_runtime_limits_and_rules.py
-```
-
-Library 高价值入库规则（A2）专项：
-```bash
-cd apps/api
-DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse_test \
-uv run pytest -q \
-  tests/test_extractor_openai_and_fallback.py -k "library_entry or low_value_style or library_downgraded or legacy_extracted_json or library_tags"
-```
-
-## Test DB Guardrails
-
-- `./scripts/test_api.sh` 会设置：
+## Test DB Guardrail
+- Tests must use test DB only.
+- Required env:
   - `ENV=test`
-  - `DEBUG=true`
-  - `DATABASE_URL_TEST` 默认 `postgresql+asyncpg://postgres:postgres@localhost:5433/investpulse_test`
+  - `DATABASE_URL_TEST=postgresql+asyncpg://.../investpulse_test`
   - `DATABASE_URL=$DATABASE_URL_TEST`
-- `apps/api/tests/conftest.py` 会拒绝非 test 库：
-  - `Refusing to run tests on non-test database URL`
-- pytest session 会在前后重置 schema，并在测试前自动执行 `alembic upgrade head`。
 
-故障注入验证（证明不会污染开发库）：
-```bash
-DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse ./scripts/test_api.sh -k test_extractor_status_includes_openrouter_and_budget_fields
-```
-预期：pytest 在 session start 直接失败，报错包含 `Refusing to run tests on non-test database URL`。
+## Extraction Ruleset Update Checklist
+When changing extraction rules, update all of:
+- Prompt SSOT: `apps/api/services/prompts/extraction_prompt.py`
+- Runtime normalize/schema: `apps/api/services/extraction.py`
+- Auto-review path: `apps/api/main.py`
+- Tests under `apps/api/tests/`
+- Docs (`docs/API.md`, `docs/STATUS.md`, `docs/RUNBOOK.md`, `docs/PROMPT_AND_FLOW_REASONING_ZH.md`)
 
-## Extraction Runtime Limits (Code-Effective)
-
-- 配置源：`apps/api/settings.py`
-  - `extract_max_concurrency_default`
-  - `extract_max_rpm_default`
-  - `extract_batch_size_default`
-  - `extract_batch_sleep_ms_default`
-  - `extract_retry_max`
-  - `extract_retry_backoff_base_ms`
-  - `extract_retry_backoff_max_ms`
-  - `extract_job_max_concurrency`
-- 生效点：
-  - 批量抽取：`apps/api/main.py::_extract_raw_posts_batch_core`（`asyncio.Semaphore` + `_RpmLimiter` + batch sleep + retry backoff）
-  - 异步 job：`apps/api/main.py::_run_extract_job`（按 chunk 并发 worker，受 `extract_job_max_concurrency` 控制）
-
-## Common Failures
-
-- `Refusing to run tests on non-test database URL`
-  - 使用包含 `test` 的 DB/schema URL。
-- DB connection refused
-  - 先按 `docs/RUNBOOK.md` 启动 infra（`db/db_test/redis`）。
-- Alembic/env parse failure
-  - 检查 `.env`，特别是布尔值（如 `DEBUG=true|false`）。
-- Web deps missing
-  - 执行 `cd apps/web && pnpm install`。
-
-## Documentation Update Rule
-
-- 运行/回放变更：更新 `docs/RUNBOOK.md`
-- API 合约变更：更新 `docs/API.md`
-- 证据链/版本语义变更：更新 `docs/TRACEABILITY_AND_REPLAY.md`
-- 能力边界变更：更新 `docs/STATUS.md`
+## Current Extraction Contract
+- Top-level strict business keys: `as_of/source_url/islibrary/assets/asset_views/library_entry`
+- Asset views keep `confidence>=70`
+- Library review key: `library_entry.confidence`

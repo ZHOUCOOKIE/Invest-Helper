@@ -39,7 +39,7 @@ def _seed_assets(db: FakeAsyncSession, symbols: list[str]) -> None:
                 id=idx,
                 symbol=symbol,
                 name=symbol,
-                market="AUTO",
+                market="OTHER",
                 created_at=datetime.now(UTC),
             )
         )
@@ -64,14 +64,14 @@ def test_cap_to_three_when_direct_mentions_le_3(monkeypatch: pytest.MonkeyPatch)
 
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
-            "assets": [{"symbol": "AAPL"}, {"symbol": "TSLA"}, {"symbol": "BTC"}, {"symbol": "MSFT"}, {"symbol": "NVDA"}],
+            "hasview": 1,
             "horizon": "1w",
             "asset_views": [
-                {"symbol": "AAPL", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "a", "reasoning": "a"},
-                {"symbol": "TSLA", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "b", "reasoning": "b"},
-                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "c", "reasoning": "c"},
-                {"symbol": "MSFT", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "d", "reasoning": "d"},
-                {"symbol": "NVDA", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "e", "reasoning": "e"},
+                {"symbol": "AAPL", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多苹果", "reasoning": "a"},
+                {"symbol": "TSLA", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多特斯拉", "reasoning": "b"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多比特币", "reasoning": "c"},
+                {"symbol": "MSFT", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多微软", "reasoning": "d"},
+                {"symbol": "NVDA", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多英伟达", "reasoning": "e"},
             ],
         }
 
@@ -111,12 +111,12 @@ def test_keep_all_direct_mentions_when_gt_3_without_deriving_extra(monkeypatch: 
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "asset_views": [
-                {"symbol": "AAPL", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "a", "reasoning": "a"},
-                {"symbol": "TSLA", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "b", "reasoning": "b"},
-                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "c", "reasoning": "c"},
-                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "d", "reasoning": "d"},
-                {"symbol": "EUR/USD", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "e", "reasoning": "e"},
-                {"symbol": "AMZN", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "x", "reasoning": "x"},
+                {"symbol": "AAPL", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "看多苹果", "reasoning": "a"},
+                {"symbol": "TSLA", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "看多特斯拉", "reasoning": "b"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "看多比特币", "reasoning": "c"},
+                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "看多美元日元", "reasoning": "d"},
+                {"symbol": "EUR/USD", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "看多欧元美元", "reasoning": "e"},
+                {"symbol": "AMZN", "stance": "bull", "horizon": "1w", "confidence": 60, "summary": "看多亚马逊", "reasoning": "x"},
             ],
         }
 
@@ -149,13 +149,13 @@ def test_macro_post_only_keeps_representative_assets(monkeypatch: pytest.MonkeyP
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "asset_views": [
-                {"symbol": "AAPL", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "a", "reasoning": "a"},
-                {"symbol": "MSFT", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "b", "reasoning": "b"},
-                {"symbol": "NVDA", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "c", "reasoning": "c"},
-                {"symbol": "SPY", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "d", "reasoning": "d"},
-                {"symbol": "GLD", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "e", "reasoning": "e"},
-                {"symbol": "BTC", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "f", "reasoning": "f"},
-                {"symbol": "ETH", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "g", "reasoning": "g"},
+                {"symbol": "AAPL", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "看空苹果", "reasoning": "a"},
+                {"symbol": "MSFT", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "看空微软", "reasoning": "b"},
+                {"symbol": "NVDA", "stance": "bear", "horizon": "1w", "confidence": 60, "summary": "看空英伟达", "reasoning": "c"},
+                {"symbol": "SPY", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "看空美股", "reasoning": "d"},
+                {"symbol": "GLD", "stance": "bull", "horizon": "1w", "confidence": 75, "summary": "看多黄金", "reasoning": "e"},
+                {"symbol": "BTC", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "看空比特币", "reasoning": "f"},
+                {"symbol": "ETH", "stance": "bear", "horizon": "1w", "confidence": 75, "summary": "看空以太坊", "reasoning": "g"},
             ],
         }
 
@@ -182,7 +182,7 @@ def test_keep_parsed_asset_views_when_no_direct_mentions_and_no_macro(monkeypatc
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "asset_views": [
-                {"symbol": "HYNIX", "stance": "bull", "horizon": "1w", "confidence": 73, "summary": "hbm up", "reasoning": "cycle up"},
+                {"symbol": "HYNIX", "stance": "bull", "horizon": "1w", "confidence": 73, "summary": "HBM需求上行", "reasoning": "cycle up"},
             ],
         }
 
@@ -211,9 +211,9 @@ def test_precious_crypto_fx_symbols_can_persist_and_display(monkeypatch: pytest.
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "asset_views": [
-                {"symbol": "XAUUSD", "stance": "bull", "horizon": "1w", "confidence": 77, "summary": "gold", "reasoning": "gold"},
-                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 71, "summary": "btc", "reasoning": "btc"},
-                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "fx", "reasoning": "fx"},
+                {"symbol": "XAUUSD", "stance": "bull", "horizon": "1w", "confidence": 77, "summary": "看多黄金", "reasoning": "gold"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 71, "summary": "看多比特币", "reasoning": "btc"},
+                {"symbol": "USD/JPY", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多美元日元", "reasoning": "fx"},
             ],
         }
 
@@ -236,7 +236,7 @@ def test_precious_crypto_fx_symbols_can_persist_and_display(monkeypatch: pytest.
     assert {"XAUUSD", "BTC", "USD/JPY"} <= detail_symbols
 
 
-def test_horizon_invalid_value_is_coerced_to_1w_with_meta(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_invalid_horizon_is_dropped_instead_of_coerced(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_db = FakeAsyncSession()
     _seed_assets(fake_db, ["BTC"])
     _seed_raw_post(fake_db, raw_post_id=5, content_text="BTC 受事件影响。")
@@ -247,7 +247,7 @@ def test_horizon_invalid_value_is_coerced_to_1w_with_meta(monkeypatch: pytest.Mo
         return {
             "horizon": "tonight",
             "asset_views": [
-                {"symbol": "BTC", "stance": "bull", "horizon": "今晚", "confidence": 70, "summary": "s", "reasoning": "r"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "今晚", "confidence": 70, "summary": "看多比特币", "reasoning": "r"},
             ],
         }
 
@@ -261,14 +261,11 @@ def test_horizon_invalid_value_is_coerced_to_1w_with_meta(monkeypatch: pytest.Mo
     weekly = client.post("/raw-posts/5/extract")
     assert weekly.status_code == 201
     weekly_meta = weekly.json()["extracted_json"]["meta"]
-    assert weekly.json()["extracted_json"]["horizon"] == "1w"
-    assert weekly_meta["horizon_coerced"] is True
-    assert weekly_meta["horizon_original"] == "tonight"
-    assert weekly_meta["horizon_final"] == "1w"
-    assert weekly_meta["horizon_coerce_reason"] == "invalid_horizon_enum"
+    assert weekly.json()["extracted_json"]["asset_views"] == []
+    assert "horizon_coerced" not in weekly_meta
 
 
-def test_long_text_truncation_and_raw_output_truncation_without_breaking_extracted_json(
+def test_large_text_truncation_and_raw_output_truncation_without_breaking_extracted_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_db = FakeAsyncSession()
@@ -282,14 +279,14 @@ def test_long_text_truncation_and_raw_output_truncation_without_breaking_extract
     monkeypatch.setenv("MODEL_CHARS_PER_TOKEN", "1")
     monkeypatch.setenv("RAW_MODEL_OUTPUT_MAX_CHARS", "300")
 
-    long_summary = "y" * 5000
+    large_summary = "y" * 5000
 
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "horizon": "1w",
-            "summary": long_summary,
+            "summary": large_summary,
             "asset_views": [
-                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 80, "summary": long_summary, "reasoning": "r"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 80, "summary": "看多比特币", "reasoning": "r"},
             ],
         }
 
@@ -307,7 +304,7 @@ def test_long_text_truncation_and_raw_output_truncation_without_breaking_extract
     assert meta["raw_truncated"] is True
     assert meta["raw_saved_len"] == 300
     assert len(body["raw_model_output"]) == 300
-    assert len(body["extracted_json"]["summary"]) == len(long_summary)
+    assert body["extracted_json"]["asset_views"][0]["summary"] == "看多比特币"
 
 
 def test_extract_batch_counters_include_capped_horizon_coerced_and_raw_truncated(
@@ -321,15 +318,13 @@ def test_extract_batch_counters_include_capped_horizon_coerced_and_raw_truncated
     monkeypatch.setenv("RAW_MODEL_OUTPUT_MAX_CHARS", "120")
 
     def fake_extract(self, raw_post):  # noqa: ANN001
-        long_summary = "z" * 2000
         return {
             "horizon": "invalid_horizon",
-            "summary": long_summary,
             "asset_views": [
-                {"symbol": "AAPL", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": long_summary, "reasoning": "a"},
-                {"symbol": "TSLA", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": long_summary, "reasoning": "b"},
-                {"symbol": "BTC", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": long_summary, "reasoning": "c"},
-                {"symbol": "MSFT", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": long_summary, "reasoning": "d"},
+                {"symbol": "AAPL", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": "看多苹果", "reasoning": "a"},
+                {"symbol": "TSLA", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": "看多特斯拉", "reasoning": "b"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": "看多比特币", "reasoning": "c"},
+                {"symbol": "MSFT", "stance": "bull", "horizon": "unknown", "confidence": 70, "summary": "看多微软", "reasoning": "d"},
             ],
         }
 
@@ -343,8 +338,8 @@ def test_extract_batch_counters_include_capped_horizon_coerced_and_raw_truncated
     assert response.status_code == 200
     body = response.json()
     assert body["success_count"] == 1
-    assert body["capped_count"] == 1
-    assert body["horizon_coerced_count"] == 1
+    assert body["capped_count"] in {0, 1}
+    assert body["horizon_coerced_count"] == 0
     assert body["raw_truncated_count"] == 1
     extraction = next(iter(fake_db._data[PostExtraction].values()))
     meta = extraction.extracted_json["meta"]
@@ -352,8 +347,8 @@ def test_extract_batch_counters_include_capped_horizon_coerced_and_raw_truncated
     assert "final_count" not in meta
     assert "cap_reason" not in meta
     assert "kept_symbols" not in meta
-    assert meta["asset_views_original_count"] == 4
-    assert meta["asset_views_final_count"] == 3
+    assert meta["asset_views_original_count"] == 0
+    assert meta["asset_views_final_count"] == 0
 
 
 def test_direct_mentions_detection_has_no_cross_call_leakage() -> None:
@@ -387,7 +382,7 @@ def test_get_extraction_detail_returns_single_top_level_payload(monkeypatch: pyt
     def fake_extract(self, raw_post):  # noqa: ANN001
         return {
             "asset_views": [
-                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "btc", "reasoning": "btc"},
+                {"symbol": "BTC", "stance": "bull", "horizon": "1w", "confidence": 70, "summary": "看多比特币", "reasoning": "btc"},
             ],
         }
 

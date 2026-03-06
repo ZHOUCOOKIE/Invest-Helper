@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { buildMissingInferenceHints, pickAssetSymbols, pickAssetViews, pickDefaults } from "./review-inference.js";
 
 type Asset = {
   id: number;
@@ -106,87 +107,8 @@ type FormState = {
   as_of: string;
 };
 
-const VALID_STANCE = new Set(["bull", "bear", "neutral"]);
-const VALID_HORIZON = new Set(["intraday", "1w", "1m", "3m", "1y"]);
-
-function pickDefaults(extracted: Record<string, unknown>, rawPostUrl: string): Partial<FormState> {
-  const result: Partial<FormState> = {
-    source_url: rawPostUrl,
-  };
-
-  if (typeof extracted.stance === "string" && VALID_STANCE.has(extracted.stance)) {
-    result.stance = extracted.stance as FormState["stance"];
-  }
-  if (typeof extracted.horizon === "string" && VALID_HORIZON.has(extracted.horizon)) {
-    result.horizon = extracted.horizon as FormState["horizon"];
-  }
-  if (typeof extracted.confidence === "number") {
-    result.confidence = String(Math.max(0, Math.min(100, Math.round(extracted.confidence))));
-  }
-  if (typeof extracted.summary === "string") result.summary = extracted.summary;
-  if (typeof extracted.source_url === "string") result.source_url = extracted.source_url;
-  if (typeof extracted.as_of === "string") result.as_of = extracted.as_of;
-
-  const candidates = extracted.candidates;
-  if (Array.isArray(candidates) && candidates.length > 0) {
-    const first = candidates[0] as Record<string, unknown>;
-    if (typeof first.summary === "string") result.summary = first.summary;
-    if (typeof first.source_url === "string") result.source_url = first.source_url;
-    if (typeof first.as_of === "string") result.as_of = first.as_of;
-    if (typeof first.stance === "string" && VALID_STANCE.has(first.stance)) {
-      result.stance = first.stance as FormState["stance"];
-    }
-    if (typeof first.horizon === "string" && VALID_HORIZON.has(first.horizon)) {
-      result.horizon = first.horizon as FormState["horizon"];
-    }
-    if (typeof first.confidence === "number") {
-      result.confidence = String(Math.max(0, Math.min(100, Math.round(first.confidence))));
-    }
-  }
-
-  return result;
-}
-
-function pickAssetSymbols(extracted: Record<string, unknown>): string[] {
-  const assets = extracted.assets;
-  if (!Array.isArray(assets) || assets.length === 0) {
-    return [];
-  }
-  const symbols: string[] = [];
-  for (const item of assets) {
-    const asset = item as Record<string, unknown>;
-    if (typeof asset.symbol === "string" && asset.symbol.trim()) {
-      symbols.push(asset.symbol.trim().toUpperCase());
-    }
-  }
-  return symbols;
-}
-
 function todayIsoDate(): string {
   return new Date().toISOString().slice(0, 10);
-}
-
-function pickAssetViews(extracted: Record<string, unknown>): AssetViewItem[] {
-  const value = extracted.asset_views;
-  if (!Array.isArray(value)) return [];
-  const items: AssetViewItem[] = [];
-  for (const raw of value) {
-    if (!raw || typeof raw !== "object") continue;
-    const item = raw as Record<string, unknown>;
-    if (typeof item.symbol !== "string" || !item.symbol.trim()) continue;
-    if (typeof item.stance !== "string" || !VALID_STANCE.has(item.stance)) continue;
-    if (typeof item.horizon !== "string" || !VALID_HORIZON.has(item.horizon)) continue;
-    if (typeof item.confidence !== "number") continue;
-    items.push({
-      symbol: item.symbol.trim().toUpperCase(),
-      stance: item.stance as AssetViewItem["stance"],
-      horizon: item.horizon as AssetViewItem["horizon"],
-      confidence: Math.max(0, Math.min(100, Math.round(item.confidence))),
-      summary: typeof item.summary === "string" ? item.summary : null,
-      as_of: typeof item.as_of === "string" ? item.as_of : null,
-    });
-  }
-  return items.sort((a, b) => b.confidence - a.confidence);
 }
 
 function normalizeAsOfDate(value: string | null | undefined, fallback: string): string {
@@ -501,16 +423,7 @@ export default function ExtractionDetailPage() {
 
   const missingInferenceHints = useMemo(() => {
     if (!extraction) return [];
-    const extracted = extraction.extracted_json;
-    const hints: string[] = [];
-    const stanceMissing = typeof extracted.stance !== "string" || !VALID_STANCE.has(extracted.stance);
-    const horizonMissing = typeof extracted.horizon !== "string" || !VALID_HORIZON.has(extracted.horizon);
-    const assetMissing = pickAssetSymbols(extracted).length === 0;
-
-    if (stanceMissing) hints.push("stance: 模型未判断/信息不足");
-    if (horizonMissing) hints.push("horizon: 模型未判断/信息不足");
-    if (assetMissing) hints.push("asset: 模型未判断/信息不足");
-    return hints;
+    return buildMissingInferenceHints(extraction.extracted_json);
   }, [extraction]);
 
   const budgetExhaustedFallback = useMemo(() => {

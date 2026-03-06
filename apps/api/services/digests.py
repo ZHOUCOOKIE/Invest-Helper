@@ -19,13 +19,9 @@ from schemas import (
     DailyDigestTopViewRead,
 )
 from services.profiles import DEFAULT_PROFILE_ID, load_profile_rules
+from services.view_logic import calc_clarity, select_latest_views
 
 TimeFieldUsed = Literal["as_of", "posted_at", "created_at"]
-
-
-def _calc_clarity(bull_count: int, bear_count: int) -> float:
-    total = bull_count + bear_count
-    return abs(bull_count - bear_count) / max(1, total)
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -67,25 +63,6 @@ def _resolve_view_business_ts(
         return _ensure_utc(view.created_at), "created_at"
 
     return None, "created_at"
-
-
-def _is_newer_view(candidate: KolView, current: KolView) -> bool:
-    return (candidate.as_of, candidate.created_at, candidate.id) > (
-        current.as_of,
-        current.created_at,
-        current.id,
-    )
-
-
-def _select_latest_views(views: list[KolView]) -> list[KolView]:
-    latest_by_key: dict[tuple[int, int, str], KolView] = {}
-    for view in views:
-        horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
-        key = (view.kol_id, view.asset_id, horizon_value)
-        prev = latest_by_key.get(key)
-        if prev is None or _is_newer_view(view, prev):
-            latest_by_key[key] = view
-    return list(latest_by_key.values())
 
 
 async def _load_posted_at_by_url(db: AsyncSession) -> dict[str, datetime]:
@@ -182,7 +159,7 @@ def _build_daily_digest_content(
                 continue
         profile_filtered.append(view)
 
-    latest_views = _select_latest_views(profile_filtered)
+    latest_views = select_latest_views(profile_filtered)
 
     views_cutoff_24h = generated_to_ts - timedelta(hours=24)
     views_cutoff_7d = generated_to_ts - timedelta(days=7)
@@ -324,7 +301,7 @@ def _build_daily_digest_content(
                 name=asset.name,
                 market=asset.market,
                 horizon_counts=horizon_counts,
-                clarity=_calc_clarity(bull_count=bull_total, bear_count=bear_total),
+                clarity=calc_clarity(bull_count=bull_total, bear_count=bear_total),
                 top_views_bull=top_views_by_stance[Stance.bull.value],
                 top_views_bear=top_views_by_stance[Stance.bear.value],
                 top_views_neutral=top_views_by_stance[Stance.neutral.value],

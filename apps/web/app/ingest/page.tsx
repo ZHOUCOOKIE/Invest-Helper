@@ -1,19 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import type { DragEvent, FormEvent } from "react";
+import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-
-type ManualIngestResponse = {
-  raw_post: { id: number };
-  extraction: {
-    id: number;
-    raw_post_id: number;
-    extractor_name: string;
-    last_error: string | null;
-  };
-  extraction_id: number;
-};
 
 type ExtractorStatus = {
   mode: "auto" | "dummy" | "openai" | string;
@@ -219,14 +208,6 @@ type XProgress = {
   latest_extraction_at: string | null;
 };
 
-type FormState = {
-  platform: "x" | "reddit" | "other";
-  author_handle: string;
-  url: string;
-  content_text: string;
-  posted_at: string;
-};
-
 const STORAGE_START_DATE = "x_import_start_date";
 const STORAGE_END_DATE = "x_import_end_date";
 const DEFAULT_DIRECT_API_BASE_URL = "http://localhost:8000";
@@ -303,16 +284,6 @@ function toDateKeyFromIso(value: string): string | null {
 }
 
 export default function IngestPage() {
-  const [form, setForm] = useState<FormState>({
-    platform: "x",
-    author_handle: "",
-    url: "",
-    content_text: "",
-    posted_at: "",
-  });
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ManualIngestResponse | null>(null);
   const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
   const [extractBatchSize, setExtractBatchSize] = useState(20);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -491,36 +462,6 @@ export default function IngestPage() {
       throw new Error(formatApiError("Load progress failed", parsed.data, parsed.textBody, parsed.requestId));
     }
     setProgress(parsed.data as XProgress);
-  };
-
-  const onManualSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setSubmitting(true);
-    setError(null);
-    setResult(null);
-    try {
-      const payload: Record<string, string | null> = {
-        platform: form.platform,
-        author_handle: form.author_handle.trim(),
-        url: form.url.trim(),
-        content_text: form.content_text.trim(),
-      };
-      if (form.posted_at) payload.posted_at = new Date(form.posted_at).toISOString();
-
-      const res = await fetch("/api/ingest/manual", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const parsed = await parseApiResponse<ManualIngestResponse>(res);
-      if (!res.ok || !parsed.data) throw new Error(formatApiError("Submit failed", parsed.data, parsed.textBody, parsed.requestId));
-      setResult(parsed.data as ManualIngestResponse);
-      setForm((prev) => ({ ...prev, url: "", content_text: "" }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
-    } finally {
-      setSubmitting(false);
-    }
   };
 
   const applyOverridesForStandardRows = (rows: XImportItem[]): XImportItem[] => {
@@ -1051,7 +992,7 @@ export default function IngestPage() {
     <main style={{ padding: "24px", fontFamily: "monospace", display: "grid", gap: "12px" }}>
       <h1>Ingest</h1>
       <p>
-        手动单条入口 + X 文件拖拽导入。<Link href="/dashboard">返回 Dashboard</Link>
+        X 文件拖拽导入。<Link href="/dashboard">返回 Dashboard</Link>
       </p>
 
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "900px" }}>
@@ -1559,58 +1500,6 @@ export default function IngestPage() {
         )}
       </section>
 
-      <form onSubmit={onManualSubmit} style={{ display: "grid", gap: "8px", maxWidth: "760px" }}>
-        <h2 style={{ marginBottom: 0 }}>Manual Single Ingest</h2>
-        <label>
-          platform
-          <select
-            value={form.platform}
-            onChange={(event) => setForm((prev) => ({ ...prev, platform: event.target.value as FormState["platform"] }))}
-            style={{ display: "block", width: "100%" }}
-          >
-            <option value="x">x</option>
-            <option value="reddit">reddit</option>
-            <option value="other">other</option>
-          </select>
-        </label>
-
-        <label>
-          author_handle
-          <input value={form.author_handle} onChange={(event) => setForm((prev) => ({ ...prev, author_handle: event.target.value }))} style={{ display: "block", width: "100%" }} required />
-        </label>
-
-        <label>
-          url
-          <input type="url" value={form.url} onChange={(event) => setForm((prev) => ({ ...prev, url: event.target.value }))} style={{ display: "block", width: "100%" }} required />
-        </label>
-
-        <label>
-          content_text
-          <textarea value={form.content_text} onChange={(event) => setForm((prev) => ({ ...prev, content_text: event.target.value }))} rows={5} style={{ display: "block", width: "100%" }} required />
-        </label>
-
-        <label>
-          posted_at (optional)
-          <input type="datetime-local" value={form.posted_at} onChange={(event) => setForm((prev) => ({ ...prev, posted_at: event.target.value }))} style={{ display: "block", width: "100%" }} />
-        </label>
-
-        <button type="submit" disabled={submitting}>
-          {submitting ? "Submitting..." : "Create Raw Post + Pending Extraction"}
-        </button>
-      </form>
-
-      {error && <p style={{ color: "crimson" }}>{error}</p>}
-      {result && (
-        <div style={{ border: "1px solid #96d29a", borderRadius: "8px", padding: "10px", background: "#f4fff5" }}>
-          <p style={{ margin: 0 }}>
-            提交成功。raw_post_id={result.extraction.raw_post_id}，extraction_id={result.extraction_id}，extractor_name={result.extraction.extractor_name}
-          </p>
-          {result.extraction.last_error && <p style={{ color: "crimson", marginBottom: 0 }}>last_error: {result.extraction.last_error}</p>}
-          <p style={{ marginBottom: 0 }}>
-            <Link href={`/extractions/${result.extraction_id}`}>去审核该 extraction</Link>
-          </p>
-        </div>
-      )}
     </main>
   );
 }

@@ -63,7 +63,7 @@ def _seed_wrong_extraction_with_applied_view(fake_db: FakeAsyncSession) -> None:
             raw_post_id=1,
             status=ExtractionStatus.approved,
             extracted_json={
-                "assets": [],
+                "hasview": 0,
                 "asset_views": [],
                 "meta": {"asset_views_original_count": 1, "asset_views_final_count": 0, "asset_views_cap_reason": "no_direct_mentions_no_macro"},
             },

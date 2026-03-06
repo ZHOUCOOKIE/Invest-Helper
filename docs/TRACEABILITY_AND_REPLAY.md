@@ -15,6 +15,7 @@ TL;DR
 2. `post_extractions`
 - 关联：`raw_post_id`
 - 审计：`prompt_version`, `prompt_text`, `prompt_hash`, `raw_model_output`, `parsed_model_output`
+- Prompt 组装来源：`apps/api/services/prompts/extraction_prompt.py`（`prompt_version` 当前为 `extract_v1`）
 - 状态：`status`, `extracted_json`, `last_error`
 
 3. `kol_views`

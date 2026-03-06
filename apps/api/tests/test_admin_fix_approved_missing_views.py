@@ -51,16 +51,16 @@ def test_fix_approved_missing_views_backfills_from_parsed_model_output_without_l
             id=1,
             raw_post_id=1,
             status=ExtractionStatus.approved,
-            extracted_json={"assets": [], "asset_views": [], "meta": {"asset_views_cap_reason": "no_direct_mentions_no_macro"}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {"asset_views_cap_reason": "no_direct_mentions_no_macro"}},
             parsed_model_output={
-                "assets": [{"symbol": "HYNIX", "market": "STOCK"}],
+                "hasview": 1,
                 "asset_views": [
                     {
                         "symbol": "HYNIX",
                         "stance": "bull",
                         "horizon": "1w",
                         "confidence": 78,
-                        "summary": "HBM demand keeps strong",
+                        "summary": "HBM需求持续走强",
                         "reasoning": "memory cycle turns up",
                     }
                 ],
@@ -211,16 +211,16 @@ def test_fix_approved_missing_views_refreshes_extracted_json_for_already_applied
             id=476,
             raw_post_id=1,
             status=ExtractionStatus.approved,
-            extracted_json={"assets": [], "asset_views": [], "meta": {"asset_views_final_count": 0}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {"asset_views_final_count": 0}},
             parsed_model_output={
-                "assets": [{"symbol": "HYNIX", "market": "STOCK"}],
+                "hasview": 1,
                 "asset_views": [
                     {
                         "symbol": "HYNIX",
                         "stance": "bull",
                         "horizon": "1w",
                         "confidence": 78,
-                        "summary": "HBM strong",
+                        "summary": "HBM需求较强",
                         "reasoning": "cycle up",
                     }
                 ],

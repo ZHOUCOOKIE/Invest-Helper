@@ -49,20 +49,6 @@ type XProgress = {
   latest_extraction_at: string | null;
 };
 
-type BackfillAutoReviewResponse = {
-  scanned: number;
-  approved_count: number;
-  rejected_count: number;
-  skipped_no_result_count: number;
-  skipped_no_confidence_count: number;
-  skipped_already_terminal_count: number;
-  errors: Array<{
-    extraction_id: number | null;
-    raw_post_id: number | null;
-    error: string;
-  }>;
-};
-
 type ExtractionsStats = {
   bad_count: number;
   total_count: number;
@@ -73,24 +59,6 @@ type RefreshWrongJsonResponse = {
   updated: number;
   dry_run: boolean;
   updated_ids: number[];
-};
-
-type ReextractPendingResponse = {
-  scanned: number;
-  created: number;
-  triggered: number;
-  conflict_count: number;
-  succeeded_parse: number;
-  failed_parse: number;
-  auto_approved: number;
-  auto_rejected: number;
-  noneany_rejected: number;
-  skipped_terminal: number;
-  errors: Array<{
-    extraction_id: number | null;
-    raw_post_id: number | null;
-    error: string;
-  }>;
 };
 
 const PAGE_SIZE = 20;
@@ -171,11 +139,8 @@ export default function ExtractionsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
   const [progress, setProgress] = useState<XProgress | null>(null);
-  const [backfillBusy, setBackfillBusy] = useState(false);
-  const [backfillResult, setBackfillResult] = useState<BackfillAutoReviewResponse | null>(null);
   const [stats, setStats] = useState<ExtractionsStats | null>(null);
   const [refreshWrongBusy, setRefreshWrongBusy] = useState(false);
-  const [reextractPendingBusy, setReextractPendingBusy] = useState(false);
   const requestSeqRef = useRef(0);
 
   const canPrev = useMemo(() => offset > 0, [offset]);
@@ -287,45 +252,6 @@ export default function ExtractionsPage() {
     }
   };
 
-  const reextractAllPendingForce = async () => {
-    const confirmText = window.prompt("将强制重试所有待审核记录并生成新 extraction。输入 YES 继续：", "");
-    if (confirmText !== "YES") return;
-    setReextractPendingBusy(true);
-    setError(null);
-    setMessage(null);
-    try {
-      const res = await fetch("/api/admin/extractions/reextract-pending?confirm=YES", { method: "POST" });
-      const rawText = await res.text();
-      let body: ReextractPendingResponse | { detail?: string } | null = null;
-      try {
-        body = rawText ? (JSON.parse(rawText) as ReextractPendingResponse | { detail?: string }) : null;
-      } catch {
-        body = null;
-      }
-      if (!res.ok) {
-        const detail =
-          body && typeof body === "object" && "detail" in body
-            ? (body.detail ?? "重试待审核失败")
-            : (rawText || `HTTP ${res.status}`).slice(0, 200);
-        throw new Error(detail);
-      }
-      const done = body as ReextractPendingResponse;
-      const shouldReloadNow = offset === 0;
-      setOffset(0);
-      setMessage(
-        `已完成：scanned=${done.scanned}, approved=${done.auto_approved}, rejected=${done.auto_rejected}, failed_parse=${done.failed_parse}, noneany_rejected=${done.noneany_rejected}, conflict=${done.conflict_count}.`,
-      );
-      await Promise.all([refreshProgress(), refreshStats()]);
-      if (shouldReloadNow) {
-        await load();
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "重试待审核失败");
-    } finally {
-      setReextractPendingBusy(false);
-    }
-  };
-
   const clearPending = async () => {
     const confirmText = window.prompt(
       "Dangerous operation: this will hard delete pending/failed extractions. Type YES to continue.",
@@ -351,35 +277,6 @@ export default function ExtractionsPage() {
       await Promise.all([load(), refreshProgress()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Clear pending failed");
-    }
-  };
-
-  const backfillAutoReview = async () => {
-    const confirmText = window.prompt(
-      "This updates historical extractions by confidence only, with no model calls. Type YES to continue.",
-      "",
-    );
-    if (confirmText !== "YES") return;
-    setBackfillBusy(true);
-    setError(null);
-    setMessage(null);
-    setBackfillResult(null);
-    try {
-      const res = await fetch("/api/admin/extractions/backfill-auto-review?confirm=YES", { method: "POST" });
-      const body = (await res.json()) as BackfillAutoReviewResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Backfill auto review failed") : "Backfill auto review failed");
-      }
-      const done = body as BackfillAutoReviewResponse;
-      setBackfillResult(done);
-      setMessage(
-        `Backfill done: scanned=${done.scanned}, approved=${done.approved_count}, rejected=${done.rejected_count}.`,
-      );
-      await Promise.all([load(), refreshProgress()]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Backfill auto review failed");
-    } finally {
-      setBackfillBusy(false);
     }
   };
 
@@ -480,16 +377,6 @@ export default function ExtractionsPage() {
         </button>
         {status === "pending" && (
           <>
-            <button
-              type="button"
-              onClick={() => void reextractAllPendingForce()}
-              disabled={loading || reextractPendingBusy}
-            >
-              {reextractPendingBusy ? "执行中..." : "重试所有待审核（强制）"}
-            </button>
-            <button type="button" onClick={() => void backfillAutoReview()} disabled={loading || backfillBusy}>
-              {backfillBusy ? "执行中..." : "回填自动审核（置信度规则）"}
-            </button>
             <label>
               <input
                 type="checkbox"
@@ -517,30 +404,6 @@ export default function ExtractionsPage() {
         </p>
       )}
       {stats && <p style={{ color: "#555" }}>bad_json_count={stats.bad_count} / total={stats.total_count}</p>}
-      {backfillResult && (
-        <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px", marginBottom: "10px" }}>
-          <div>
-            scanned={backfillResult.scanned}, approved={backfillResult.approved_count}, rejected={backfillResult.rejected_count}
-          </div>
-          <div>
-            skipped_no_result={backfillResult.skipped_no_result_count}, skipped_no_confidence=
-            {backfillResult.skipped_no_confidence_count}, skipped_already_terminal=
-            {backfillResult.skipped_already_terminal_count}
-          </div>
-          {backfillResult.errors.length > 0 && (
-            <details style={{ marginTop: "6px" }}>
-              <summary>errors (showing first {Math.min(20, backfillResult.errors.length)})</summary>
-              <ul>
-                {backfillResult.errors.slice(0, 20).map((item, index) => (
-                  <li key={`${item.extraction_id ?? "na"}-${index}`}>
-                    extraction_id={item.extraction_id ?? "null"}, raw_post_id={item.raw_post_id ?? "null"}: {item.error}
-                  </li>
-                ))}
-              </ul>
-            </details>
-          )}
-        </div>
-      )}
 
       {!loading && items.length === 0 && <p>暂无 extraction。</p>}
 

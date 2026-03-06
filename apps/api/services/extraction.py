@@ -14,18 +14,15 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from models import RawPost
-from services.prompts.extract_v1 import PromptBundle
+from services.prompts.extraction_prompt import PromptBundle, render_prompt_bundle
 from settings import Settings
 
-MARKET_VALUES = ["CRYPTO", "STOCK", "ETF", "FOREX", "OTHER", "AUTO"]
+MARKET_VALUES = ["CRYPTO", "STOCK", "ETF", "FOREX", "OTHER"]
 STANCE_VALUES = ["bull", "bear", "neutral"]
 HORIZON_VALUES = ["intraday", "1w", "1m", "3m", "1y"]
-CONTENT_KIND_VALUES = ["asset", "library"]
 LIBRARY_TAG_VALUES = ["macro", "industry", "thesis", "strategy", "risk", "events"]
-LIBRARY_RULESET_VERSION = "A2_library_model_gate_s3"
-LIBRARY_ENTRY_MIN_CONFIDENCE = 80
+LIBRARY_RULESET_VERSION = "A3_islibrary_strict_v1"
 ASSET_VIEW_MIN_CONFIDENCE = 70
-NONEANY_ASSET = {"symbol": "NoneAny", "name": None, "market": "OTHER"}
 _OPENAI_CALLS_MADE = 0
 _OPENAI_CALLS_LOCK = Lock()
 OPENAI_PROVIDER_OPENROUTER = "openrouter"
@@ -104,29 +101,14 @@ class ExtractionAudit:
     model_output_tokens: int | None = None
 
 
-class ExtractedAsset(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    symbol: str
-    name: str | None = None
-    market: Literal["CRYPTO", "STOCK", "ETF", "FOREX", "OTHER", "AUTO"] = "AUTO"
-
-
 class ExtractionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assets: list[ExtractedAsset] = Field(
-        default_factory=lambda: [ExtractedAsset.model_validate(NONEANY_ASSET)],
-        min_length=1,
-    )
-    stance: Literal["bull", "bear", "neutral"] | None = None
-    horizon: Literal["intraday", "1w", "1m", "3m", "1y"] | None = None
-    confidence: int | None = Field(default=None, ge=0, le=100)
-    summary: str | None = None
-    source_url: str | None = None
-    as_of: date | None = None
+    source_url: str
+    as_of: date
+    islibrary: Literal[0, 1] = 0
+    hasview: Literal[0, 1] = 0
     asset_views: list["AssetView"] = Field(default_factory=list)
-    content_kind: Literal["asset", "library"] = "asset"
     library_entry: "LibraryEntry | None" = None
 
 
@@ -134,164 +116,81 @@ class AssetView(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     symbol: str
+    market: Literal["CRYPTO", "STOCK", "ETF", "FOREX", "OTHER"] = "OTHER"
     stance: Literal["bull", "bear", "neutral"]
     horizon: Literal["intraday", "1w", "1m", "3m", "1y"]
-    confidence: int = Field(ge=0, le=100)
-    summary: str | None = Field(default=None, max_length=1024)
+    confidence: int = Field(ge=ASSET_VIEW_MIN_CONFIDENCE, le=100)
+    summary: str = Field(max_length=1024)
 
 
 class LibraryEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    confidence: int = Field(ge=0, le=100)
-    tags: list[Literal["macro", "industry", "thesis", "strategy", "risk", "events"]] = Field(min_length=1, max_length=2)
-    summary: str | None = Field(default=None, max_length=512)
+    tag: Literal["macro", "industry", "thesis", "strategy", "risk", "events"]
+    summary: str = Field(max_length=512)
 
 
 ExtractionPayload.model_rebuild()
 
 
-_EXTRACTION_TOP_LEVEL_KEYS = set(ExtractionPayload.model_fields.keys())
-_ASSET_KEYS = set(ExtractedAsset.model_fields.keys())
 _ASSET_VIEW_KEYS = set(AssetView.model_fields.keys())
-_STANCE_ALIAS_MAP: dict[str, str] = {
-    "bull": "bull",
-    "long": "bull",
-    "看多": "bull",
-    "多头": "bull",
-    "上涨": "bull",
-    "乐观": "bull",
-    "偏多": "bull",
-    "做多": "bull",
-    "bear": "bear",
-    "short": "bear",
-    "看空": "bear",
-    "空头": "bear",
-    "下跌": "bear",
-    "悲观": "bear",
-    "偏空": "bear",
-    "做空": "bear",
-    "neutral": "neutral",
-    "中性": "neutral",
-    "观望": "neutral",
-    "不确定": "neutral",
-    "谨慎乐观": "neutral",
-    "稳定": "neutral",
-}
-_HORIZON_ALIAS_MAP: dict[str, str] = {
-    "intraday": "intraday",
-    "today": "intraday",
-    "tonight": "intraday",
-    "今晚": "intraday",
-    "日内": "intraday",
-    "短线": "intraday",
-    "短期": "intraday",
-    "short": "intraday",
-    "1w": "1w",
-    "week": "1w",
-    "一周": "1w",
-    "本周": "1w",
-    "1m": "1m",
-    "month": "1m",
-    "一个月": "1m",
-    "一月": "1m",
-    "本月": "1m",
-    "短中期": "1m",
-    "3m": "3m",
-    "quarter": "3m",
-    "一季": "3m",
-    "三月": "3m",
-    "三个月": "3m",
-    "1y": "1y",
-    "year": "1y",
-    "一年": "1y",
-    "长期": "1y",
-}
-
-
 EXTRACTION_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "assets",
-        "stance",
-        "horizon",
-        "confidence",
-        "summary",
-        "source_url",
         "as_of",
+        "source_url",
+        "islibrary",
+        "hasview",
         "asset_views",
-        "content_kind",
         "library_entry",
     ],
     "properties": {
-        "assets": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["symbol", "name", "market"],
-                "properties": {
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": 30},
-                    "name": {"type": ["string", "null"], "maxLength": 255},
-                    "market": {"type": "string", "enum": MARKET_VALUES},
-                },
-            },
-        },
-        "stance": {"type": ["string", "null"], "enum": STANCE_VALUES + [None]},
-        "horizon": {"type": ["string", "null"], "enum": HORIZON_VALUES + [None]},
-        "confidence": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
-        "summary": {"type": ["string", "null"], "maxLength": 1024},
-        "source_url": {"type": ["string", "null"], "maxLength": 1024},
-        "as_of": {"type": ["string", "null"], "format": "date"},
+        "as_of": {"type": "string", "format": "date"},
+        "source_url": {"type": "string", "maxLength": 1024},
+        "islibrary": {"type": "integer", "enum": [0, 1]},
+        "hasview": {"type": "integer", "enum": [0, 1]},
         "asset_views": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["symbol", "stance", "horizon", "confidence", "summary"],
+                "required": ["symbol", "market", "stance", "horizon", "confidence", "summary"],
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": 32},
+                    "market": {"type": "string", "enum": MARKET_VALUES},
                     "stance": {"type": "string", "enum": STANCE_VALUES},
                     "horizon": {"type": "string", "enum": HORIZON_VALUES},
-                    "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "summary": {"type": ["string", "null"], "maxLength": 1024},
+                    "confidence": {"type": "integer", "minimum": ASSET_VIEW_MIN_CONFIDENCE, "maximum": 100},
+                    "summary": {"type": "string", "maxLength": 1024},
                 },
             },
         },
-        "content_kind": {"type": "string", "enum": CONTENT_KIND_VALUES},
         "library_entry": {
             "type": ["object", "null"],
             "additionalProperties": False,
-            "required": ["confidence", "tags", "summary"],
+            "required": ["tag", "summary"],
             "properties": {
-                "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                "tags": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 2,
-                    "items": {"type": "string", "enum": LIBRARY_TAG_VALUES},
-                },
-                "summary": {"type": ["string", "null"], "maxLength": 512},
+                "tag": {"type": "string", "enum": LIBRARY_TAG_VALUES},
+                "summary": {"type": "string", "maxLength": 512},
             },
         },
     },
     "allOf": [
         {
-            "if": {"properties": {"content_kind": {"const": "library"}}},
+            "if": {"properties": {"islibrary": {"const": 1}}},
             "then": {
                 "properties": {
                     "library_entry": {
                         "type": "object",
-                        "required": ["confidence", "tags", "summary"],
-                        "properties": {
-                            "confidence": {"minimum": LIBRARY_ENTRY_MIN_CONFIDENCE},
-                            "tags": {"minItems": 1, "maxItems": 2},
-                        },
+                        "required": ["tag", "summary"],
                     },
                 },
             },
+        },
+        {
+            "if": {"properties": {"islibrary": {"const": 0}}},
+            "then": {"properties": {"library_entry": {"type": "null"}}},
         }
     ],
 }
@@ -347,34 +246,15 @@ def normalize_extracted_json(
     alias_to_symbol: Mapping[str, str] | None = None,
     known_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
-    normalized = {k: v for k, v in extracted_json.items() if k in _EXTRACTION_TOP_LEVEL_KEYS}
+    normalized: dict[str, Any] = {
+        key: extracted_json.get(key)
+        for key in ("as_of", "source_url", "islibrary", "hasview", "asset_views", "library_entry")
+        if key in extracted_json
+    }
     normalized_meta: dict[str, Any] = {}
     if isinstance(extracted_json.get("meta"), dict):
         normalized_meta = dict(extracted_json["meta"])
     normalized_meta["ruleset_version"] = LIBRARY_RULESET_VERSION
-    if "library_tags" in extracted_json:
-        normalized_meta["library_tags_stripped"] = True
-
-    raw_assets = normalized.get("assets")
-    if _detect_noneany_mixed_assets_raw(raw_assets):
-        normalized_meta["noneany_mixed_with_symbols"] = True
-
-    stance_raw = normalized.get("stance")
-    normalized["stance"] = _normalize_stance(stance_raw)
-
-    horizon_raw = normalized.get("horizon")
-    normalized_horizon, horizon_meta = _normalize_horizon_with_meta(horizon_raw)
-    normalized["horizon"] = normalized_horizon
-    normalized_meta.update(horizon_meta)
-
-    confidence_raw = normalized.get("confidence")
-    normalized["confidence"] = _normalize_confidence(confidence_raw)
-    normalized["summary"] = _normalize_text(normalized.get("summary"))
-
-    assets_normalized, assets_meta = _normalize_assets(raw_assets)
-    normalized["assets"] = assets_normalized
-    _merge_symbol_drop_meta(normalized_meta, assets_meta)
-
     alias_map = _normalize_alias_symbol_mapping(alias_to_symbol or {})
     known_symbol_set = _normalize_known_symbols(known_symbols)
 
@@ -396,25 +276,25 @@ def normalize_extracted_json(
     valid_asset_views, asset_views_meta = _filter_asset_views_by_symbol_quality(normalized["asset_views"])
     normalized["asset_views"] = valid_asset_views
     _merge_symbol_drop_meta(normalized_meta, asset_views_meta)
-    if not normalized["asset_views"] and normalized["assets"]:
-        normalized["asset_views"] = _derive_asset_views_from_global(normalized)
-        if normalized["asset_views"]:
-            normalized_meta["derived_from_global"] = True
 
     as_of_raw = normalized.get("as_of")
-    normalized["as_of"] = _normalize_as_of(
+    normalized_as_of = _normalize_as_of(
         as_of_raw,
         posted_at=posted_at if posted_at is not None else extracted_json.get("posted_at"),
     )
+    normalized["as_of"] = normalized_as_of or date.today().isoformat()
+    normalized["source_url"] = (
+        _normalize_text(normalized.get("source_url"))
+        or _normalize_text(extracted_json.get("source_url"))
+        or _normalize_text(extracted_json.get("url"))
+        or ""
+    )
 
-    raw_content_kind = extracted_json.get("content_kind")
-    if raw_content_kind is not None:
-        normalized_meta["content_kind_raw"] = raw_content_kind
-    content_kind = _normalize_content_kind(raw_content_kind)
-    normalized_meta["content_kind_original"] = content_kind
-    if not _is_valid_content_kind_input(raw_content_kind):
-        normalized_meta["content_kind_defaulted"] = True
-    normalized["content_kind"] = content_kind
+    raw_islibrary = extracted_json.get("islibrary")
+    if raw_islibrary is not None:
+        normalized_meta["islibrary_raw"] = raw_islibrary
+    islibrary = _normalize_islibrary(raw_islibrary)
+    normalized["islibrary"] = islibrary
 
     raw_library_entry = normalized.get("library_entry")
     normalized_library_entry, library_entry_drop_reason = _normalize_library_entry(raw_library_entry)
@@ -423,40 +303,29 @@ def normalize_extracted_json(
         normalized_meta["library_entry_dropped"] = True
         normalized_meta["library_entry_drop_reason"] = library_entry_drop_reason
 
-    if content_kind == "library" and normalized_library_entry is None:
-        normalized["content_kind"] = "asset"
+    if islibrary == 1 and normalized_library_entry is None:
+        normalized["islibrary"] = 0
         normalized_meta["library_downgraded"] = True
         normalized_meta["library_downgrade_reason"] = library_entry_drop_reason or "invalid_library_shape"
         normalized["library_entry"] = None
-        content_kind = "asset"
+        islibrary = 0
 
-    if content_kind == "library":
-        normalized_meta["library_entry_kept"] = True
-        original_asset_view_count = len(normalized["asset_views"]) if isinstance(normalized.get("asset_views"), list) else 0
-        normalized["assets"] = [dict(NONEANY_ASSET)]
-        normalized["asset_views"] = []
-        normalized_meta["library_asset_views_original_count"] = original_asset_view_count
-        normalized_meta["library_asset_views_final_count"] = 0
-        normalized_meta["library_asset_views_cleared"] = original_asset_view_count > 0
-    else:
+    if islibrary == 0:
         normalized["library_entry"] = None
-        normalized_asset_views, threshold_meta = _filter_asset_views_by_confidence(
-            normalized["asset_views"],
-            min_confidence=ASSET_VIEW_MIN_CONFIDENCE,
-        )
-        normalized["asset_views"] = normalized_asset_views
-        normalized_meta.update(threshold_meta)
-        normalized["assets"] = _sync_assets_to_asset_views(
-            normalized["assets"],
-            normalized["asset_views"],
-        )
-        if not normalized["assets"]:
-            normalized["assets"] = [dict(NONEANY_ASSET)]
-            normalized_meta["assets_filled_noneany"] = True
+    else:
+        normalized_meta["library_entry_kept"] = normalized_library_entry is not None
 
-    if not normalized["assets"]:
-        normalized["assets"] = [dict(NONEANY_ASSET)]
-        normalized_meta["assets_filled_noneany"] = True
+    normalized_asset_views, threshold_meta = _filter_asset_views_by_confidence(
+        normalized["asset_views"],
+        min_confidence=ASSET_VIEW_MIN_CONFIDENCE,
+    )
+    normalized["asset_views"] = normalized_asset_views
+    normalized_meta.update(threshold_meta)
+    normalized_asset_views, language_meta = _filter_asset_views_by_summary_language(normalized["asset_views"])
+    normalized["asset_views"] = normalized_asset_views
+    normalized_meta.update(language_meta)
+    normalized["hasview"] = 1 if normalized["asset_views"] else 0
+
     if include_meta and normalized_meta:
         normalized["meta"] = normalized_meta
 
@@ -492,66 +361,19 @@ def _unwrap_extracted_json_envelope(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_stance(value: Any) -> str | None:
-    if value is None:
+    if not isinstance(value, str):
         return None
-    if not isinstance(value, str):
-        return "neutral"
     normalized = value.strip()
-    mapped = _STANCE_ALIAS_MAP.get(normalized.lower()) or _STANCE_ALIAS_MAP.get(normalized)
-    if mapped:
-        return mapped
-    lowered = normalized.lower()
-    if "bull" in lowered or "long" in lowered:
-        return "bull"
-    if "bear" in lowered or "short" in lowered:
-        return "bear"
-    if any(token in normalized for token in ("看多", "多头", "上涨", "乐观")):
-        return "bull"
-    if any(token in normalized for token in ("看空", "空头", "下跌", "悲观")):
-        return "bear"
-    if any(token in normalized for token in ("中性", "观望", "不确定", "谨慎")):
-        return "neutral"
-    return "neutral"
+    return normalized if normalized in STANCE_VALUES else None
 
 
-def _normalize_horizon(value: Any) -> str:
-    if value is None:
-        return "1w"
+def _normalize_horizon(value: Any) -> str | None:
     if not isinstance(value, str):
-        return "1w"
+        return None
     normalized = value.strip()
     if not normalized:
-        return "1w"
-    return normalized if normalized in HORIZON_VALUES else "1w"
-
-
-def _normalize_horizon_with_meta(value: Any) -> tuple[str, dict[str, Any]]:
-    normalized = _normalize_horizon(value)
-    if isinstance(value, str):
-        raw = value.strip()
-        if raw and raw in HORIZON_VALUES:
-            return normalized, {"horizon_coerced": False}
-        if raw and normalized == "1w":
-            return (
-                normalized,
-                {
-                    "horizon_coerced": True,
-                    "horizon_original": raw,
-                    "horizon_final": "1w",
-                    "horizon_coerce_reason": "invalid_horizon_enum",
-                },
-            )
-    elif value is None:
-        return normalized, {"horizon_coerced": False}
-    return (
-        normalized,
-        {
-            "horizon_coerced": True,
-            "horizon_original": value,
-            "horizon_final": "1w",
-            "horizon_coerce_reason": "invalid_horizon_enum",
-        },
-    )
+        return None
+    return normalized if normalized in HORIZON_VALUES else None
 
 
 def _normalize_confidence(value: Any) -> int:
@@ -575,44 +397,6 @@ def _normalize_confidence(value: Any) -> int:
     if rounded < 0 or rounded > 100:
         return 50
     return rounded
-
-
-def _normalize_assets(value: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if value is None:
-        return [], {}
-
-    if isinstance(value, dict) or isinstance(value, str):
-        candidates = [value]
-    elif isinstance(value, list):
-        candidates = value
-    else:
-        return [], {}
-
-    normalized_assets: list[dict[str, Any]] = []
-    normalized_from_strings = False
-    dropped_empty_symbol_count = 0
-    dropped_invalid_symbol_count = 0
-    dropped_invalid_symbols_sample: list[str] = []
-    for candidate in candidates:
-        parsed_asset, from_string, empty_symbol_dropped, invalid_symbol, invalid_symbol_sample = _normalize_asset_item(candidate)
-        normalized_from_strings = normalized_from_strings or from_string
-        dropped_empty_symbol_count += 1 if empty_symbol_dropped else 0
-        if invalid_symbol:
-            dropped_invalid_symbol_count += 1
-            if invalid_symbol_sample and len(dropped_invalid_symbols_sample) < 3:
-                dropped_invalid_symbols_sample.append(invalid_symbol_sample)
-        if parsed_asset is not None:
-            normalized_assets.append(parsed_asset)
-    meta: dict[str, Any] = {
-        "assets_dropped_empty_symbol_count": dropped_empty_symbol_count,
-        "dropped_invalid_symbol_count": dropped_invalid_symbol_count,
-    }
-    if dropped_invalid_symbols_sample:
-        meta["dropped_invalid_symbols_sample"] = dropped_invalid_symbols_sample
-    if normalized_from_strings:
-        meta["assets_normalized_from_strings"] = True
-        meta["assets_default_market"] = "AUTO"
-    return normalized_assets, meta
 
 
 def _normalize_asset_views(value: Any, *, allow_missing_symbol: bool = False) -> list[dict[str, Any]]:
@@ -665,10 +449,15 @@ def _normalize_asset_view_item(value: Any, *, allow_missing_symbol: bool = False
     if not allow_missing_symbol and not normalized["symbol"]:
         return None
 
-    normalized["stance"] = _normalize_stance(normalized.get("stance")) or "neutral"
-    normalized["horizon"] = _normalize_horizon(normalized.get("horizon"))
+    normalized_stance = _normalize_stance(normalized.get("stance"))
+    normalized_horizon = _normalize_horizon(normalized.get("horizon"))
+    if normalized_stance is None or normalized_horizon is None:
+        return None
+    normalized["stance"] = normalized_stance
+    normalized["horizon"] = normalized_horizon
     normalized["confidence"] = _normalize_confidence(normalized.get("confidence"))
-    normalized["summary"] = _normalize_text(normalized.get("summary"))
+    normalized["market"] = _normalize_market(normalized.get("market"))
+    normalized["summary"] = _normalize_text(normalized.get("summary")) or ""
     return normalized
 
 
@@ -725,44 +514,18 @@ def _filter_asset_views_by_confidence(
     )
 
 
-def _sync_assets_to_asset_views(
-    assets: list[dict[str, Any]],
+def _filter_asset_views_by_summary_language(
     asset_views: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    asset_by_symbol: dict[str, dict[str, Any]] = {}
-    for asset in assets:
-        symbol = asset.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    valid_views: list[dict[str, Any]] = []
+    dropped_count = 0
+    for item in asset_views:
+        summary = item.get("summary")
+        if not isinstance(summary, str) or not _is_chinese_summary(summary):
+            dropped_count += 1
             continue
-        normalized_symbol = symbol.strip().upper()
-        if normalized_symbol not in asset_by_symbol:
-            asset_by_symbol[normalized_symbol] = {
-                "symbol": normalized_symbol,
-                "name": asset.get("name"),
-                "market": _normalize_market(asset.get("market")),
-            }
-
-    synced_assets: list[dict[str, Any]] = []
-    seen_symbols: set[str] = set()
-    for view in asset_views:
-        symbol = view.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
-            continue
-        normalized_symbol = symbol.strip().upper()
-        if normalized_symbol in seen_symbols:
-            continue
-        seen_symbols.add(normalized_symbol)
-        synced_assets.append(
-            asset_by_symbol.get(
-                normalized_symbol,
-                {
-                    "symbol": normalized_symbol,
-                    "name": None,
-                    "market": "AUTO",
-                },
-            )
-        )
-    return synced_assets
+        valid_views.append(item)
+    return valid_views, {"asset_views_dropped_non_zh_summary_count": dropped_count}
 
 
 def _normalize_alias_symbol_mapping(value: Mapping[str, str]) -> dict[str, str]:
@@ -830,35 +593,9 @@ def _find_alias_match_for_view(
     return None
 
 
-def _derive_asset_views_from_global(normalized: dict[str, Any]) -> list[dict[str, Any]]:
-    views: list[dict[str, Any]] = []
-    stance = _normalize_stance(normalized.get("stance")) or "neutral"
-    horizon = _normalize_horizon(normalized.get("horizon"))
-    confidence = _normalize_confidence(normalized.get("confidence"))
-    summary = _normalize_text(normalized.get("summary"))
-    for asset in normalized.get("assets", []):
-        if not isinstance(asset, dict):
-            continue
-        symbol = asset.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
-            continue
-        if _is_noneany_symbol(symbol):
-            continue
-        views.append(
-            {
-                "symbol": symbol.strip().upper(),
-                "stance": stance,
-                "horizon": horizon,
-                "confidence": confidence,
-                "summary": summary,
-            }
-        )
-    return views
-
-
 def _merge_symbol_drop_meta(target: dict[str, Any], source: dict[str, Any]) -> None:
     for key, value in source.items():
-        if key in {"dropped_invalid_symbol_count", "asset_views_dropped_empty_symbol_count", "assets_dropped_empty_symbol_count"}:
+        if key in {"dropped_invalid_symbol_count", "asset_views_dropped_empty_symbol_count"}:
             target[key] = int(target.get(key, 0) or 0) + int(value or 0)
             continue
         if key == "dropped_invalid_symbols_sample":
@@ -874,74 +611,16 @@ def _merge_symbol_drop_meta(target: dict[str, Any], source: dict[str, Any]) -> N
         target[key] = value
 
 
-def _normalize_asset_item(value: Any) -> tuple[dict[str, Any] | None, bool, bool, bool, str | None]:
-    if isinstance(value, str):
-        symbol = value.strip()
-        if not symbol:
-            return None, True, True, False, None
-        normalized_symbol = _normalize_symbol_for_storage(symbol)
-        if normalized_symbol is None:
-            return None, True, False, True, symbol
-        if _is_noneany_symbol(normalized_symbol):
-            return dict(NONEANY_ASSET), True, False, False, None
-        return {"symbol": normalized_symbol, "name": None, "market": "AUTO"}, True, False, False, None
-
-    if not isinstance(value, dict):
-        return None, False, False, False, None
-
-    normalized = {k: v for k, v in value.items() if k in _ASSET_KEYS}
-    symbol = normalized.get("symbol")
-    if not isinstance(symbol, str) or not symbol.strip():
-        return None, False, True, False, None
-    normalized_symbol = _normalize_symbol_for_storage(symbol)
-    if normalized_symbol is None:
-        return None, False, False, True, str(symbol)
-    if _is_noneany_symbol(normalized_symbol):
-        return dict(NONEANY_ASSET), False, False, False, None
-    normalized["symbol"] = normalized_symbol
-    if "name" not in normalized:
-        normalized["name"] = None
-    normalized["market"] = _normalize_market(normalized.get("market"))
-    return normalized, False, False, False, None
-
-
 def _normalize_market(value: Any) -> str:
     if isinstance(value, str):
         normalized = value.strip().upper()
         if normalized in MARKET_VALUES:
             return normalized
-    return "AUTO"
+    return "OTHER"
 
 
-def _normalize_content_kind(value: Any) -> str:
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in CONTENT_KIND_VALUES:
-            return normalized
-    return "asset"
-
-
-def _is_valid_content_kind_input(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    return value.strip().lower() in CONTENT_KIND_VALUES
-
-
-def _normalize_library_tags(value: Any) -> tuple[list[str], list[str]]:
-    if not isinstance(value, list):
-        return [], []
-    normalized: list[str] = []
-    invalid: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            invalid.append(str(item))
-            continue
-        tag = item.strip().lower()
-        if tag in LIBRARY_TAG_VALUES and tag not in normalized:
-            normalized.append(tag)
-        elif tag and len(invalid) < 8:
-            invalid.append(tag)
-    return normalized, invalid
+def _normalize_islibrary(value: Any) -> int:
+    return 1 if isinstance(value, int) and not isinstance(value, bool) and value == 1 else 0
 
 
 def _normalize_library_entry(value: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -949,66 +628,23 @@ def _normalize_library_entry(value: Any) -> tuple[dict[str, Any] | None, str | N
         return None, None
     if not isinstance(value, dict):
         return None, "invalid_library_shape"
-    confidence = _normalize_library_entry_confidence(value.get("confidence"))
-    if confidence is None:
-        return None, "invalid_library_shape"
-    if confidence < LIBRARY_ENTRY_MIN_CONFIDENCE:
-        return None, "low_library_confidence"
-    tags, invalid_tags = _normalize_library_tags(value.get("tags"))
-    if invalid_tags or len(tags) < 1 or len(tags) > 2:
+    tag = value.get("tag")
+    if not isinstance(tag, str):
+        return None, "invalid_library_tags"
+    normalized_tag = tag.strip().lower()
+    if normalized_tag not in LIBRARY_TAG_VALUES:
         return None, "invalid_library_tags"
     summary = _normalize_text(value.get("summary"))
+    if summary is None:
+        return None, "invalid_library_summary"
+    if not _is_chinese_summary(summary):
+        return None, "invalid_library_summary_language"
+    if summary != "测试":
+        return None, "invalid_library_summary_exact"
     return {
-        "confidence": confidence,
-        "tags": tags,
+        "tag": normalized_tag,
         "summary": summary,
     }, None
-
-
-def _normalize_library_entry_confidence(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, float):
-        if not value.is_integer():
-            return None
-        parsed = int(value)
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text or not re.fullmatch(r"-?\d+", text):
-            return None
-        parsed = int(text)
-    else:
-        return None
-    if 0 <= parsed <= 100:
-        return parsed
-    return None
-
-
-def _detect_noneany_mixed_assets_raw(value: Any) -> bool:
-    if not isinstance(value, list):
-        return False
-    has_noneany = False
-    has_other_symbol = False
-    for item in value:
-        symbol: str | None = None
-        if isinstance(item, str):
-            symbol = item.strip()
-        elif isinstance(item, dict):
-            raw_symbol = item.get("symbol")
-            symbol = raw_symbol.strip() if isinstance(raw_symbol, str) else None
-        if not symbol:
-            continue
-        if _is_noneany_symbol(symbol):
-            has_noneany = True
-        else:
-            has_other_symbol = True
-    return has_noneany and has_other_symbol
-
-
-def _is_noneany_symbol(value: str) -> bool:
-    return value.strip().lower() == "noneany"
 
 
 _ASCII_SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/]{0,29}$")
@@ -1080,6 +716,10 @@ def _normalize_text(value: Any) -> str | None:
     normalized = value.strip()
     return normalized or None
 
+
+def _is_chinese_summary(value: str) -> bool:
+    return bool(_CJK_PATTERN.search(value))
+
 class DummyExtractor(Extractor):
     model_name = "dummy-v2"
     extractor_name = "dummy"
@@ -1088,18 +728,11 @@ class DummyExtractor(Extractor):
         self._audit = ExtractionAudit()
 
     def extract(self, raw_post: RawPost) -> dict[str, Any]:
-        content = raw_post.content_text.strip()
-        summary = content[:280] if content else None
-
         payload = ExtractionPayload(
-            assets=[ExtractedAsset.model_validate(NONEANY_ASSET)],
-            stance="neutral",
-            horizon="1w",
-            confidence=50,
-            summary=summary,
-            source_url=raw_post.url.strip() or None,
+            source_url=raw_post.url.strip() or "",
             as_of=raw_post.posted_at.date(),
-            content_kind="asset",
+            islibrary=0,
+            hasview=0,
         )
         parsed = payload.model_dump(mode="json")
         self._record_model_output(
@@ -1275,25 +908,14 @@ class OpenAIExtractor(Extractor):
     def _call_openai(
         self, raw_post: RawPost, *, response_mode: Literal["structured", "text_json"]
     ) -> dict[str, Any]:
-        system_prompt = (
-            "Only output 1 JSON object; no markdown, no code fence, no text outside JSON. "
-            "Top-level fields must be exactly: as_of, source_url, content_kind, assets, asset_views, library_entry. "
-            "content_kind must be \"asset\" or \"library\". "
-            "asset_views can be non-empty only when content_kind=\"asset\"; when content_kind=\"library\", asset_views must be []. "
-            "asset_views[*].confidence must be an integer >=70; remove any item with confidence<70. "
-            "After removal, if asset_views is empty, assets must be exactly "
-            "[{\"symbol\":\"NoneAny\",\"name\":null,\"market\":\"OTHER\"}] and asset_views must be []. "
-            "Do not output asset_views[*].drivers or asset_views[*].reasoning."
-        )
-        user_prompt = self._build_user_prompt(raw_post)
+        prompt = self._build_user_prompt(raw_post)
 
         request_payload: dict[str, Any] = {
             "model": self.model_name,
             "temperature": 0,
             "max_tokens": self.max_output_tokens,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": prompt},
             ],
         }
         if response_mode == EXTRACTION_OUTPUT_STRUCTURED:
@@ -1418,13 +1040,13 @@ class OpenAIExtractor(Extractor):
         bundle = self._prompt_bundle
         if bundle and bundle.text.strip():
             return bundle.text
-        return (
-            f"platform: {raw_post.platform}\n"
-            f"author_handle: {raw_post.author_handle}\n"
-            f"url: {raw_post.url}\n"
-            f"posted_at: {raw_post.posted_at.isoformat()}\n"
-            f"content_text:\n{raw_post.content_text}"
-        )
+        return render_prompt_bundle(
+            platform=raw_post.platform,
+            author_handle=raw_post.author_handle,
+            url=raw_post.url,
+            posted_at=raw_post.posted_at,
+            content_text=raw_post.content_text,
+        ).text
 
     def _is_structured_outputs_unsupported(self, exc: OpenAIRequestError) -> bool:
         if exc.status_code != 400:
@@ -1571,15 +1193,11 @@ def _extract_outermost_json_object(text: str) -> str | None:
 
 def default_extracted_json(raw_post: RawPost) -> dict[str, Any]:
     payload = ExtractionPayload(
-        assets=[ExtractedAsset.model_validate(NONEANY_ASSET)],
-        stance=None,
-        horizon=None,
-        confidence=None,
-        summary=None,
-        source_url=raw_post.url.strip() or None,
+        source_url=raw_post.url.strip() or "",
         as_of=raw_post.posted_at.date(),
+        hasview=0,
         asset_views=[],
-        content_kind="asset",
+        islibrary=0,
     )
     return payload.model_dump(mode="json")
 

@@ -10,10 +10,11 @@ TL;DR
 ## Product Scope (Code-Verified)
 
 Implemented
-- X 导入与原始帖子入库（manual/convert/import/following/retry）。
+- X 导入与原始帖子入库（convert/import/following/retry）。
 - 抽取与审核流程（single/batch/async jobs，approve/reject/re-extract）。
 - OpenRouter 抽取默认模型：`deepseek/deepseek-v3.2`（可被环境变量 `OPENAI_MODEL` 覆盖）。
 - Prompt 限制已在代码 enforce：JSON-only 输出、OpenRouter `text_json` 模式、reasoning 中文检测与一次纠正重试。
+- Prompt 组装单一事实来源：`apps/api/services/prompts/extraction_prompt.py`；官方构建入口：`apps/api/services/prompts/__init__.py::build_extract_prompt`（`prompt_version` 当前固定为 `extract_v1`）。
 - 抽取并发与节流已在批量/异步任务生效：`max_concurrency` + `max_rpm` + `batch_size` + `batch_sleep_ms` + retry backoff。
 - Profile 规则（KOL 权重、market 过滤）。
 - 按 `profile_id + digest_date + version` 的 Digest 版本化生成与回放。
@@ -24,7 +25,7 @@ Not Implemented
 - Prediction-market integration。
 
 Non-goal (current)
-- Reddit 不是当前核心产品流水线。
+- 非 X 平台不是当前核心产品流水线。
 
 ## Start Here
 

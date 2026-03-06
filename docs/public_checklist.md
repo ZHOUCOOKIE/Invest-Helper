@@ -44,12 +44,12 @@ Use history rewrite (example with `git filter-repo`) to remove tracked sensitive
 
 After rewrite, verify:
 
-- Local history no longer contains files:
+- Local history has no remaining tracked files:
   - `git log --all -- apps/api/.env RUNBOOK_LOCAL.txt --oneline`
 - Remote branches and tags are replaced:
   - `git push --force --all origin`
   - `git push --force --tags origin`
-- GitHub UI/repo search no longer finds old secrets/data.
+- GitHub UI/repo search does not find old secrets/data.
 
 ## 5) Final public gate
 

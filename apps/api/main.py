@@ -2,7 +2,6 @@ from collections import Counter, defaultdict, deque
 import asyncio
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
-import hashlib
 import json
 import logging
 import os
@@ -30,9 +29,6 @@ from enums import ExtractionStatus
 from models import Asset, AssetAlias, DailyDigest, Kol, KolView, PostExtraction, ProfileKolWeight, RawPost
 from schemas import (
     AssetCreate,
-    AssetAliasCreate,
-    AssetAliasMapRead,
-    AssetAliasRead,
     AssetViewFeedItemRead,
     AssetViewsGroupRead,
     AssetViewsFeedRead,
@@ -41,10 +37,7 @@ from schemas import (
     AssetViewsMetaRead,
     AssetRead,
     AdminDeletePendingExtractionsRead,
-    AdminCleanupDuplicatePendingRead,
-    AdminReextractPendingRead,
     AdminFixApprovedMissingViewsRead,
-    AdminBackfillAutoReviewRead,
     AdminRefreshWrongExtractedJsonRead,
     AdminHardDeleteRead,
     AssetViewsRead,
@@ -71,10 +64,7 @@ from schemas import (
     ExtractionRejectRequest,
     KolCreate,
     KolRead,
-    KolViewCreate,
     KolViewRead,
-    ManualIngestCreate,
-    ManualIngestRead,
     PostExtractionRead,
     PostExtractionWithRawPostRead,
     ProfileKolsUpdateRequest,
@@ -83,8 +73,6 @@ from schemas import (
     ProfileSummaryRead,
     RawPostsExtractBatchRead,
     RawPostsExtractBatchRequest,
-    RawPostCreate,
-    RawPostRead,
     ExtractionsStatsRead,
     XImportItemCreate,
     XConvertResponseRead,
@@ -102,8 +90,6 @@ from schemas import (
     XFollowingImportErrorRead,
     XFollowingImportKolRead,
     XFollowingImportStatsRead,
-    AutoReviewBackfillErrorRead,
-    AdminReextractPendingErrorRead,
 )
 from services.extraction import (
     EXTRACTION_OUTPUT_TEXT_JSON,
@@ -133,6 +119,7 @@ from services.profiles import (
     update_profile_markets as update_profile_markets_service,
 )
 from services.prompts import build_extract_prompt
+from services.view_logic import calc_clarity, is_newer_view, select_latest_views
 from scripts.x_import_converter import convert_records, load_records_from_bytes
 from settings import get_settings
 
@@ -258,25 +245,6 @@ async def handle_unexpected_exception(request: Request, exc: Exception):
     )
 
 
-def is_newer_view(candidate: KolView, current: KolView) -> bool:
-    return (candidate.as_of, candidate.created_at, candidate.id) > (
-        current.as_of,
-        current.created_at,
-        current.id,
-    )
-
-
-def select_latest_views(views: list[KolView]) -> list[KolView]:
-    latest_by_key: dict[tuple[int, int, str], KolView] = {}
-    for view in views:
-        horizon_value = view.horizon.value if hasattr(view.horizon, "value") else str(view.horizon)
-        key = (view.kol_id, view.asset_id, horizon_value)
-        prev = latest_by_key.get(key)
-        if prev is None or is_newer_view(view, prev):
-            latest_by_key[key] = view
-    return list(latest_by_key.values())
-
-
 def build_asset_views_response(asset_id: int, views: list[KolView]) -> AssetViewsRead:
     latest_views = select_latest_views(views)
 
@@ -320,28 +288,32 @@ def health():
     return {"ok": True}
 
 
-def build_external_id(url: str) -> str:
-    url = url.strip()
-    if not url:
-        return uuid4().hex
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
-
-
-def calc_clarity(bull_count: int, bear_count: int) -> float:
-    total = bull_count + bear_count
-    return abs(bull_count - bear_count) / max(1, total)
-
-
 def _is_bad_extracted_json(extraction: PostExtraction) -> bool:
     if (extraction.last_error or "").strip():
         return True
     payload = extraction.extracted_json
     if not isinstance(payload, dict):
         return True
-    required_keys = {"asset_views", "summary", "stance", "horizon", "confidence", "as_of"}
+    required_keys = {"as_of", "source_url", "islibrary", "hasview", "asset_views", "library_entry"}
     if not required_keys.issubset(payload.keys()):
         return True
+    hasview = payload.get("hasview")
+    if not isinstance(hasview, int) or isinstance(hasview, bool) or hasview not in {0, 1}:
+        return True
     if not isinstance(payload.get("asset_views"), list):
+        return True
+    expected_hasview = 1 if payload.get("asset_views") else 0
+    if hasview != expected_hasview:
+        return True
+    source_url = payload.get("source_url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return True
+    as_of = payload.get("as_of")
+    if not isinstance(as_of, str) or not as_of.strip():
+        return True
+    try:
+        date.fromisoformat(as_of.strip())
+    except ValueError:
         return True
     return False
 
@@ -627,24 +599,25 @@ def _detect_summary_language(summary: Any) -> str:
     if cjk_count >= 2:
         return "zh"
     en_word_count = len(EN_WORD_RE.findall(text))
-    if cjk_count == 0 and en_word_count >= 6:
+    if cjk_count == 0 and en_word_count >= 1:
         return "non_zh"
-    if cjk_count <= 1 and en_word_count >= 12:
+    if cjk_count <= 1 and en_word_count >= 4:
         return "non_zh"
     return "zh"
 
 
 def _detect_extracted_summary_language(extracted_json: dict[str, Any]) -> str:
-    if _detect_summary_language(extracted_json.get("summary")) == "non_zh":
-        return "non_zh"
     asset_views = extracted_json.get("asset_views")
     if not isinstance(asset_views, list):
-        return "zh"
+        asset_views = []
     for item in asset_views:
         if not isinstance(item, dict):
             continue
         if _detect_summary_language(item.get("summary")) == "non_zh":
             return "non_zh"
+    library_entry = extracted_json.get("library_entry")
+    if isinstance(library_entry, dict) and _detect_summary_language(library_entry.get("summary")) == "non_zh":
+        return "non_zh"
     return "zh"
 
 
@@ -732,22 +705,18 @@ def _is_valid_extracted_object(extracted_json: Any) -> bool:
 def _normalize_library_entry_for_read(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    confidence_raw = value.get("confidence")
-    if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
-        confidence = 0
-    else:
-        confidence = int(max(0, min(100, round(float(confidence_raw)))))
-    tags = value.get("tags")
-    normalized_tags: list[str] = []
-    if isinstance(tags, list):
-        for item in tags:
-            if isinstance(item, str) and item.strip():
-                normalized_tags.append(item.strip().lower())
+    tag = value.get("tag")
+    if not isinstance(tag, str) or not tag.strip():
+        return None
+    normalized_tag = tag.strip().lower()
+    if normalized_tag not in {"macro", "industry", "thesis", "strategy", "risk", "events"}:
+        return None
     summary = value.get("summary")
-    normalized_summary = summary if isinstance(summary, str) and summary.strip() else None
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    normalized_summary = summary.strip()
     return {
-        "confidence": confidence,
-        "tags": normalized_tags,
+        "tag": normalized_tag,
         "summary": normalized_summary,
     }
 
@@ -755,20 +724,29 @@ def _normalize_library_entry_for_read(value: Any) -> dict[str, Any] | None:
 def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {
-            "content_kind": "asset",
+            "as_of": "",
+            "source_url": "",
+            "islibrary": 0,
+            "hasview": 0,
+            "asset_views": [],
             "library_entry": None,
         }
-    content_kind_raw = payload.get("content_kind")
-    if isinstance(content_kind_raw, str) and content_kind_raw.strip().lower() in {"asset", "library"}:
-        content_kind = content_kind_raw.strip().lower()
-    else:
-        content_kind = "asset"
-    payload_wo_legacy_tags = {k: v for k, v in payload.items() if k != "library_tags"}
-    return {
-        **payload_wo_legacy_tags,
-        "content_kind": content_kind,
+    islibrary = _coerce_islibrary(payload)
+    asset_views = payload.get("asset_views") if isinstance(payload.get("asset_views"), list) else []
+    as_of_raw = payload.get("as_of")
+    source_url_raw = payload.get("source_url")
+    normalized: dict[str, Any] = {
+        "as_of": as_of_raw.strip() if isinstance(as_of_raw, str) else "",
+        "source_url": source_url_raw.strip() if isinstance(source_url_raw, str) else "",
+        "islibrary": islibrary,
+        "hasview": 1 if asset_views else 0,
+        "asset_views": asset_views,
         "library_entry": _normalize_library_entry_for_read(payload.get("library_entry")),
     }
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        normalized["meta"] = meta
+    return normalized
 
 
 def _prepare_extraction_for_read(extraction: PostExtraction) -> None:
@@ -851,31 +829,25 @@ def _has_extracted_result(extraction: PostExtraction | None, raw_post: RawPost |
     }
 
 
-def _has_non_empty_assets(extraction: PostExtraction | None) -> bool:
+def _has_non_empty_asset_views(extraction: PostExtraction | None) -> bool:
     if extraction is None:
         return False
     payload = extraction.extracted_json
     if not isinstance(payload, dict):
         return False
-    assets = payload.get("assets")
-    if not isinstance(assets, list):
+    asset_views = payload.get("asset_views")
+    if not isinstance(asset_views, list):
         return False
-    for item in assets:
-        if isinstance(item, str) and item.strip():
-            if item.strip().lower() == "noneany":
-                continue
-            return True
+    for item in asset_views:
         if isinstance(item, dict):
             symbol = item.get("symbol")
             if isinstance(symbol, str) and symbol.strip():
-                if symbol.strip().lower() == "noneany":
-                    continue
                 return True
     return False
 
 
 def _is_result_available_extraction(extraction: PostExtraction | None, raw_post: RawPost | None = None) -> bool:
-    if _has_non_empty_assets(extraction):
+    if _has_non_empty_asset_views(extraction):
         return True
     return _has_extracted_result(extraction, raw_post)
 
@@ -1294,17 +1266,8 @@ def _infer_auto_market(raw_post: RawPost | SimpleNamespace, symbol: str) -> str:
     if getattr(raw_post, "platform", "").strip().lower() in {"binance", "okx", "bybit"}:
         return "CRYPTO"
     if symbol.endswith("USD") or symbol in {"US10Y", "DXY", "VIX", "SPX", "QQQ"}:
-        return "AUTO"
-    return "AUTO"
-
-
-async def _load_assets_for_prompt(db: AsyncSession, limit: int) -> list[dict[str, str | None]]:
-    safe_limit = max(0, limit)
-    if safe_limit == 0:
-        return []
-    result = await db.execute(select(Asset).order_by(Asset.id.asc()).limit(safe_limit))
-    items = list(result.scalars().all())
-    return [{"symbol": item.symbol, "name": item.name, "market": item.market} for item in items]
+        return "OTHER"
+    return "OTHER"
 
 
 async def _load_aliases_for_prompt(db: AsyncSession) -> list[dict[str, str]]:
@@ -1422,6 +1385,7 @@ def _cap_asset_views_for_runtime_rules(
     views = extracted_json.get("asset_views")
     meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
     if not isinstance(views, list):
+        extracted_json["hasview"] = 0
         extracted_json["meta"] = {
             **meta,
             "asset_views_capped": False,
@@ -1472,6 +1436,7 @@ def _cap_asset_views_for_runtime_rules(
             if symbol:
                 kept_symbols.append(symbol)
     extracted_json["asset_views"] = kept_views
+    extracted_json["hasview"] = 1 if kept_views else 0
     extracted_json["meta"] = {
         **meta,
         "asset_views_capped": capped,
@@ -1527,17 +1492,11 @@ async def ensure_assets_from_extracted_json(
     extracted_json: dict[str, Any],
 ) -> None:
     seen_symbols: set[str] = set()
-    candidates: list[Any] = []
-    assets = extracted_json.get("assets")
-    if isinstance(assets, list):
-        candidates.extend(assets)
     asset_views = extracted_json.get("asset_views")
-    if isinstance(asset_views, list):
-        candidates.extend(asset_views)
-    if not candidates:
+    if not isinstance(asset_views, list) or not asset_views:
         return
 
-    for item in candidates:
+    for item in asset_views:
         if isinstance(item, str):
             symbol = _normalize_asset_symbol(item)
             name = None
@@ -1550,8 +1509,6 @@ async def ensure_assets_from_extracted_json(
             continue
 
         if symbol is None or symbol in seen_symbols:
-            continue
-        if symbol == "NONEANY":
             continue
         seen_symbols.add(symbol)
         await upsert_asset(
@@ -1972,47 +1929,34 @@ def _resolve_auto_review_trigger(
 
 
 def _coerce_extraction_confidence(extracted_json: dict[str, Any]) -> int | None:
-    confidence_raw = extracted_json.get("confidence")
-    if not isinstance(confidence_raw, (int, float)):
+    asset_views = extracted_json.get("asset_views")
+    if not isinstance(asset_views, list):
         return None
-    return int(max(0, min(100, round(float(confidence_raw)))))
-
-
-def _coerce_library_entry_confidence(extracted_json: dict[str, Any]) -> int | None:
-    library_entry = extracted_json.get("library_entry")
-    if not isinstance(library_entry, dict):
+    confidences: list[int] = []
+    for item in asset_views:
+        if not isinstance(item, dict):
+            continue
+        confidence_raw = item.get("confidence")
+        if isinstance(confidence_raw, (int, float)):
+            confidences.append(int(max(0, min(100, round(float(confidence_raw))))))
+    if not confidences:
         return None
-    confidence_raw = library_entry.get("confidence")
-    if not isinstance(confidence_raw, (int, float)):
-        return None
-    return int(max(0, min(100, round(float(confidence_raw)))))
+    return max(confidences)
 
 
-def _has_noneany_assets(extracted_json: dict[str, Any]) -> bool:
-    assets = extracted_json.get("assets")
-    if not isinstance(assets, list):
-        return False
-    for item in assets:
-        if isinstance(item, str) and item.strip().lower() == "noneany":
-            return True
-        if isinstance(item, dict):
-            symbol = item.get("symbol")
-            if isinstance(symbol, str) and symbol.strip().lower() == "noneany":
-                return True
-    return False
-
-
-def _is_noneany_only_assets(extracted_json: dict[str, Any]) -> bool:
-    assets = extracted_json.get("assets")
-    if not isinstance(assets, list) or len(assets) != 1:
-        return False
-    item = assets[0]
-    if isinstance(item, dict):
-        symbol = item.get("symbol")
-        return isinstance(symbol, str) and symbol.strip().lower() == "noneany"
-    if isinstance(item, str):
-        return item.strip().lower() == "noneany"
-    return False
+def _coerce_islibrary(extracted_json: dict[str, Any]) -> int:
+    raw = extracted_json.get("islibrary")
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    if isinstance(raw, int):
+        return 1 if raw == 1 else 0
+    if isinstance(raw, float):
+        return 1 if raw == 1.0 else 0
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "library"}:
+            return 1
+    return 0
 
 
 async def postprocess_auto_review(
@@ -2027,32 +1971,7 @@ async def postprocess_auto_review(
         return None
     if not isinstance(extraction.extracted_json, dict):
         return None
-    content_kind = str(extraction.extracted_json.get("content_kind") or "asset").strip().lower()
-    noneany_detected = _has_noneany_assets(extraction.extracted_json)
-    noneany_only = _is_noneany_only_assets(extraction.extracted_json)
-    if noneany_detected and content_kind == "asset" and noneany_only:
-        base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
-        reviewed_at = datetime.now(UTC)
-        extraction.extracted_json = {
-            **extraction.extracted_json,
-            "meta": {
-                **base_meta,
-                "auto_rejected": True,
-                "auto_review_reason": "no_investment_asset_noneany",
-                "noneany_detected": True,
-                "auto_reject_reason": "no_investment_asset_noneany",
-                "noneany_only": True,
-                "auto_policy_applied": "noneany_asset_forced_reject",
-            },
-        }
-        extraction.status = ExtractionStatus.rejected
-        extraction.reviewed_by = AUTO_EXTRACTION_REVIEWER
-        extraction.reviewed_at = reviewed_at
-        extraction.review_note = "auto-rejected: no_investment_asset_noneany"
-        raw_post.review_status = ReviewStatus.rejected
-        raw_post.reviewed_by = AUTO_EXTRACTION_REVIEWER
-        raw_post.reviewed_at = reviewed_at
-        return "rejected"
+    islibrary = _coerce_islibrary(extraction.extracted_json)
     if trigger not in {"auto", "bulk"}:
         base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
         extraction.extracted_json = {
@@ -2063,19 +1982,17 @@ async def postprocess_auto_review(
             },
         }
         return None
-    if content_kind == "asset" and not _has_reviewable_asset_views(extraction):
+    if islibrary == 0 and not _has_reviewable_asset_views(extraction):
         return None
-    if content_kind == "library":
-        model_confidence = _coerce_library_entry_confidence(extraction.extracted_json)
-    else:
-        model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
+    if islibrary == 1:
+        return None
+    model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
     if model_confidence is None:
         return None
 
     base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
     reviewed_at = datetime.now(UTC)
     if model_confidence < threshold:
-        threshold_policy = "threshold_library" if content_kind == "library" else "threshold_asset"
         extraction.extracted_json = {
             **extraction.extracted_json,
             "meta": {
@@ -2086,7 +2003,7 @@ async def postprocess_auto_review(
                 "model_confidence": model_confidence,
                 "auto_reject_reason": "confidence_below_threshold",
                 "auto_reject_threshold": threshold,
-                "auto_policy_applied": threshold_policy,
+                "auto_policy_applied": "threshold_asset",
             },
         }
         extraction.status = ExtractionStatus.rejected
@@ -2098,7 +2015,6 @@ async def postprocess_auto_review(
         raw_post.reviewed_at = reviewed_at
         return "rejected"
 
-    threshold_policy = "threshold_library" if content_kind == "library" else "threshold_asset"
     extraction.extracted_json = {
         **extraction.extracted_json,
         "meta": {
@@ -2107,7 +2023,7 @@ async def postprocess_auto_review(
             "auto_review_threshold": threshold,
             "auto_review_reason": "confidence_at_or_above_threshold",
             "model_confidence": model_confidence,
-            "auto_policy_applied": threshold_policy,
+            "auto_policy_applied": "threshold_asset",
         },
     }
     await _auto_apply_extraction_views(db, extraction=extraction, raw_post=raw_post, force_apply=True)
@@ -2166,11 +2082,7 @@ async def _apply_model_output_to_extraction(
         alias_to_symbol=alias_to_symbol,
         known_symbols=known_symbols,
     )
-    extracted_meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
-    if extracted_meta.get("noneany_mixed_with_symbols"):
-        prior_error = audit_meta.get("last_error") if isinstance(audit_meta.get("last_error"), str) else None
-        audit_meta["last_error"] = _append_last_error(prior_error, "noneany_mixed_with_symbols")
-
+    extracted_json["source_url"] = (extraction_input.url or "").strip()
     extracted_json["meta"] = {
         **(extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}),
         **(audit_meta.get("meta") if isinstance(audit_meta.get("meta"), dict) else {}),
@@ -2353,7 +2265,6 @@ async def create_pending_extraction(
     settings = get_settings()
     extraction_input, truncation_meta = _build_extraction_input(raw_post)
     extractor = select_extractor(settings)
-    assets_for_prompt = await _load_assets_for_prompt(db, settings.max_assets_in_prompt)
     try:
         aliases_for_prompt = await _load_aliases_for_prompt(db)
     except Exception:  # noqa: BLE001
@@ -2367,9 +2278,6 @@ async def create_pending_extraction(
         url=extraction_input.url,
         posted_at=extraction_input.posted_at,
         content_text=extraction_input.content_text,
-        assets=assets_for_prompt,
-        aliases=aliases_for_prompt,
-        max_assets_in_prompt=settings.max_assets_in_prompt,
     )
     extractor.set_prompt_bundle(prompt_bundle)
     extracted_json = default_extracted_json(extraction_input)
@@ -2762,19 +2670,6 @@ async def list_assets(db: AsyncSession = Depends(get_db)):
     return list(result.scalars().all())
 
 
-@app.get("/assets/aliases", response_model=list[AssetAliasMapRead])
-async def list_alias_symbol_map(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(AssetAlias.alias, Asset.symbol)
-        .join(Asset, Asset.id == AssetAlias.asset_id)
-        .order_by(AssetAlias.id.asc())
-    )
-    rows: list[AssetAliasMapRead] = []
-    for alias, symbol in result.all():
-        rows.append(AssetAliasMapRead(alias=alias, symbol=symbol))
-    return rows
-
-
 @app.post("/assets", response_model=AssetRead, status_code=status.HTTP_201_CREATED)
 async def create_asset(payload: AssetCreate, db: AsyncSession = Depends(get_db)):
     symbol = payload.symbol.strip().upper()
@@ -2805,44 +2700,6 @@ async def upsert_asset_endpoint(payload: AssetCreate, db: AsyncSession = Depends
     await db.commit()
     await db.refresh(asset)
     return asset
-
-
-@app.get("/assets/{asset_id}/aliases", response_model=list[AssetAliasRead])
-async def list_asset_aliases(asset_id: int, db: AsyncSession = Depends(get_db)):
-    asset = await db.get(Asset, asset_id)
-    if asset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
-    result = await db.execute(
-        select(AssetAlias).where(AssetAlias.asset_id == asset_id).order_by(AssetAlias.id.asc())
-    )
-    return list(result.scalars().all())
-
-
-@app.post("/assets/{asset_id}/aliases", response_model=list[AssetAliasRead], status_code=status.HTTP_201_CREATED)
-async def create_asset_alias(asset_id: int, payload: AssetAliasCreate, db: AsyncSession = Depends(get_db)):
-    asset = await db.get(Asset, asset_id)
-    if asset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
-    alias = payload.alias.strip()
-    if not alias:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="alias is required")
-    alias_key = _normalize_alias_key(alias)
-
-    existing_result = await db.execute(select(AssetAlias).order_by(AssetAlias.id.asc()))
-    existing_aliases = list(existing_result.scalars().all())
-    matched = next((item for item in existing_aliases if _normalize_alias_key(item.alias) == alias_key), None)
-    if matched is None:
-        db.add(AssetAlias(asset_id=asset_id, alias=alias))
-    else:
-        matched.asset_id = asset_id
-        matched.alias = alias
-        await db.flush()
-
-    await db.commit()
-    result = await db.execute(
-        select(AssetAlias).where(AssetAlias.asset_id == asset_id).order_by(AssetAlias.id.asc())
-    )
-    return list(result.scalars().all())
 
 
 @app.get("/kols", response_model=list[KolRead])
@@ -2903,37 +2760,6 @@ async def update_profile_markets(
     db: AsyncSession = Depends(get_db),
 ):
     return await update_profile_markets_service(db, profile_id=profile_id, payload=payload)
-
-
-@app.post("/kol-views", response_model=KolViewRead, status_code=status.HTTP_201_CREATED)
-async def create_kol_view(payload: KolViewCreate, db: AsyncSession = Depends(get_db)):
-    kol = await db.get(Kol, payload.kol_id)
-    if kol is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="kol not found")
-
-    asset = await db.get(Asset, payload.asset_id)
-    if asset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
-
-    view = KolView(
-        kol_id=payload.kol_id,
-        asset_id=payload.asset_id,
-        stance=payload.stance,
-        horizon=payload.horizon,
-        confidence=payload.confidence,
-        summary=(payload.summary or "").strip(),
-        source_url=(payload.source_url or "").strip(),
-        as_of=payload.as_of or datetime.now(UTC).date(),
-    )
-    db.add(view)
-    try:
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate kol view")
-
-    await db.refresh(view)
-    return view
 
 
 @app.get("/assets/{asset_id}/views", response_model=AssetViewsRead)
@@ -3077,60 +2903,6 @@ async def get_asset_views_timeline(
         generated_at=now,
         items=items,
     )
-
-
-@app.post("/raw-posts", response_model=RawPostRead, status_code=status.HTTP_201_CREATED)
-async def create_raw_post(payload: RawPostCreate, db: AsyncSession = Depends(get_db)):
-    raw_post = RawPost(
-        platform=payload.platform.strip().lower(),
-        author_handle=payload.author_handle.strip(),
-        external_id=payload.external_id.strip(),
-        url=payload.url.strip(),
-        content_text=payload.content_text.strip(),
-        posted_at=payload.posted_at,
-        raw_json=payload.raw_json,
-    )
-    db.add(raw_post)
-    try:
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="raw post already exists")
-    await db.refresh(raw_post)
-    return raw_post
-
-
-@app.post("/ingest/manual", response_model=ManualIngestRead, status_code=status.HTTP_201_CREATED)
-async def ingest_manual(payload: ManualIngestCreate, db: AsyncSession = Depends(get_db)):
-    platform = payload.platform.strip().lower()
-    author_handle = payload.author_handle.strip()
-    url = payload.url.strip()
-    content_text = payload.content_text.strip()
-    external_id = (payload.external_id or "").strip() or build_external_id(url)
-    posted_at = payload.posted_at or datetime.now(UTC)
-
-    raw_post = RawPost(
-        platform=platform,
-        author_handle=author_handle,
-        external_id=external_id,
-        url=url,
-        content_text=content_text,
-        posted_at=posted_at,
-        raw_json=payload.raw_json,
-    )
-    db.add(raw_post)
-
-    try:
-        await db.flush()
-        extraction = await create_pending_extraction(db, raw_post)
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="raw post already exists")
-
-    await db.refresh(raw_post)
-    await db.refresh(extraction)
-    return ManualIngestRead(raw_post=raw_post, extraction=extraction, extraction_id=extraction.id)
 
 
 @app.get("/ingest/x/import/template", response_model=XImportTemplateRead)
@@ -4495,286 +4267,6 @@ async def retry_failed_x_extractions(
         failed_count=failed_count,
         skipped_count=skipped_count,
         failure_reasons=dict(reason_counter),
-    )
-
-
-async def _plan_duplicate_pending_cleanup(
-    db: AsyncSession,
-    *,
-    limit: int,
-) -> tuple[int, list[int], list[int], list[str]]:
-    result = await db.execute(select(PostExtraction))
-    rows = list(result.scalars().all())
-    rows.sort(
-        key=lambda item: (
-            item.created_at or datetime.min.replace(tzinfo=UTC),
-            item.id or 0,
-        ),
-        reverse=True,
-    )
-    by_raw_post_id: dict[int, list[PostExtraction]] = defaultdict(list)
-    for item in rows:
-        by_raw_post_id[item.raw_post_id].append(item)
-
-    scanned = 0
-    keep_ids: list[int] = []
-    delete_ids: list[int] = []
-    errors: list[str] = []
-    for raw_post_id, items in by_raw_post_id.items():
-        pending_rows = [item for item in items if _extraction_status_key(item) == ExtractionStatus.pending.value]
-        if not pending_rows:
-            continue
-        scanned += len(pending_rows)
-        has_terminal = any(
-            _extraction_status_key(item) in {ExtractionStatus.approved.value, ExtractionStatus.rejected.value}
-            for item in items
-        )
-        if has_terminal:
-            candidates = pending_rows
-        else:
-            keep_ids.append(pending_rows[0].id)
-            candidates = pending_rows[1:]
-        for candidate in candidates:
-            if not _is_safe_pending_cleanup_candidate(candidate):
-                errors.append(f"skip_unsafe_extraction:{candidate.id}:raw_post:{raw_post_id}")
-                continue
-            delete_ids.append(candidate.id)
-            if len(delete_ids) >= limit:
-                return scanned, keep_ids, delete_ids, errors[:50]
-    return scanned, keep_ids, delete_ids, errors[:50]
-
-
-@app.post("/admin/extractions/cleanup-duplicate-pending", response_model=AdminCleanupDuplicatePendingRead)
-async def cleanup_duplicate_pending_extractions(
-    confirm: str = Query(...),
-    dry_run: bool = Query(default=True),
-    limit: int = Query(default=1000, ge=1, le=10000),
-    db: AsyncSession = Depends(get_db),
-):
-    _require_destructive_admin_guard(confirm=confirm)
-    scanned, keep_ids, delete_ids, errors = await _plan_duplicate_pending_cleanup(db, limit=limit)
-    duplicates_found = len(delete_ids)
-    deleted_count = 0
-    if not dry_run and delete_ids:
-        for extraction_id in delete_ids:
-            extraction = await db.get(PostExtraction, extraction_id)
-            if extraction is None:
-                continue
-            await db.delete(extraction)
-            deleted_count += 1
-        await db.commit()
-    return AdminCleanupDuplicatePendingRead(
-        scanned=scanned,
-        duplicates_found=duplicates_found,
-        dry_run=dry_run,
-        would_delete_ids=delete_ids,
-        would_keep_ids=keep_ids,
-        deleted_count=deleted_count,
-        errors=errors,
-    )
-
-
-@app.post("/admin/extractions/backfill-auto-review", response_model=AdminBackfillAutoReviewRead)
-async def backfill_auto_review_by_confidence(
-    confirm: str = Query(...),
-    db: AsyncSession = Depends(get_db),
-):
-    _require_destructive_admin_guard(confirm=confirm)
-
-    result = await db.execute(select(PostExtraction).order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc()))
-    extractions = list(result.scalars().all())
-    scanned = len(extractions)
-    approved_count = 0
-    rejected_count = 0
-    skipped_no_result_count = 0
-    skipped_no_confidence_count = 0
-    skipped_already_terminal_count = 0
-    errors: list[AutoReviewBackfillErrorRead] = []
-
-    for extraction in extractions:
-        extraction_id = getattr(extraction, "id", None)
-        raw_post = await db.get(RawPost, extraction.raw_post_id)
-        if raw_post is None:
-            if len(errors) < 20:
-                errors.append(
-                    AutoReviewBackfillErrorRead(
-                        extraction_id=extraction_id,
-                        raw_post_id=extraction.raw_post_id,
-                        error="raw_post_not_found",
-                    )
-                )
-            continue
-        state = classify_extraction_state(extraction, raw_post)
-        if state in {ClassifiedExtractionState.approved, ClassifiedExtractionState.rejected}:
-            skipped_already_terminal_count += 1
-            continue
-        if state != ClassifiedExtractionState.success:
-            skipped_no_result_count += 1
-            continue
-        if not isinstance(extraction.extracted_json, dict):
-            skipped_no_result_count += 1
-            continue
-        model_confidence = _coerce_extraction_confidence(extraction.extracted_json)
-        if model_confidence is None:
-            skipped_no_confidence_count += 1
-            continue
-
-        try:
-            outcome = await postprocess_auto_review(db=db, extraction=extraction, raw_post=raw_post)
-        except Exception as exc:  # noqa: BLE001
-            if len(errors) < 20:
-                errors.append(
-                    AutoReviewBackfillErrorRead(
-                        extraction_id=extraction_id,
-                        raw_post_id=raw_post.id,
-                        error=_build_last_error(exc)[:240],
-                    )
-                )
-            continue
-
-        if outcome == "approved":
-            approved_count += 1
-        elif outcome == "rejected":
-            rejected_count += 1
-        else:
-            skipped_no_result_count += 1
-
-    await db.commit()
-    return AdminBackfillAutoReviewRead(
-        scanned=scanned,
-        approved_count=approved_count,
-        rejected_count=rejected_count,
-        skipped_no_result_count=skipped_no_result_count,
-        skipped_no_confidence_count=skipped_no_confidence_count,
-        skipped_already_terminal_count=skipped_already_terminal_count,
-        errors=errors[:20],
-    )
-
-
-@app.post("/admin/extractions/reextract-pending", response_model=AdminReextractPendingRead)
-async def admin_reextract_pending(
-    confirm: str = Query(...),
-    db: AsyncSession = Depends(get_db),
-):
-    _require_destructive_admin_guard(confirm=confirm)
-
-    result = await db.execute(
-        select(PostExtraction)
-        .options(selectinload(PostExtraction.raw_post))
-        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
-    )
-    rows = list(result.scalars().all())
-    latest_by_raw_post: dict[int, PostExtraction] = {}
-    for extraction in rows:
-        raw_post_id = getattr(extraction, "raw_post_id", None)
-        if raw_post_id is None or raw_post_id in latest_by_raw_post:
-            continue
-        latest_by_raw_post[raw_post_id] = extraction
-
-    scanned = len(latest_by_raw_post)
-    created = 0
-    conflict_count = 0
-    succeeded_parse = 0
-    failed_parse = 0
-    auto_approved = 0
-    auto_rejected = 0
-    noneany_rejected = 0
-    skipped_terminal = 0
-    errors: list[AdminReextractPendingErrorRead] = []
-
-    latest_records: list[tuple[int | None, int | None, str]] = []
-    for extraction in latest_by_raw_post.values():
-        latest_records.append((getattr(extraction, "id", None), extraction.raw_post_id, _extraction_status_key(extraction)))
-
-    for extraction_id, raw_post_id, status_key in latest_records:
-        if raw_post_id is None:
-            skipped_terminal += 1
-            if len(errors) < 20:
-                errors.append(
-                    AdminReextractPendingErrorRead(
-                        extraction_id=extraction_id,
-                        raw_post_id=None,
-                        error="raw_post_id_missing",
-                    )
-                )
-            continue
-        raw_post = await db.get(RawPost, raw_post_id)
-        if raw_post is None:
-            skipped_terminal += 1
-            if len(errors) < 20:
-                errors.append(
-                    AdminReextractPendingErrorRead(
-                        extraction_id=extraction_id,
-                        raw_post_id=raw_post_id,
-                        error="raw_post_not_found",
-                    )
-                )
-            continue
-
-        # Keep selection semantics consistent with /extractions?status=pending (status field based).
-        if status_key != ExtractionStatus.pending.value:
-            skipped_terminal += 1
-            continue
-
-        try:
-            _check_reextract_rate_limit(raw_post.id)
-            created_extraction = await create_pending_extraction(
-                db,
-                raw_post,
-                allow_budget_fallback=False,
-                force_reextract=True,
-                force_reextract_triggered_by=FORCE_REEXTRACT_TRIGGER_BULK_PENDING_RETRY,
-                source_extraction_id=extraction_id,
-            )
-            created += 1
-            payload = created_extraction.extracted_json if isinstance(created_extraction.extracted_json, dict) else {}
-            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-            if bool(meta.get("parse_error")):
-                failed_parse += 1
-            else:
-                succeeded_parse += 1
-            if _has_noneany_assets(payload) and _extraction_status_key(created_extraction) == ExtractionStatus.rejected.value:
-                noneany_rejected += 1
-            elif _extraction_status_key(created_extraction) == ExtractionStatus.approved.value:
-                auto_approved += 1
-            elif _extraction_status_key(created_extraction) == ExtractionStatus.rejected.value:
-                auto_rejected += 1
-            await db.commit()
-        except IntegrityError as exc:
-            await db.rollback()
-            conflict_count += 1
-            if len(errors) < 20:
-                errors.append(
-                    AdminReextractPendingErrorRead(
-                        extraction_id=extraction_id,
-                        raw_post_id=raw_post_id,
-                        error=_build_last_error(exc)[:240],
-                    )
-                )
-        except Exception as exc:  # noqa: BLE001
-            await db.rollback()
-            if len(errors) < 20:
-                errors.append(
-                    AdminReextractPendingErrorRead(
-                        extraction_id=extraction_id,
-                        raw_post_id=raw_post_id,
-                        error=_build_last_error(exc)[:240],
-                    )
-                )
-
-    await db.commit()
-    return AdminReextractPendingRead(
-        scanned=scanned,
-        created=created,
-        triggered=created,
-        conflict_count=conflict_count,
-        succeeded_parse=succeeded_parse,
-        failed_parse=failed_parse,
-        auto_approved=auto_approved,
-        auto_rejected=auto_rejected,
-        noneany_rejected=noneany_rejected,
-        skipped_terminal=skipped_terminal,
-        errors=errors[:20],
     )
 
 

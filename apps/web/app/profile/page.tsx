@@ -26,7 +26,7 @@ type ProfileDetail = {
   markets: string[];
 };
 
-const MARKET_OPTIONS = ["CRYPTO", "US", "HK", "CN", "FX", "AUTO"];
+const MARKET_OPTIONS = ["CRYPTO", "US", "HK", "CN", "FX"];
 
 export default function ProfilePage() {
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);

@@ -264,11 +264,11 @@ def test_extractions_bad_only_and_stats() -> None:
 
     assert pending_bad_only.status_code == 200
     pending_items = pending_bad_only.json()
-    assert [item["id"] for item in pending_items] == [21]
+    assert [item["id"] for item in pending_items] == [22, 21]
 
     assert stats.status_code == 200
     stats_payload = stats.json()
-    assert stats_payload["bad_count"] == 2
+    assert stats_payload["bad_count"] == 3
     assert stats_payload["total_count"] == 3
 
 

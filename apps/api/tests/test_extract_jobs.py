@@ -96,7 +96,7 @@ def test_extract_job_happy_path_counts(monkeypatch) -> None:  # noqa: ANN001
             id=10,
             raw_post_id=2,
             status=ExtractionStatus.pending,
-            extracted_json={"sentiment": "neutral", "assets": []},
+            extracted_json={"sentiment": "neutral", "hasview": 0, "asset_views": []},
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             prompt_version="extract_v1",
@@ -123,7 +123,7 @@ def test_extract_job_happy_path_counts(monkeypatch) -> None:  # noqa: ANN001
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"sentiment": "neutral", "assets": []},
+            extracted_json={"sentiment": "neutral", "hasview": 0, "asset_views": []},
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             prompt_version="extract_v1",
@@ -208,7 +208,7 @@ def test_extract_batch_respects_max_concurrency(monkeypatch) -> None:  # noqa: A
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {}},
             model_name="deepseek/deepseek-v3.2",
             extractor_name="openrouter_json_mode",
             prompt_version="extract_v1",
@@ -272,7 +272,7 @@ def test_extract_job_reupload_resumes_only_failed(monkeypatch) -> None:  # noqa:
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"sentiment": "neutral", "assets": []},
+            extracted_json={"sentiment": "neutral", "hasview": 0, "asset_views": []},
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             prompt_version="extract_v1",
@@ -353,7 +353,7 @@ def test_extract_job_pending_with_result_skips_already_has_result(monkeypatch) -
             id=101,
             raw_post_id=1,
             status=ExtractionStatus.pending,
-            extracted_json={"summary": "has result", "confidence": 65, "assets": []},
+            extracted_json={"summary": "has result", "confidence": 65, "hasview": 0, "asset_views": []},
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             last_error=None,
@@ -423,7 +423,7 @@ def test_extract_job_rejected_history_counts_as_has_result_and_skips_reupload(mo
             id=201,
             raw_post_id=1,
             status=ExtractionStatus.rejected,
-            extracted_json={"summary": "old rejected", "confidence": 69, "assets": []},
+            extracted_json={"summary": "old rejected", "confidence": 69, "hasview": 0, "asset_views": []},
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             last_error=None,
@@ -503,7 +503,7 @@ def test_progress_and_job_counters_use_same_terminal_status_logic(monkeypatch) -
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
             extracted_json={
-                "assets": [],
+                "hasview": 0,
                 "asset_views": [],
                 "meta": {
                     "extraction_mode": "text_json",
@@ -587,7 +587,7 @@ def test_frontend_job_creation_guard_or_backend_idempotency(monkeypatch) -> None
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {}},
             model_name="qwen",
             extractor_name="openai_structured",
             prompt_version="extract_v1",
@@ -685,7 +685,7 @@ def test_extract_job_deduplicates_inflight_raw_post_ids_without_idempotency_key(
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {}},
             model_name="qwen",
             extractor_name="openai_structured",
             prompt_version="extract_v1",
@@ -769,7 +769,7 @@ def test_extract_job_no_actionable_items_still_reaches_terminal(monkeypatch) -> 
             id=301,
             raw_post_id=1,
             status=ExtractionStatus.approved,
-            extracted_json={"summary": "already done", "assets": []},
+            extracted_json={"summary": "already done", "hasview": 0, "asset_views": []},
             model_name="gpt-4o-mini",
             extractor_name="openai_structured",
             last_error=None,
@@ -903,7 +903,7 @@ def test_extract_job_import_ai_limit_caps_calls_and_marks_skipped(monkeypatch) -
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {}},
             model_name="qwen",
             extractor_name="openai_structured",
             prompt_version="extract_v1",
@@ -984,7 +984,7 @@ def test_extract_job_disables_global_call_budget_by_default(monkeypatch) -> None
         extraction = PostExtraction(
             raw_post_id=raw_post.id,
             status=ExtractionStatus.pending,
-            extracted_json={"assets": [], "asset_views": [], "meta": {}},
+            extracted_json={"hasview": 0, "asset_views": [], "meta": {}},
             model_name="qwen",
             extractor_name="openai_structured",
             prompt_version="extract_v1",

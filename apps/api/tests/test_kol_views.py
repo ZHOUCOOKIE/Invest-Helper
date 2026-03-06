@@ -3,17 +3,11 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-from fastapi.testclient import TestClient
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from db import get_db
 from enums import Horizon, Stance
-from main import app, build_asset_views_response
-
-
-async def _fake_db():
-    yield SimpleNamespace()
+from main import build_asset_views_response, calc_clarity as dashboard_calc_clarity, select_latest_views as dashboard_select_latest_views
+from services import digests as digest_service
 
 
 def _view(
@@ -39,26 +33,6 @@ def _view(
         as_of=as_of,
         created_at=created_at,
     )
-
-
-def test_create_kol_view_invalid_enum_returns_422():
-    app.dependency_overrides[get_db] = _fake_db
-    client = TestClient(app)
-
-    payload = {
-        "kol_id": 1,
-        "asset_id": 1,
-        "stance": "moon",
-        "horizon": "10y",
-        "confidence": 50,
-        "summary": "invalid enum test",
-        "source_url": "https://example.com",
-        "as_of": "2026-02-21",
-    }
-    response = client.post("/kol-views", json=payload)
-    app.dependency_overrides.clear()
-
-    assert response.status_code == 422
 
 
 def test_build_asset_views_response_keeps_latest_version():
@@ -132,3 +106,44 @@ def test_build_asset_views_response_group_and_confidence_sort():
     assert [group.horizon for group in result.groups] == [Horizon.one_week, Horizon.one_month]
     one_month = next(group for group in result.groups if group.horizon == Horizon.one_month)
     assert [item.confidence for item in one_month.bull] == [88, 55]
+
+
+def test_dashboard_and_digest_share_latest_view_and_clarity_logic():
+    views = [
+        _view(
+            view_id=21,
+            kol_id=1,
+            asset_id=1,
+            horizon=Horizon.one_week,
+            stance=Stance.bull,
+            confidence=60,
+            as_of=date(2026, 2, 20),
+            created_at=datetime(2026, 2, 20, 9, 0, tzinfo=UTC),
+        ),
+        _view(
+            view_id=22,
+            kol_id=1,
+            asset_id=1,
+            horizon=Horizon.one_week,
+            stance=Stance.bear,
+            confidence=95,
+            as_of=date(2026, 2, 21),
+            created_at=datetime(2026, 2, 21, 9, 0, tzinfo=UTC),
+        ),
+        _view(
+            view_id=23,
+            kol_id=2,
+            asset_id=1,
+            horizon=Horizon.one_week,
+            stance=Stance.bull,
+            confidence=75,
+            as_of=date(2026, 2, 21),
+            created_at=datetime(2026, 2, 21, 10, 0, tzinfo=UTC),
+        ),
+    ]
+
+    dashboard_latest = sorted(item.id for item in dashboard_select_latest_views(views))
+    digest_latest = sorted(item.id for item in digest_service.select_latest_views(views))
+    assert dashboard_latest == digest_latest
+
+    assert dashboard_calc_clarity(bull_count=2, bear_count=1) == digest_service.calc_clarity(bull_count=2, bear_count=1)

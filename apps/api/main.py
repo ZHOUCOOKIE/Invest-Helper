@@ -56,6 +56,7 @@ from schemas import (
     DashboardRead,
     DashboardTopAssetRead,
     DailyDigestRead,
+    WeeklyDigestRead,
     ExtractJobCreateRead,
     ExtractJobCreateRequest,
     ExtractJobRead,
@@ -73,6 +74,8 @@ from schemas import (
     KolViewRead,
     PostExtractionRead,
     PostExtractionWithRawPostRead,
+    PortfolioAdviceRequest,
+    PortfolioAdviceResponse,
     RawPostsExtractBatchRead,
     RawPostsExtractBatchRequest,
     XImportItemCreate,
@@ -113,6 +116,12 @@ from services.digests import (
     get_daily_digest_by_id as get_daily_digest_by_id_service,
     list_daily_digest_dates as list_daily_digest_dates_service,
 )
+from services.weekly_digests import (
+    generate_weekly_digest as generate_weekly_digest_service,
+    get_weekly_digest as get_weekly_digest_service,
+    list_weekly_digest_anchor_dates as list_weekly_digest_anchor_dates_service,
+)
+from services.portfolio_advice import generate_portfolio_advice as generate_portfolio_advice_service
 from services.prompts import build_extract_prompt
 from services.view_logic import calc_clarity, is_newer_view, select_latest_views
 from scripts.x_import_converter import convert_records, load_records_from_bytes
@@ -5147,6 +5156,68 @@ async def get_daily_digest_by_id(
     db: AsyncSession = Depends(get_db),
 ):
     return await get_daily_digest_by_id_service(db, digest_id=digest_id)
+
+
+@app.post("/weekly-digests/generate", response_model=WeeklyDigestRead)
+async def generate_weekly_digest(
+    request: Request,
+    report_kind: Literal["recent_week", "this_week", "last_week"] = Query(alias="kind"),
+    reference_date: date | None = Query(default=None, alias="date"),
+    to_ts: datetime | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await generate_weekly_digest_service(
+            db,
+            report_kind=report_kind,
+            reference_date=reference_date,
+            to_ts=to_ts,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("rollback failed after /weekly-digests/generate error")
+        logger.exception(
+            "generate weekly digest failed: kind=%s date=%s",
+            report_kind,
+            reference_date.isoformat() if reference_date else "today",
+        )
+        return _json_error(
+            request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="weekly_digest_generate_failed",
+            message="Generate weekly digest failed",
+            detail="Generate weekly digest failed",
+        )
+
+
+@app.get("/weekly-digests", response_model=WeeklyDigestRead)
+async def get_weekly_digest(
+    report_kind: Literal["recent_week", "this_week", "last_week"] = Query(alias="kind"),
+    anchor_date: date = Query(alias="anchor_date"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await get_weekly_digest_service(
+        db,
+        report_kind=report_kind,
+        anchor_date=anchor_date,
+    )
+
+
+@app.get("/weekly-digests/dates", response_model=list[date])
+async def list_weekly_digest_anchor_dates(
+    report_kind: Literal["recent_week", "this_week", "last_week"] = Query(alias="kind"),
+    db: AsyncSession = Depends(get_db),
+):
+    return await list_weekly_digest_anchor_dates_service(db, report_kind=report_kind)
+
+
+@app.post("/portfolio/advice", response_model=PortfolioAdviceResponse)
+async def generate_portfolio_advice(payload: PortfolioAdviceRequest):
+    return await generate_portfolio_advice_service(payload)
 
 
 @app.get("/extractions", response_model=list[PostExtractionWithRawPostRead])

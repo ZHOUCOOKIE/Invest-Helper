@@ -3,7 +3,7 @@
 Reference
 
 TL;DR
-- Next.js frontend for dashboard, ingest, review, assets, profile, and digest pages.
+- Next.js frontend for dashboard, ingest, review, assets, kols, daily digest, weekly digest, and portfolio pages.
 - For repository-level authoritative docs, use `docs/INDEX.md`.
 - Runtime/test commands are maintained in:
   - `docs/RUNBOOK.md` (run/replay)
@@ -17,13 +17,15 @@ TL;DR
 ## Main Routes
 
 - `/dashboard`
+- `/portfolio`
 - `/ingest`
 - `/extractions`
 - `/extractions/[id]`
 - `/assets`
 - `/assets/[id]`
-- `/profile`
+- `/kols`
 - `/digests/[date]`
+- `/weekly-digests`
 - `/health`
 
 ## Scope Note

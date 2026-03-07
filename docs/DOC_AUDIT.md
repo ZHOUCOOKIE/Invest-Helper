@@ -24,7 +24,7 @@ TL;DR
 - `docs/RUNBOOK.md`: 本地启动、端到端流程、回放命令、运维清理。
 - `docs/DEV_WORKFLOW.md`: 开发测试流程、`make verify`、test DB 安全护栏。
 - `docs/API.md`: API 端点与请求示例。
-- `docs/TRACEABILITY_AND_REPLAY.md`: 证据链与版本化回放语义。
+- `docs/TRACEABILITY_AND_REPLAY.md`: 证据链与回放语义。
 - `docs/STATUS.md`: 仅记录实现状态与非目标。
 - `docs/GLOSSARY.md`: 统一术语。
 - `docs/INDEX.md`: 导航与权威分层。

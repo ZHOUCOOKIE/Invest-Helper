@@ -14,7 +14,7 @@ import main as main_module
 from db import get_db
 from enums import ExtractionStatus
 from main import app, reset_runtime_counters
-from models import DailyDigest, Kol, PostExtraction, ProfileKolWeight, RawPost, UserProfile
+from models import DailyDigest, Kol, PostExtraction, ProfileKolWeight, RawPost, UserProfile, WeeklyDigest
 from services.digests import _author_summary_field_guide_text
 from settings import get_settings
 
@@ -43,6 +43,7 @@ class FakeAsyncSession:
     def __init__(self) -> None:
         self._data: dict[type[object], dict[int, object]] = {
             DailyDigest: {},
+            WeeklyDigest: {},
             Kol: {},
             PostExtraction: {},
             ProfileKolWeight: {},
@@ -78,6 +79,8 @@ class FakeAsyncSession:
             items.sort(key=lambda item: (item.created_at, item.id), reverse=True)
         elif entity is DailyDigest:
             items.sort(key=lambda item: (item.digest_date, item.id), reverse=True)
+        elif entity is WeeklyDigest:
+            items.sort(key=lambda item: (item.anchor_date, item.id), reverse=True)
         else:
             items.sort(key=lambda item: item.id)
         return FakeResult(items)
@@ -494,3 +497,159 @@ def test_author_summary_field_guide_mentions_core_fields() -> None:
     assert "summary" not in text
     assert "source_url" not in text
     assert "title" not in text
+
+
+def test_list_digest_dates_keeps_recent_3_days_and_purges_older() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    today = now.date()
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(DailyDigest(id=1, profile_id=1, digest_date=today, version=1, days=2, content={}, generated_at=now))
+    fake_db.seed(
+        DailyDigest(id=2, profile_id=1, digest_date=today - timedelta(days=1), version=1, days=2, content={}, generated_at=now)
+    )
+    fake_db.seed(
+        DailyDigest(id=3, profile_id=1, digest_date=today - timedelta(days=2), version=1, days=2, content={}, generated_at=now)
+    )
+    fake_db.seed(
+        DailyDigest(id=4, profile_id=1, digest_date=today - timedelta(days=3), version=1, days=2, content={}, generated_at=now)
+    )
+
+    client = _client_with_db(fake_db)
+    response = client.get("/digests/dates")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == [today.isoformat(), (today - timedelta(days=1)).isoformat(), (today - timedelta(days=2)).isoformat()]
+    assert set(fake_db._data[DailyDigest].keys()) == {1, 2, 3}
+
+
+def test_get_digest_out_of_recent_3_days_returns_404() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    today = now.date()
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(
+        DailyDigest(id=1, profile_id=1, digest_date=today - timedelta(days=3), version=1, days=2, content={}, generated_at=now)
+    )
+
+    client = _client_with_db(fake_db)
+    response = client.get("/digests", params={"date": (today - timedelta(days=3)).isoformat()})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "digest not found"
+
+
+def test_generate_digest_rejects_out_of_recent_3_days() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    today = now.date()
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+
+    client = _client_with_db(fake_db)
+    response = client.post(f"/digests/generate?date={(today - timedelta(days=3)).isoformat()}")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "digest_date must be within recent 3 days"
+
+
+def test_generate_weekly_digest_this_week_window_starts_from_latest_sunday() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)  # Wednesday
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+
+    for idx, as_of in enumerate(["2026-03-08", "2026-03-10", "2026-03-07"], start=1):
+        fake_db.seed(
+            RawPost(
+                id=600 + idx,
+                platform="x",
+                kol_id=1,
+                author_handle="alice",
+                external_id=f"w-{idx}",
+                url=f"https://x.com/alice/w{idx}",
+                content_text=f"content {idx}",
+                posted_at=now,
+                fetched_at=now,
+                raw_json=None,
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=700 + idx,
+                raw_post_id=600 + idx,
+                status=ExtractionStatus.approved,
+                extracted_json={"as_of": as_of, "hasview": 1, "summary": f"summary {idx}"},
+                model_name="dummy",
+                extractor_name="dummy",
+                created_at=now,
+            )
+        )
+
+    client = _client_with_db(fake_db)
+    response = client.post("/weekly-digests/generate?kind=this_week&date=2026-03-11")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["report_kind"] == "this_week"
+    assert body["anchor_date"] == "2026-03-08"
+    assert body["metadata"]["window_start"].startswith("2026-03-08")
+    assert body["metadata"]["window_end"].startswith("2026-03-12")
+    # 2026-03-07 should be excluded for this_week
+    assert {item["raw_post_id"] for item in body["post_summaries"]} == {601, 602}
+
+
+def test_generate_weekly_digest_last_week_window_and_dates_listing() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+
+    for idx, as_of in enumerate(["2026-03-01", "2026-03-07", "2026-03-08"], start=1):
+        fake_db.seed(
+            RawPost(
+                id=800 + idx,
+                platform="x",
+                kol_id=1,
+                author_handle="alice",
+                external_id=f"lw-{idx}",
+                url=f"https://x.com/alice/lw{idx}",
+                content_text=f"last week {idx}",
+                posted_at=now,
+                fetched_at=now,
+                raw_json=None,
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=900 + idx,
+                raw_post_id=800 + idx,
+                status=ExtractionStatus.approved,
+                extracted_json={"as_of": as_of, "hasview": 1, "summary": f"last week summary {idx}"},
+                model_name="dummy",
+                extractor_name="dummy",
+                created_at=now,
+            )
+        )
+
+    client = _client_with_db(fake_db)
+    generated = client.post("/weekly-digests/generate?kind=last_week&date=2026-03-11")
+    dates = client.get("/weekly-digests/dates?kind=last_week")
+    fetched = client.get("/weekly-digests?kind=last_week&anchor_date=2026-03-01")
+    app.dependency_overrides.clear()
+
+    assert generated.status_code == 200
+    body = generated.json()
+    assert body["anchor_date"] == "2026-03-01"
+    assert body["metadata"]["window_start"].startswith("2026-03-01")
+    assert body["metadata"]["window_end"].startswith("2026-03-08")
+    # 2026-03-08 belongs to this_week and should be excluded for last_week
+    assert {item["raw_post_id"] for item in body["post_summaries"]} == {801, 802}
+
+    assert dates.status_code == 200
+    assert dates.json() == ["2026-03-01"]
+    assert fetched.status_code == 200
+    assert fetched.json()["report_kind"] == "last_week"

@@ -1,8 +1,8 @@
 "use client";
 
-import Link from "next/link";
 import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useImportProgressHub } from "../components/import-progress-hub";
 
 type ExtractorStatus = {
   mode: "auto" | "dummy" | "openai" | string;
@@ -143,6 +143,11 @@ type ExtractJobCreateResponse = {
   job_id: string;
 };
 
+type RunExtractJobHooks = {
+  onJobCreated?: (jobId: string) => void;
+  onJobProgress?: (job: ExtractJob) => void;
+};
+
 type ExtractJob = ExtractBatchStats & {
   job_id: string;
   status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timeout" | "done";
@@ -176,6 +181,12 @@ type XProgress = {
   no_extraction_count: number;
   latest_error_summary: string | null;
   latest_extraction_at: string | null;
+};
+
+type HandlePick = {
+  author_handle: string;
+  count: number;
+  will_create_kol: boolean;
 };
 
 const STORAGE_START_DATE = "x_import_start_date";
@@ -254,6 +265,7 @@ function toDateKeyFromIso(value: string): string | null {
 }
 
 export default function IngestPage() {
+  const importProgressHub = useImportProgressHub();
   const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
   const [extractBatchSize, setExtractBatchSize] = useState(20);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -275,6 +287,9 @@ export default function IngestPage() {
   const [importStats, setImportStats] = useState<XImportStats | null>(null);
   const [extractStats, setExtractStats] = useState<ExtractBatchStats | null>(null);
   const [selectedHandles, setSelectedHandles] = useState<string[]>([]);
+  const [includeAllHandles, setIncludeAllHandles] = useState(true);
+  const [convertedRowsForConfirm, setConvertedRowsForConfirm] = useState<XImportItem[] | null>(null);
+  const [awaitingImportConfirm, setAwaitingImportConfirm] = useState(false);
   const [extractByHandle, setExtractByHandle] = useState<Record<string, ExtractBatchStats>>({});
   const [progress, setProgress] = useState<XProgress | null>(null);
   const [followingFile, setFollowingFile] = useState<File | null>(null);
@@ -327,6 +342,21 @@ export default function IngestPage() {
     };
     void loadStatus();
   }, []);
+
+  useEffect(() => {
+    if (!importProgressHub.state.visible) return;
+    if (importProgressHub.state.message) {
+      setWorkflowStep(importProgressHub.state.message);
+    }
+    if (importProgressHub.state.status === "error" && importProgressHub.state.error) {
+      setWorkflowError(importProgressHub.state.error);
+    }
+  }, [
+    importProgressHub.state.visible,
+    importProgressHub.state.message,
+    importProgressHub.state.status,
+    importProgressHub.state.error,
+  ]);
 
   const formatApiError = (
     fallbackMessage: string,
@@ -458,6 +488,7 @@ export default function IngestPage() {
     batchSize: number,
     mode: "pending_only" | "pending_or_failed" | "force",
     aiCallLimitTotal?: number,
+    hooks?: RunExtractJobHooks,
   ): Promise<ExtractBatchStats> => {
     const stableIds = Array.from(new Set(ids)).sort((a, b) => a - b);
     const normalizedAiLimit =
@@ -505,6 +536,7 @@ export default function IngestPage() {
       );
     }
     const jobId = (createParsed.data as ExtractJobCreateResponse).job_id;
+    hooks?.onJobCreated?.(jobId);
 
     try {
       for (let attempt = 0; attempt < 1800; attempt += 1) {
@@ -531,6 +563,7 @@ export default function IngestPage() {
           );
         }
         const job = parsed.data as ExtractJob;
+        hooks?.onJobProgress?.(job);
         setWorkflowRequestId(parsed.requestId);
         setWorkflowStep(
           `抽取任务 ${job.status}：成功=${job.success_count}，失败=${job.failed_count}，跳过=${job.skipped_count}，请求=${job.requested_count}，AI调用=${job.ai_call_used}${job.ai_call_limit_total !== null ? `/${job.ai_call_limit_total}` : ""}`,
@@ -564,6 +597,7 @@ export default function IngestPage() {
 
   const generateDigest = async (dateStr: string) => {
     setWorkflowStep(`正在生成 ${dateStr} 的日报...`);
+    importProgressHub.updateRunning(`正在生成 ${dateStr} 的日报...`, "refreshing");
     const res = await fetch(`/api/digests/generate?date=${dateStr}`, { method: "POST" });
     const body = (await res.json()) as { detail?: string };
     if (!res.ok) throw new Error(body.detail ?? "生成日报失败");
@@ -578,15 +612,41 @@ export default function IngestPage() {
     setConvertedCount(null);
     setConvertResult(null);
     setSelectedHandles([]);
+    setIncludeAllHandles(true);
+    setConvertedRowsForConfirm(null);
+    setAwaitingImportConfirm(false);
   };
 
   const syncSelectedHandles = (handles: string[]) => {
-    if (handles.length === 0) return;
-    setSelectedHandles((prev) => {
-      if (prev.length === 0) return handles;
-      const kept = prev.filter((item) => handles.includes(item));
-      return kept.length > 0 ? kept : handles;
+    if (handles.length === 0) {
+      setSelectedHandles([]);
+      return;
+    }
+    setSelectedHandles(Array.from(new Set(handles.map((item) => item.trim().toLowerCase()).filter(Boolean))));
+  };
+
+  const summarizeHandlesFromRows = (rows: XImportItem[]): HandlePick[] => {
+    const map = new Map<string, number>();
+    rows.forEach((item) => {
+      const key = (item.resolved_author_handle || item.author_handle || "").trim().toLowerCase();
+      if (!key) return;
+      map.set(key, (map.get(key) ?? 0) + 1);
     });
+    return Array.from(map.entries())
+      .map(([author_handle, count]) => ({ author_handle, count, will_create_kol: false }))
+      .sort((a, b) => b.count - a.count || a.author_handle.localeCompare(b.author_handle));
+  };
+
+  const getCurrentHandlePicks = (): HandlePick[] => {
+    if (!convertResult) return [];
+    if (convertResult.handles_summary.length > 0) {
+      return convertResult.handles_summary.map((item) => ({
+        author_handle: item.author_handle.trim().toLowerCase(),
+        count: item.count,
+        will_create_kol: item.will_create_kol,
+      }));
+    }
+    return summarizeHandlesFromRows(convertResult.items);
   };
 
   const onDropFile = (event: DragEvent<HTMLDivElement>) => {
@@ -616,14 +676,20 @@ export default function IngestPage() {
       return;
     }
     setWorkflowBusy(true);
+    importProgressHub.begin("正在转换文件...");
     setWorkflowError(null);
     setWorkflowRequestId(null);
     setWorkflowStep("正在读取文件...");
     setConvertResult(null);
+    setImportStats(null);
+    setExtractStats(null);
+    setProgress(null);
+    setConvertedRowsForConfirm(null);
+    setAwaitingImportConfirm(false);
+    setIncludeAllHandles(true);
     setExtractByHandle({});
     try {
       let rows: XImportItem[] = [];
-      let detectedHandles: string[] = [];
       let convertedRowsTotal = 0;
       const maybeJson = file.name.toLowerCase().endsWith(".json");
       if (maybeJson) {
@@ -632,6 +698,7 @@ export default function IngestPage() {
           const parsed = JSON.parse(text) as unknown;
           if (isStandardImportJson(parsed)) {
             setWorkflowStep("检测到标准 x_import.json，直接导入...");
+            importProgressHub.updateRunning("检测到标准 x_import.json，正在准备导入...", "converting");
             rows = applyOverridesForStandardRows(parsed);
             setConvertResult({
               converted_rows: parsed.length,
@@ -639,63 +706,85 @@ export default function IngestPage() {
               converted_failed: parsed.length - rows.length,
               errors: [],
               items: rows,
-              handles_summary: [],
+              handles_summary: summarizeHandlesFromRows(rows),
               resolved_author_handle: null,
               resolved_kol_id: null,
               kol_created: false,
               skipped_not_followed_count: 0,
               skipped_not_followed_samples: [],
             });
-            detectedHandles = Array.from(
-              new Set(rows.map((item) => (item.author_handle || "").trim().toLowerCase()).filter(Boolean)),
-            );
             convertedRowsTotal = parsed.length;
           } else {
             setWorkflowStep("检测到原始导出 JSON，正在转换...");
+            importProgressHub.updateRunning("检测到原始导出 JSON，正在转换...", "converting");
             const converted = await convertViaApi(file);
             setConvertResult(converted);
-            detectedHandles = converted.handles_summary.map((item) => item.author_handle);
-            syncSelectedHandles(detectedHandles);
             rows = converted.items;
             convertedRowsTotal = converted.converted_rows;
           }
         } catch {
           setWorkflowStep("浏览器解析 JSON 失败，改用后端转换...");
+          importProgressHub.updateRunning("浏览器解析 JSON 失败，改用后端转换...", "converting");
           const converted = await convertViaApi(file);
           setConvertResult(converted);
-          detectedHandles = converted.handles_summary.map((item) => item.author_handle);
-          syncSelectedHandles(detectedHandles);
           rows = converted.items;
           convertedRowsTotal = converted.converted_rows;
         }
       } else {
         setWorkflowStep("正在通过后端转换上传文件...");
+        importProgressHub.updateRunning("正在通过后端转换上传文件...", "converting");
         const converted = await convertViaApi(file);
         setConvertResult(converted);
-        detectedHandles = converted.handles_summary.map((item) => item.author_handle);
-        syncSelectedHandles(detectedHandles);
         rows = converted.items;
         convertedRowsTotal = converted.converted_rows;
       }
 
-      const activeHandleSet = new Set(
-        (selectedHandles.length > 0 ? selectedHandles : detectedHandles).map((item) => item.trim().toLowerCase()),
+      const handles = Array.from(
+        new Set(rows.map((item) => (item.resolved_author_handle || item.author_handle || "").trim().toLowerCase()).filter(Boolean)),
       );
-      if (activeHandleSet && activeHandleSet.size > 0) {
-        rows = rows.filter((item) =>
-          activeHandleSet.has((item.resolved_author_handle || item.author_handle).trim().toLowerCase()),
-        );
-      }
-
+      syncSelectedHandles(handles);
+      setConvertedRowsForConfirm(rows);
       setConvertedCount(convertedRowsTotal || rows.length);
-      if (rows.length === 0) throw new Error("转换或筛选后无可导入数据。");
+      if (rows.length === 0) throw new Error("转换后无可导入数据。");
+      setAwaitingImportConfirm(true);
+      setWorkflowStep("转换完成。请确认账号选择后点击“确认并导入”。");
+      importProgressHub.markPendingConfirm("转换完成，等待你确认并导入。");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "流程执行失败";
+      setWorkflowError(message);
+      setWorkflowStep(null);
+      importProgressHub.markError(message);
+    } finally {
+      setWorkflowBusy(false);
+    }
+  };
+
+  const handleConfirmImport = async () => {
+    if (workflowBusy) return;
+    if (!convertedRowsForConfirm || convertedRowsForConfirm.length === 0) {
+      setWorkflowError("请先执行转换。");
+      return;
+    }
+    setWorkflowBusy(true);
+    setWorkflowError(null);
+    setWorkflowRequestId(null);
+    importProgressHub.updateRunning("确认完成，准备导入数据...", "importing");
+    try {
+      let rows = convertedRowsForConfirm;
+      if (!includeAllHandles) {
+        const activeHandleSet = new Set(selectedHandles.map((item) => item.trim().toLowerCase()).filter(Boolean));
+        rows = rows.filter((item) => activeHandleSet.has((item.resolved_author_handle || item.author_handle).trim().toLowerCase()));
+      }
+      if (rows.length === 0) throw new Error("当前勾选账号下无可导入数据。");
 
       setWorkflowStep("正在导入到 raw_posts...");
+      importProgressHub.updateRunning("正在导入到 raw_posts...", "importing");
       const imported = await importRows(rows);
       setImportStats(imported);
 
       if (autoExtract && Object.keys(imported.imported_by_handle).length > 0) {
         setWorkflowStep("正在为 pending/failed/no_extraction 贴文续跑抽取...");
+        importProgressHub.updateRunning("正在上传到AI模型处理...", "extracting");
         const totals: ExtractBatchStats = {
           requested_count: 0,
           success_count: 0,
@@ -715,13 +804,23 @@ export default function IngestPage() {
           resumed_failed: 0,
           resumed_skipped: 0,
         };
-        const allIds = Array.from(
-          new Set(
-            Object.values(imported.imported_by_handle).flatMap((byHandle) => byHandle.raw_post_ids ?? []),
-          ),
-        );
+        const allIds = Array.from(new Set(Object.values(imported.imported_by_handle).flatMap((byHandle) => byHandle.raw_post_ids ?? [])));
         if (allIds.length > 0) {
-          const extracted = await runExtractJob(allIds, extractBatchSize, "pending_or_failed", allIds.length);
+          const extracted = await runExtractJob(allIds, extractBatchSize, "pending_or_failed", allIds.length, {
+            onJobCreated: (jobId) => importProgressHub.attachExtractJob(jobId),
+            onJobProgress: (job) => {
+              importProgressHub.applyExtractStats({
+                requested: job.requested_count,
+                success: job.success_count,
+                failed: job.failed_count,
+                skipped: job.skipped_count,
+              });
+              importProgressHub.updateRunning(
+                `AI处理中：成功=${job.success_count}，失败=${job.failed_count}，完成=${job.success_count + job.failed_count + job.skipped_count}/${job.requested_count}`,
+                "extracting",
+              );
+            },
+          });
           totals.requested_count = extracted.requested_count;
           totals.success_count = extracted.success_count;
           totals.skipped_count = extracted.skipped_count;
@@ -742,19 +841,30 @@ export default function IngestPage() {
         }
         setExtractByHandle({});
         setExtractStats(totals);
+        importProgressHub.applyExtractStats({
+          requested: totals.requested_count,
+          success: totals.success_count,
+          failed: totals.failed_count,
+          skipped: totals.skipped_count,
+        });
       }
 
       setWorkflowStep("正在刷新进度...");
+      importProgressHub.updateRunning("正在刷新进度...", "refreshing");
       await refreshProgress();
       if (autoExtract) {
         await new Promise((resolve) => window.setTimeout(resolve, 300));
         await refreshProgress();
       }
       if (autoGenerateDigest) await generateDigest(digestDate);
+      setAwaitingImportConfirm(false);
       setWorkflowStep("已完成。");
+      importProgressHub.markSuccess("导入与AI处理已完成。");
     } catch (err) {
-      setWorkflowError(err instanceof Error ? err.message : "流程执行失败");
+      const message = err instanceof Error ? err.message : "流程执行失败";
+      setWorkflowError(message);
       setWorkflowStep(null);
+      importProgressHub.markError(message);
     } finally {
       setWorkflowBusy(false);
     }
@@ -810,27 +920,39 @@ export default function IngestPage() {
         </p>
 
         <div style={{ display: "grid", gap: "8px", maxWidth: "700px" }}>
-          {convertResult && convertResult.handles_summary.length > 1 && (
+          {awaitingImportConfirm && (
             <div style={{ border: "1px solid #eee", borderRadius: "8px", padding: "8px", display: "grid", gap: "6px" }}>
-              <strong>导入全部账号（默认）</strong>
-              {convertResult.handles_summary.map((item) => {
-                const checked = selectedHandles.includes(item.author_handle);
-                return (
-                  <label key={item.author_handle} style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={(event) => {
-                        setSelectedHandles((prev) => {
-                          if (event.target.checked) return Array.from(new Set([...prev, item.author_handle]));
-                          return prev.filter((handle) => handle !== item.author_handle);
-                        });
-                      }}
-                    />
-                    @{item.author_handle} 数量={item.count} {item.will_create_kol ? "（将自动创建 KOL）" : ""}
-                  </label>
-                );
-              })}
+              <strong>导入账号确认</strong>
+              <label style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={includeAllHandles}
+                  onChange={(event) => setIncludeAllHandles(event.target.checked)}
+                />
+                导入全部账号（默认）
+              </label>
+              {!includeAllHandles && (
+                <div style={{ display: "grid", gap: "6px" }}>
+                  {getCurrentHandlePicks().map((item) => {
+                    const checked = selectedHandles.includes(item.author_handle);
+                    return (
+                      <label key={item.author_handle} style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) => {
+                            setSelectedHandles((prev) => {
+                              if (event.target.checked) return Array.from(new Set([...prev, item.author_handle]));
+                              return prev.filter((handle) => handle !== item.author_handle);
+                            });
+                          }}
+                        />
+                        @{item.author_handle} 数量={item.count} {item.will_create_kol ? "（将自动创建 KOL）" : ""}
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -903,7 +1025,14 @@ export default function IngestPage() {
 
         <div style={{ marginTop: "10px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
           <button type="button" onClick={() => void handleImportWorkflow()} disabled={workflowBusy}>
-            {workflowBusy ? "执行中..." : "转换并导入"}
+            {workflowBusy ? "执行中..." : "转换并准备导入"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleConfirmImport()}
+            disabled={workflowBusy || !awaitingImportConfirm}
+          >
+            {workflowBusy ? "执行中..." : "确认并导入"}
           </button>
           <button type="button" onClick={() => void refreshProgress()} disabled={workflowBusy}>
             刷新进度
@@ -918,13 +1047,16 @@ export default function IngestPage() {
         {workflowError && <p style={{ color: "crimson", marginBottom: 0 }}>{workflowError}</p>}
         {workflowRequestId && <p style={{ color: "#666", marginTop: "4px", marginBottom: 0 }}>请求 ID：{workflowRequestId}</p>}
 
-        {convertedCount !== null && <p style={{ marginBottom: 0 }}>转换行数={convertedCount}</p>}
-        {convertResult && (
+        {convertedCount !== null && <p style={{ marginBottom: 0 }}>文件数据总数={convertedCount}</p>}
+        {convertResult && <p style={{ margin: 0 }}>未关注排除（转换阶段）={convertResult.skipped_not_followed_count}</p>}
+        {importStats && <p style={{ margin: 0 }}>导入接收={importStats.received_count}, 导入成功={importStats.inserted_raw_posts_count}</p>}
+        {importStats && <p style={{ margin: 0 }}>去重排除={importStats.dedup_skipped_count}, 未关注排除（导入阶段）={importStats.skipped_not_followed_count}</p>}
+        {extractStats && (
           <p style={{ margin: 0 }}>
-            转换成功={convertResult.converted_ok}, 转换失败={convertResult.converted_failed},
-            非关注跳过={convertResult.skipped_not_followed_count}
+            上传到AI模型={extractStats.success_count + extractStats.failed_count}, AI处理成功={extractStats.success_count}
           </p>
         )}
+        {extractStats && <p style={{ margin: 0 }}>AI处理失败={extractStats.failed_count}</p>}
         {convertResult && convertResult.skipped_not_followed_samples.length > 0 && (
           <details>
             <summary>
@@ -941,17 +1073,18 @@ export default function IngestPage() {
             </ul>
           </details>
         )}
-        {convertResult && convertResult.handles_summary.length > 0 && (
-          <div>
+        {convertResult && getCurrentHandlePicks().length > 0 && (
+          <details>
+            <summary>账号汇总（默认折叠）</summary>
             <strong>账号汇总</strong>
             <ul>
-              {convertResult.handles_summary.map((item) => (
+              {getCurrentHandlePicks().map((item) => (
                 <li key={item.author_handle}>
                   @{item.author_handle}: 数量={item.count}, 将创建KOL={item.will_create_kol ? "是" : "否"}
                 </li>
               ))}
             </ul>
-          </div>
+          </details>
         )}
         {convertResult && convertResult.resolved_author_handle && (
           <p style={{ margin: 0 }}>
@@ -990,52 +1123,20 @@ export default function IngestPage() {
             </button>
           </details>
         )}
-        {importStats && (
-          <div style={{ marginBottom: 0 }}>
-            <p style={{ margin: 0 }}>
-              导入行数={importStats.inserted_raw_posts_count}, 去重跳过={importStats.dedup_skipped_count},
-              已存在ID={importStats.dedup_existing_raw_post_ids.length}, 警告数={importStats.warnings_count}
-            </p>
-            <p style={{ margin: 0 }}>
-              导入触发抽取：成功={importStats.extract_success_count}, 失败={importStats.extract_failed_count},
-              已抽取跳过={importStats.skipped_already_extracted_count}, 非关注跳过=
-              {importStats.skipped_not_followed_count}
-            </p>
-            {(importStats.resolved_author_handle || importStats.resolved_kol_id) && (
-              <p style={{ margin: 0 }}>
-                解析账号={importStats.resolved_author_handle ?? "-"}, 解析 KOL ID=
-                {importStats.resolved_kol_id ?? "-"}, 是否创建KOL={importStats.kol_created ? "是" : "否"}
-              </p>
-            )}
-            {Object.keys(importStats.imported_by_handle).length > 0 && (
-              <div>
-                <strong>按账号导入统计</strong>
-                <ul>
-                  {Object.entries(importStats.imported_by_handle).map(([handle, stats]) => (
-                    <li key={handle}>
-                      @{handle}: 接收={stats.received}, 插入={stats.inserted}, 去重={stats.dedup}, 警告=
-                      {stats.warnings}
-                      {extractByHandle[handle]
-                        ? `, 抽取成功=${extractByHandle[handle].success_count}, 续跑成功=${extractByHandle[handle].resumed_success}, 跳过=${extractByHandle[handle].resumed_skipped}`
-                        : ""}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {importStats.created_kols.length > 0 && (
-              <div>
-                <strong>新建 KOL</strong>
-                <ul>
-                  {importStats.created_kols.map((item) => (
-                    <li key={item.id}>
-                      #{item.id} @{item.handle} {item.name ?? ""}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
+        {importStats && Object.keys(importStats.imported_by_handle).length > 0 && (
+          <details>
+            <summary>按账号导入统计（默认折叠）</summary>
+            <ul>
+              {Object.entries(importStats.imported_by_handle).map(([handle, stats]) => (
+                <li key={handle}>
+                  @{handle}: 接收={stats.received}, 插入={stats.inserted}, 去重={stats.dedup}, 警告={stats.warnings}
+                  {extractByHandle[handle]
+                    ? `, 抽取成功=${extractByHandle[handle].success_count}, 续跑成功=${extractByHandle[handle].resumed_success}, 跳过=${extractByHandle[handle].resumed_skipped}`
+                    : ""}
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
         {importStats && importStats.skipped_not_followed_samples.length > 0 && (
           <details>
@@ -1053,40 +1154,17 @@ export default function IngestPage() {
             </ul>
           </details>
         )}
-        {extractStats && (
-          <div style={{ marginBottom: 0 }}>
-            <p style={{ margin: 0 }}>
-              抽取成功={extractStats.success_count}, 请求数={extractStats.requested_count}, 抽取失败=
-              {extractStats.failed_count}, 抽取跳过={extractStats.skipped_count}, 已抽取跳过=
-              {extractStats.skipped_already_extracted_count}
-            </p>
-            <p style={{ margin: 0 }}>
-              已待处理跳过={extractStats.skipped_already_pending_count}, 已成功跳过=
-              {extractStats.skipped_already_success_count}
-            </p>
-            <p style={{ margin: 0 }}>
-              已有结果跳过={extractStats.skipped_already_has_result_count}, 自动拒绝=
-              {extractStats.auto_rejected_count}
-            </p>
-            <p style={{ margin: 0 }}>
-              已拒绝跳过={extractStats.skipped_already_rejected_count}, 已通过跳过=
-              {extractStats.skipped_already_approved_count}, 导入上限跳过=
-              {extractStats.skipped_due_to_import_limit_count}, 非关注跳过={extractStats.skipped_not_followed_count}
-            </p>
-            <p style={{ margin: 0 }}>
-              续跑请求={extractStats.resumed_requested_count}, 续跑成功={extractStats.resumed_success},
-              续跑失败={extractStats.resumed_failed}, 续跑跳过={extractStats.resumed_skipped}
-            </p>
-          </div>
-        )}
-        {!workflowBusy && extractStats && (
-          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <Link href="/extractions?status=pending">打开待审核列表</Link>
-            <button type="button" onClick={() => void refreshProgress()}>
-              刷新进度
-            </button>
-            <Link href={`/extractions?status=pending&t=${Date.now()}`}>刷新审核页</Link>
-          </div>
+        {importStats && importStats.created_kols.length > 0 && (
+          <details>
+            <summary>新建 KOL（默认折叠）</summary>
+            <ul>
+              {importStats.created_kols.map((item) => (
+                <li key={item.id}>
+                  #{item.id} @{item.handle} {item.name ?? ""}
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
         {importStats && importStats.warnings.length > 0 && (
           <div>
@@ -1100,8 +1178,9 @@ export default function IngestPage() {
         )}
         {progress && (
           <p style={{ marginBottom: 0 }}>
-            进度[{progress.scope}] 总数={progress.total_raw_posts}, 成功={progress.extracted_success_count},
-            待处理={progress.pending_count}, 失败={progress.failed_count}, 无抽取={progress.no_extraction_count}
+            进度[{progress.scope}] AI处理成功={Math.max(0, progress.total_raw_posts - progress.pending_count)}, 已通过=
+            {progress.extracted_success_count}, 待处理={progress.pending_count}, 已拒绝={progress.failed_count}, 已入库=
+            {progress.no_extraction_count}
           </p>
         )}
       <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px", maxWidth: "900px" }}>

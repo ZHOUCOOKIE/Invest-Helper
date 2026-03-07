@@ -58,17 +58,58 @@ curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_
 
 ## Generate And Replay Digest
 ```bash
-# generate (overwrite same profile_id + date)
-curl -s -X POST "http://localhost:8000/digests/generate?date=2026-03-06&profile_id=1" | jq
+# generate (overwrite same profile_id + date; current API writes profile_id=1)
+curl -s -X POST "http://localhost:8000/digests/generate?date=2026-03-06" | jq
 
-# replay by date/profile
-curl -s "http://localhost:8000/digests?date=2026-03-06&profile_id=1" | jq
+# replay by date (current API reads profile_id=1)
+curl -s "http://localhost:8000/digests?date=2026-03-06" | jq
 
 # list replayable dates
-curl -s "http://localhost:8000/digests/dates?profile_id=1" | jq
+curl -s "http://localhost:8000/digests/dates" | jq
 
 # replay by digest id
 curl -s "http://localhost:8000/digests/1" | jq
+```
+
+## Generate And Replay Weekly Digest
+```bash
+# generate weekly digest (kind: recent_week|this_week|last_week)
+curl -s -X POST "http://localhost:8000/weekly-digests/generate?kind=recent_week&date=2026-03-06" | jq
+
+# replay by kind + anchor_date
+curl -s "http://localhost:8000/weekly-digests?kind=recent_week&anchor_date=2026-03-06" | jq
+
+# list replayable anchor dates by kind
+curl -s "http://localhost:8000/weekly-digests/dates?kind=recent_week" | jq
+```
+
+## Portfolio Advice
+```bash
+curl -s -X POST "http://localhost:8000/portfolio/advice" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_goal": "控制回撤并优化调仓节奏",
+    "holdings": [
+      {
+        "asset_id": 101,
+        "symbol": "BTC",
+        "holding_reason_text": "中长期看好资金持续流入",
+        "sell_timing_text": "若结构破位且风险证据增多则分批减仓",
+        "support_citations": [
+          {
+            "source_url": "https://x.com/example/post/1",
+            "summary": "机构配置倾向增强"
+          }
+        ],
+        "risk_citations": [
+          {
+            "source_url": "https://x.com/example/post/2",
+            "summary": "短线波动率放大"
+          }
+        ]
+      }
+    ]
+  }' | jq
 ```
 
 ## Full Validation

@@ -3,7 +3,7 @@
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
 InvestPulse is an evidence-traceable investment signal dashboard built from multi-source posts.  
-It extracts structured signals, supports review workflows, and provides Daily Digest generation/replay by `profile_id + digest_date`.
+It extracts structured signals, supports review workflows, and provides Daily Digest generation/replay by `digest_date` (current API uses system profile `id=1`).
 
 ## UI Preview
 
@@ -27,21 +27,23 @@ It extracts structured signals, supports review workflows, and provides Daily Di
   - `hasview=0` => auto reject
   - `hasview=1` + valid confidence path => threshold review (`80`)
 - Traceability chain across `raw_posts -> post_extractions -> kol_views -> daily_digests`.
-- Replay-ready digests stored by `profile_id + digest_date`.
+- Replay-ready digests stored by unique `profile_id + digest_date` rows (current write path uses profile `id=1`).
 
 ## Product Surfaces
 
 - API: FastAPI + SQLAlchemy + Alembic
-- Web: Next.js dashboard/review/profile/digest pages
+- Web: Next.js dashboard/review/kols/digest/weekly-digest/portfolio pages
 - Storage: PostgreSQL (dev + test), Redis
 
 Main routes:
 - `/dashboard`
+- `/portfolio`
 - `/ingest`
 - `/extractions`
 - `/assets`
 - `/kols`
 - `/digests/[date]`
+- `/weekly-digests`
 - `/health`
 
 ## Quick Start
@@ -89,7 +91,7 @@ X/Source Posts
    -> post_extractions
    -> review/auto-review
    -> kol_views
-   -> daily_digests (profile_id + digest_date)
+   -> daily_digests (unique profile_id + digest_date, current API writes profile_id=1)
    -> dashboard / digest replay
 ```
 

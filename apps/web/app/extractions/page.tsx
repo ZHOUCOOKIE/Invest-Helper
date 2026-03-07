@@ -387,8 +387,9 @@ export default function ExtractionsPage() {
       {error && <p style={{ color: "crimson" }}>{error}</p>}
       {progress && (
         <p style={{ color: "#555" }}>
-          进度[{progress.scope}] 总数={progress.total_raw_posts}, 成功={progress.extracted_success_count}, 待处理=
-          {progress.pending_count}, 失败={progress.failed_count}, 无抽取={progress.no_extraction_count}
+          进度[{progress.scope}] AI处理成功={Math.max(0, progress.total_raw_posts - progress.pending_count)}, 已通过=
+          {progress.extracted_success_count}, 待处理={progress.pending_count}, 已拒绝={progress.failed_count}, 已入库=
+          {progress.no_extraction_count}
         </p>
       )}
 

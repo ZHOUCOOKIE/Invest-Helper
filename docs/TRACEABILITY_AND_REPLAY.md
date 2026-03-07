@@ -4,7 +4,7 @@ Authoritative
 
 TL;DR
 - 所有输出都必须可回链证据。
-- Digest 当前以 `profile_id + digest_date` 单条覆盖存储。
+- Digest 当前以唯一 `profile_id + digest_date` 单条覆盖存储（当前 API 固定使用 `profile_id=1`）。
 - 回放操作命令以 `docs/RUNBOOK.md` 为准；本文定义语义与约束。
 
 ## Evidence Chain (Storage-Level)
@@ -25,14 +25,29 @@ TL;DR
 - 回放核心：`profile_id`, `digest_date`, `content`
 - `content` 关键字段：`post_summaries`, `ai_input_by_author`, `ai_analysis`, `metadata`
 
+5. `weekly_digests`
+- 回放核心：`profile_id`, `report_kind`, `anchor_date`, `content`
+- `content` 关键字段：`post_summaries`, `ai_input_by_day`, `ai_analysis`, `metadata`
+
+6. `portfolio/advice`（请求级）
+- 证据载体：`holdings[].support_citations[]` / `holdings[].risk_citations[]`
+- 证据关键字段：`source_url`, `summary`（可选 `extraction_id/author_handle/stance/horizon/confidence/as_of`）
+- 当前语义：请求即计算，不写入独立回放实体（Not Implemented: advice 历史版本化存储）
+
 ## Replay Semantics
 
 - 唯一键：`(profile_id, digest_date)`。
 - `POST /digests/generate` 对同一 `profile_id + digest_date` 覆盖重生成。
-- `POST /digests/generate` 当前有效参数：`date`、`profile_id`、`to_ts`。
-- `GET /digests` 读取该日该 profile 的单条日报（参数：`date`、`profile_id`）。
+- `POST /digests/generate` 当前有效参数：`date`、`to_ts`（`profile_id` 当前未暴露，固定为 `1`）。
+- `GET /digests` 读取该日系统 profile 的单条日报（参数：`date`）。
 - `GET /digests/{digest_id}` 支持按主键直接回放。
-- `GET /digests/dates?profile_id=...` 返回可回放日期集合。
+- `GET /digests/dates` 返回系统 profile 可回放日期集合。
+- 日报保留窗口固定为近 `3` 天（今天及往前 `2` 天）；超出窗口数据会在读/列出路径自动清理。
+- `daily_digests.version` 当前写入路径固定为 `1`，不做多版本累积。
+- 周报回放：
+  - `POST /weekly-digests/generate` 按 `(profile_id, report_kind, anchor_date)` 覆盖重生成。
+  - `GET /weekly-digests` 按 `kind + anchor_date` 回放。
+  - `GET /weekly-digests/dates` 返回对应 `kind` 的可回放锚点日期集合。
 
 ## Time-Field Policy
 

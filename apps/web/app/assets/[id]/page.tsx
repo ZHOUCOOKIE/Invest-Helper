@@ -94,8 +94,9 @@ function sortViewsByTimeThenHorizon(items: KolView[]): KolView[] {
   });
 }
 
-const FEED_PAGE_SIZE = 10;
+const FEED_PAGE_SIZE = 50;
 const FEED_MAX_FETCH_ROUNDS = 200;
+const FEED_DISPLAY_STEP = 50;
 
 function getHorizonLabel(horizon: string): string {
   const labels: Record<string, string> = {
@@ -134,7 +135,7 @@ export default function AssetDetailPage() {
   const [feedLoading, setFeedLoading] = useState(false);
   const [feedError, setFeedError] = useState<string | null>(null);
   const [feedHorizon, setFeedHorizon] = useState<"all" | "intraday" | "1w" | "1m" | "3m" | "1y">("all");
-  const [feedOffset, setFeedOffset] = useState(0);
+  const [feedVisibleCount, setFeedVisibleCount] = useState(FEED_DISPLAY_STEP);
   const [timeline, setTimeline] = useState<AssetViewsTimelineResponse | null>(null);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
@@ -144,56 +145,40 @@ export default function AssetDetailPage() {
   const [selectedViewError, setSelectedViewError] = useState<string | null>(null);
   const [assetDisplayName, setAssetDisplayName] = useState<string | null>(null);
 
-  const loadFeed = useCallback(async (nextOffset: number, nextHorizon: typeof feedHorizon) => {
+  const loadFeed = useCallback(async (nextHorizon: typeof feedHorizon) => {
     setFeedLoading(true);
     setFeedError(null);
     try {
-      if (nextHorizon === "all" && nextOffset === 0) {
-        const mergedItems: KolView[] = [];
-        let currentOffset = 0;
-        let rounds = 0;
-        let finalPayload: AssetViewsFeedResponse | null = null;
-        while (rounds < FEED_MAX_FETCH_ROUNDS) {
-          rounds += 1;
-          const res = await fetch(
-            `/api/assets/${assetId}/views/feed?limit=${FEED_PAGE_SIZE}&offset=${currentOffset}`,
-            { cache: "no-store" },
-          );
-          const body = (await res.json()) as AssetViewsFeedResponse | { detail?: string };
-          if (!res.ok) {
-            throw new Error("detail" in body ? (body.detail ?? "Load feed failed") : "Load feed failed");
-          }
-          const payload = body as AssetViewsFeedResponse;
-          mergedItems.push(...payload.items);
-          finalPayload = payload;
-          if (!payload.has_more) {
-            break;
-          }
-          currentOffset += payload.limit;
-        }
-        setFeed({
-          asset_id: assetId,
-          horizon: null,
-          total: finalPayload?.total ?? mergedItems.length,
-          limit: FEED_PAGE_SIZE,
-          offset: 0,
-          has_more: false,
-          items: mergedItems,
-        });
-        return;
-      }
-
+      const mergedItems: KolView[] = [];
       const horizonParam = nextHorizon === "all" ? "" : `&horizon=${nextHorizon}`;
-      const res = await fetch(
-        `/api/assets/${assetId}/views/feed?limit=${FEED_PAGE_SIZE}&offset=${nextOffset}${horizonParam}`,
-        { cache: "no-store" },
-      );
-      const body = (await res.json()) as AssetViewsFeedResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "Load feed failed") : "Load feed failed");
+      let currentOffset = 0;
+      let rounds = 0;
+      let finalPayload: AssetViewsFeedResponse | null = null;
+      while (rounds < FEED_MAX_FETCH_ROUNDS) {
+        rounds += 1;
+        const res = await fetch(
+          `/api/assets/${assetId}/views/feed?limit=${FEED_PAGE_SIZE}&offset=${currentOffset}${horizonParam}`,
+          { cache: "no-store" },
+        );
+        const body = (await res.json()) as AssetViewsFeedResponse | { detail?: string };
+        if (!res.ok) {
+          throw new Error("detail" in body ? (body.detail ?? "Load feed failed") : "Load feed failed");
+        }
+        const payload = body as AssetViewsFeedResponse;
+        mergedItems.push(...payload.items);
+        finalPayload = payload;
+        if (!payload.has_more) break;
+        currentOffset += payload.limit;
       }
-      const payload = body as AssetViewsFeedResponse;
-      setFeed((prev) => (nextOffset === 0 || !prev ? payload : { ...payload, items: [...prev.items, ...payload.items] }));
+      setFeed({
+        asset_id: assetId,
+        horizon: finalPayload?.horizon ?? (nextHorizon === "all" ? null : nextHorizon),
+        total: finalPayload?.total ?? mergedItems.length,
+        limit: FEED_PAGE_SIZE,
+        offset: 0,
+        has_more: false,
+        items: mergedItems,
+      });
     } catch (err) {
       setFeedError(err instanceof Error ? err.message : "Load feed failed");
     } finally {
@@ -219,8 +204,8 @@ export default function AssetDetailPage() {
   }, [assetId]);
 
   const refreshFeed = useCallback(async () => {
-    setFeedOffset(0);
-    await loadFeed(0, feedHorizon);
+    setFeedVisibleCount(FEED_DISPLAY_STEP);
+    await loadFeed(feedHorizon);
   }, [feedHorizon, loadFeed]);
 
   const openViewDetail = useCallback(async (view: KolView) => {
@@ -297,8 +282,11 @@ export default function AssetDetailPage() {
 
   useEffect(() => {
     if (Number.isNaN(assetId)) return;
-    void loadFeed(feedOffset, feedHorizon);
-  }, [assetId, feedOffset, feedHorizon, loadFeed]);
+    void loadFeed(feedHorizon);
+  }, [assetId, feedHorizon, loadFeed]);
+
+  const sortedFeedItems = useMemo(() => sortViewsByTimeThenHorizon(feed?.items ?? []), [feed?.items]);
+  const visibleFeedItems = useMemo(() => sortedFeedItems.slice(0, feedVisibleCount), [sortedFeedItems, feedVisibleCount]);
 
   useEffect(() => {
     if (Number.isNaN(assetId)) return;
@@ -326,7 +314,7 @@ export default function AssetDetailPage() {
                   value={feedHorizon}
                   onChange={(event) => {
                     setFeedHorizon(event.target.value as typeof feedHorizon);
-                    setFeedOffset(0);
+                    setFeedVisibleCount(FEED_DISPLAY_STEP);
                   }}
                   style={{ marginLeft: "8px" }}
                 >
@@ -344,10 +332,10 @@ export default function AssetDetailPage() {
               <small style={{ color: "#666" }}>总数: {feed?.total ?? 0}</small>
             </div>
             {feedError && <p style={{ color: "crimson" }}>{feedError}</p>}
-            {!feedLoading && !feedError && feed && feed.items.length === 0 && <p>暂无观点。</p>}
-            {feed && feed.items.length > 0 && (
+            {!feedLoading && !feedError && feed && sortedFeedItems.length === 0 && <p>暂无观点。</p>}
+            {feed && sortedFeedItems.length > 0 && (
               <div style={{ display: "grid", gap: "8px", marginTop: "10px" }}>
-                {sortViewsByTimeThenHorizon(feed.items).map((view) => {
+                {visibleFeedItems.map((view) => {
                   const badge = stanceStyle[view.stance] ?? stanceStyle.neutral;
                   return (
                     <article key={`feed-${view.id}`} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
@@ -390,14 +378,14 @@ export default function AssetDetailPage() {
                     </article>
                   );
                 })}
-                {feedHorizon !== "all" && (
+                {sortedFeedItems.length > feedVisibleCount && (
                   <div>
                     <button
                       type="button"
-                      onClick={() => setFeedOffset((prev) => prev + FEED_PAGE_SIZE)}
-                      disabled={!feed.has_more || feedLoading}
+                      onClick={() => setFeedVisibleCount((prev) => prev + FEED_DISPLAY_STEP)}
+                      disabled={feedLoading}
                     >
-                      加载更多
+                      继续展开（+50）
                     </button>
                   </div>
                 )}

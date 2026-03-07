@@ -57,10 +57,6 @@ type ParsedApiResponse<T> = {
   requestPath: string;
 };
 
-type AdminHardDeleteResponse = {
-  counts: Record<string, number>;
-};
-
 function formatDate(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -68,10 +64,10 @@ function formatDate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function getRecent7Days(): string[] {
+function getRecent3Days(): string[] {
   const today = new Date();
   const rows: string[] = [];
-  for (let i = 0; i < 7; i += 1) {
+  for (let i = 0; i < 3; i += 1) {
     const d = new Date(today);
     d.setDate(today.getDate() - i);
     rows.push(formatDate(d));
@@ -79,11 +75,31 @@ function getRecent7Days(): string[] {
   return rows;
 }
 
-function displayRawTime(value: string | null | undefined): string {
-  if (typeof value !== "string") return "-";
+function parseApiDateTime(value: string): Date | null {
   const trimmed = value.trim();
-  if (!trimmed) return "-";
-  return trimmed.replace(/\s?(?:Z|[+-]\d{2}:\d{2})$/i, "").trim();
+  if (!trimmed) return null;
+  if (!/^\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)?(?:Z|[+-]\d{2}:\d{2})?$/i.test(trimmed)) {
+    return null;
+  }
+  // Digest API timestamps are UTC; if offset is missing, coerce as UTC.
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(trimmed) ? trimmed : `${trimmed.replace(" ", "T")}Z`;
+  const dt = new Date(normalized);
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+
+function displayLocalTime(value: string | null | undefined): string {
+  if (typeof value !== "string") return "-";
+  const dt = parseApiDateTime(value);
+  if (!dt) return value.trim() || "-";
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(dt);
 }
 
 function isDailyDigest(value: unknown): value is DailyDigest {
@@ -150,15 +166,11 @@ export default function DailyDigestPage() {
   const [generating, setGenerating] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [cleanupDigestDate, setCleanupDigestDate] = useState("");
-  const [cleanupBusy, setCleanupBusy] = useState(false);
-  const [cleanupError, setCleanupError] = useState<string | null>(null);
-  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
 
-  const recent7Days = useMemo(() => getRecent7Days(), []);
+  const recent3Days = useMemo(() => getRecent3Days(), []);
   const displayDates = useMemo(() => {
-    return Array.from(new Set([...availableDates, ...recent7Days])).sort((a, b) => b.localeCompare(a));
-  }, [availableDates, recent7Days]);
+    return Array.from(new Set([...availableDates, ...recent3Days])).sort((a, b) => b.localeCompare(a));
+  }, [availableDates, recent3Days]);
 
   const loadDigestDates = useCallback(async () => {
     const res = await fetch("/api/digests/dates", { cache: "no-store" });
@@ -234,10 +246,6 @@ export default function DailyDigestPage() {
     void load();
   }, [load]);
 
-  useEffect(() => {
-    setCleanupDigestDate(digestDate ?? "");
-  }, [digestDate]);
-
   const generate = async () => {
     if (!digestDate) return;
     setGenerating(true);
@@ -264,40 +272,6 @@ export default function DailyDigestPage() {
       }
     } finally {
       setGenerating(false);
-    }
-  };
-
-  const askYes = (message: string): boolean => {
-    const confirmText = window.prompt(message, "");
-    return confirmText === "YES";
-  };
-
-  const deleteDigestByDateCleanup = async () => {
-    if (!cleanupDigestDate) {
-      setCleanupError("请选择 digest_date");
-      return;
-    }
-    if (!askYes("Dangerous operation: delete digest by date. Type YES to continue.")) return;
-    setCleanupBusy(true);
-    setCleanupError(null);
-    setCleanupMessage(null);
-    try {
-      const params = new URLSearchParams({
-        confirm: "YES",
-        digest_date: cleanupDigestDate,
-      });
-      const res = await fetch(`/api/admin/digests?${params.toString()}`, { method: "DELETE" });
-      const body = (await res.json()) as AdminHardDeleteResponse | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? (body.detail ?? "删除日报失败") : "删除日报失败");
-      }
-      const done = body as AdminHardDeleteResponse;
-      setCleanupMessage(`日报清理完成：${JSON.stringify(done.counts)}`);
-      await load();
-    } catch (err) {
-      setCleanupError(err instanceof Error ? err.message : "删除日报失败");
-    } finally {
-      setCleanupBusy(false);
     }
   };
 
@@ -346,10 +320,10 @@ export default function DailyDigestPage() {
               <strong>日期:</strong> {digest.digest_date}
             </div>
             <div>
-              <strong>生成时间:</strong> {displayRawTime(digest.generated_at)}
+              <strong>生成时间:</strong> {displayLocalTime(digest.generated_at)}
             </div>
             <small style={{ color: "#666" }}>
-              时间窗: {displayRawTime(digest.metadata.window_start)} ~ {displayRawTime(digest.metadata.window_end)} | 贴文数: {digest.metadata.source_post_count} | AI状态: {digest.metadata.ai_status}
+              时间窗: {displayLocalTime(digest.metadata.window_start)} ~ {displayLocalTime(digest.metadata.window_end)} | 贴文数: {digest.metadata.source_post_count} | AI状态: {digest.metadata.ai_status}
             </small>
             {digest.metadata.ai_error && <div style={{ color: "#a00" }}>AI错误: {digest.metadata.ai_error}</div>}
           </section>
@@ -389,7 +363,7 @@ export default function DailyDigestPage() {
                 {digest.post_summaries.map((item) => (
                   <article key={`${item.raw_post_id}-${item.extraction_id}`} style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }}>
                     <div>
-                      <strong>{displayRawTime(item.posted_at ?? item.business_ts)}</strong> {item.author_display_name || item.author_handle}
+                      <strong>{displayLocalTime(item.posted_at ?? item.business_ts)}</strong> {item.author_display_name || item.author_handle}
                     </div>
                     {item.title && <div>标题: {item.title}</div>}
                     <div style={{ marginTop: "4px" }}>{item.summary}</div>
@@ -410,24 +384,6 @@ export default function DailyDigestPage() {
         </>
       )}
 
-      <section style={{ border: "1px solid #eee", borderRadius: "8px", padding: "12px", maxWidth: "560px" }}>
-        <h2 style={{ marginTop: 0, marginBottom: "8px" }}>管理清理 - 按日期删除日报</h2>
-        <p style={{ marginTop: 0 }}>所有操作都需要输入 YES。</p>
-        <label>
-          日报日期
-          <input
-            type="date"
-            value={cleanupDigestDate}
-            onChange={(event) => setCleanupDigestDate(event.target.value)}
-            style={{ display: "block", width: "100%" }}
-          />
-        </label>
-        <button type="button" onClick={() => void deleteDigestByDateCleanup()} disabled={cleanupBusy} style={{ marginTop: "8px" }}>
-          {cleanupBusy ? "删除中..." : "按日期删除日报"}
-        </button>
-        {cleanupError && <p style={{ color: "crimson", marginBottom: 0 }}>{cleanupError}</p>}
-        {cleanupMessage && <p style={{ marginBottom: 0 }}>{cleanupMessage}</p>}
-      </section>
     </main>
   );
 }

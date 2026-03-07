@@ -193,6 +193,7 @@ export default function DashboardPage() {
           <button type="button" onClick={() => void load()} disabled={loading}>
             {loading ? "加载中..." : "刷新"}
           </button>
+          <Link href="/portfolio">当前持仓</Link>
           <Link href="/ingest">手动导入</Link>
           <Link href="/kols">KOL管理</Link>
           <Link href="/extractions">审核队列</Link>

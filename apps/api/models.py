@@ -254,6 +254,7 @@ class UserProfile(Base):
     )
     markets: Mapped[list["ProfileMarket"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
     digests: Mapped[list["DailyDigest"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
+    weekly_digests: Mapped[list["WeeklyDigest"]] = relationship(back_populates="profile", cascade="all, delete-orphan")
 
 
 class ProfileKolWeight(Base):
@@ -311,3 +312,24 @@ class DailyDigest(Base):
     )
 
     profile: Mapped["UserProfile"] = relationship(back_populates="digests")
+
+
+class WeeklyDigest(Base):
+    __tablename__ = "weekly_digests"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "report_kind", "anchor_date", name="uq_weekly_digests_profile_kind_anchor"),
+        Index("ix_weekly_digests_profile_kind_anchor", "profile_id", "report_kind", "anchor_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    report_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    anchor_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    profile: Mapped["UserProfile"] = relationship(back_populates="weekly_digests")

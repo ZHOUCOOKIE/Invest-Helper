@@ -833,6 +833,74 @@ class DailyDigestRead(BaseModel):
     metadata: DailyDigestMetadataRead
 
 
+WeeklyDigestKind = Literal["recent_week", "this_week", "last_week"]
+
+
+class WeeklyDigestDaySummaryInputRead(BaseModel):
+    date: date
+    post_count: int
+    summaries: list[dict[str, Any]]
+
+
+class WeeklyDigestRead(BaseModel):
+    id: int
+    profile_id: int = 1
+    report_kind: WeeklyDigestKind
+    anchor_date: date
+    generated_at: datetime
+    post_summaries: list[DailyDigestPostSummaryRead]
+    ai_input_by_day: list[WeeklyDigestDaySummaryInputRead]
+    ai_analysis: DailyDigestAIAnalysisRead
+    metadata: DailyDigestMetadataRead
+
+
+class PortfolioAdviceCitationItem(BaseModel):
+    extraction_id: int | None = None
+    source_url: str = Field(min_length=1, max_length=1024)
+    summary: str = Field(min_length=1, max_length=1024)
+    author_handle: str | None = Field(default=None, max_length=128)
+    stance: str | None = Field(default=None, max_length=32)
+    horizon: str | None = Field(default=None, max_length=32)
+    confidence: int | None = Field(default=None, ge=0, le=100)
+    as_of: str | None = Field(default=None, max_length=32)
+
+
+class PortfolioAdviceHoldingItemRequest(BaseModel):
+    asset_id: int = Field(ge=1)
+    symbol: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=255)
+    market: str | None = Field(default=None, max_length=32)
+    holding_reason_text: str | None = Field(default=None, max_length=4000)
+    sell_timing_text: str | None = Field(default=None, max_length=4000)
+    support_citations: list[PortfolioAdviceCitationItem] = Field(default_factory=list, max_length=100)
+    risk_citations: list[PortfolioAdviceCitationItem] = Field(default_factory=list, max_length=100)
+
+
+class PortfolioAdviceRequest(BaseModel):
+    holdings: list[PortfolioAdviceHoldingItemRequest] = Field(min_length=1, max_length=30)
+    user_goal: str | None = Field(default=None, max_length=1000)
+
+
+class PortfolioAdviceAssetRead(BaseModel):
+    asset_id: int
+    symbol: str
+    score: int | None = None
+    stance: str | None = None
+    suggestion: str
+    evaluation: str
+    key_risks: list[str] = Field(default_factory=list)
+    key_triggers: list[str] = Field(default_factory=list)
+
+
+class PortfolioAdviceResponse(BaseModel):
+    generated_at: datetime
+    model: str
+    status: str
+    advice_summary: str
+    asset_advice: list[PortfolioAdviceAssetRead] = Field(default_factory=list)
+    error: str | None = None
+
+
 class ProfileSummaryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

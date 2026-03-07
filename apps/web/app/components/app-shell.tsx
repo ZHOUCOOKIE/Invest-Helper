@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
+import { ImportProgressProvider } from "./import-progress-hub";
 
 type ThemeMode = "light" | "dark";
 
@@ -61,49 +62,53 @@ export function AppShell({
   const navItems = useMemo<NavItem[]>(
     () => [
       { label: "看板", href: "/dashboard", match: (path) => path.startsWith("/dashboard") },
+      { label: "当前持仓", href: "/portfolio", match: (path) => path.startsWith("/portfolio") },
       { label: "导入", href: "/ingest", match: (path) => path.startsWith("/ingest") },
       { label: "抽取审核", href: "/extractions", match: (path) => path.startsWith("/extractions") },
       { label: "资产", href: "/assets", match: (path) => path.startsWith("/assets") },
       { label: "KOL", href: "/kols", match: (path) => path.startsWith("/kols") },
       { label: "日报", href: `/digests/${todayDigestDate}`, match: (path) => path.startsWith("/digests") },
+      { label: "周报", href: "/weekly-digests", match: (path) => path.startsWith("/weekly-digests") },
       { label: "健康检查", href: "/health", match: (path) => path.startsWith("/health") },
     ],
     [todayDigestDate],
   );
 
   return (
-    <div className="app-shell">
-      <div
-        className={`mouse-glow ${glow.visible ? "visible" : ""}`}
-        style={{ transform: `translate(${glow.x - 160}px, ${glow.y - 160}px)` }}
-        aria-hidden="true"
-      />
-      <header className="top-tabs" aria-label="主导航">
-        <div className="brand">InvestPulse</div>
-        <nav className="top-tabs-nav">
-          {navItems.map((item) => {
-            const active = item.match(pathname);
-            return (
-              <Link key={item.label} href={item.href} className={`top-tab ${active ? "active" : ""}`}>
-                {item.label}
-              </Link>
-            );
-          })}
-        </nav>
-        <button
-          type="button"
-          className="theme-toggle"
-          onClick={() => {
-            const current: ThemeMode = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
-            const next = current === "light" ? "dark" : "light";
-            applyTheme(next);
-          }}
-          aria-label="切换主题"
-        >
-          主题
-        </button>
-      </header>
-      <div className="shell-content">{children}</div>
-    </div>
+    <ImportProgressProvider>
+      <div className="app-shell">
+        <div
+          className={`mouse-glow ${glow.visible ? "visible" : ""}`}
+          style={{ transform: `translate(${glow.x - 160}px, ${glow.y - 160}px)` }}
+          aria-hidden="true"
+        />
+        <header className="top-tabs" aria-label="主导航">
+          <div className="brand">InvestPulse</div>
+          <nav className="top-tabs-nav">
+            {navItems.map((item) => {
+              const active = item.match(pathname);
+              return (
+                <Link key={item.label} href={item.href} className={`top-tab ${active ? "active" : ""}`}>
+                  {item.label}
+                </Link>
+              );
+            })}
+          </nav>
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={() => {
+              const current: ThemeMode = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+              const next = current === "light" ? "dark" : "light";
+              applyTheme(next);
+            }}
+            aria-label="切换主题"
+          >
+            主题
+          </button>
+        </header>
+        <div className="shell-content">{children}</div>
+      </div>
+    </ImportProgressProvider>
   );
 }

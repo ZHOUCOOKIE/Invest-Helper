@@ -58,6 +58,13 @@ Canonical key order (read/write):
 - failure reason is written to `last_error` and/or `meta.parse_error(_reason)`
 - state classifier treats such `pending` record as failed semantics for progress/retry flows
 
+## Extractions List Ordering (Current)
+- `GET /extractions`
+  - list order is deterministic by business post start time desc:
+    - primary: `raw_post.posted_at`
+    - fallback: `post_extractions.created_at`
+  - tie-breaker: extraction `id` desc
+
 ## Backward Read Tolerance
 - read path tolerates old records and legacy fields without rewriting historical approval status
 - legacy `library_tags` is ignored on read
@@ -98,12 +105,15 @@ Canonical key order (read/write):
     - `recent_week`: `[date-6d, date]`
     - `this_week`: from latest Sunday to `date` (not necessarily full 7 days)
     - `last_week`: previous full Sunday-Saturday week
+    - before write, stale rows for same `(profile_id, report_kind)` whose `anchor_date` is not current expected anchor are purged
     - overwrite by unique key `(profile_id, report_kind, anchor_date)` with `version=1`
 - `GET /weekly-digests`
   - required query: `kind`, `anchor_date`
+  - request path auto-purges stale rows for the same `report_kind` before lookup
   - returns replay digest for fixed system profile (`profile_id=1`)
 - `GET /weekly-digests/dates`
   - required query: `kind`
+  - request path auto-purges stale rows for the same `report_kind` before listing
   - returns replayable anchor dates (desc) for fixed system profile (`profile_id=1`)
 
 ## Portfolio Advice API (Current)

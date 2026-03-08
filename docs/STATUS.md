@@ -47,10 +47,17 @@
   - `this_week` starts at latest Sunday; `last_week` is previous full Sunday-Saturday
   - weekly AI prompt pipeline is independent from daily digest
   - weekly AI input aggregation is by day (`ai_input_by_day`)
+  - generate/read/list paths auto-purge stale rows whose `anchor_date` is not the expected current anchor for that `report_kind`
+- Extractions listing:
+  - `/extractions` response order is by business post time desc (`raw_post.posted_at`, fallback `extraction.created_at`), then by `id` desc
 - Portfolio holdings advice:
   - added `POST /portfolio/advice` for AI aggregation on user-provided holdings context
   - request supports `holding_reason_text/sell_timing_text/support_citations/risk_citations`
   - when `OPENAI_API_KEY` is missing or AI request fails, API returns deterministic fallback advice (no hard failure)
+- Web robustness updates:
+  - daily/weekly digest pages retry short polling after generate-call proxy errors to recover eventual-success writes
+  - weekly page shows request-aware API error context (`request_id`)
+  - ingest page handles polling abort/unmount/manual-stop errors with explicit user-facing messages
 
 ## Not Implemented
 - Event reminder entity and reminder lifecycle workflow.

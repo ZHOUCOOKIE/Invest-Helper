@@ -219,6 +219,43 @@ def _resolve_weekly_window(
     return last_week_start, last_week_end, last_week_start
 
 
+def _expected_anchor_date(
+    *,
+    report_kind: WeeklyDigestKind,
+    today: date | None = None,
+) -> date:
+    reference = today or datetime.now(UTC).date()
+    _start_date, _end_date, anchor_date = _resolve_weekly_window(report_kind=report_kind, reference_date=reference)
+    return anchor_date
+
+
+async def _purge_stale_weekly_digests(
+    db: AsyncSession,
+    *,
+    profile_id: int,
+    report_kind: WeeklyDigestKind,
+    today: date | None = None,
+    commit: bool = False,
+) -> int:
+    expected_anchor = _expected_anchor_date(report_kind=report_kind, today=today)
+    result = await db.execute(
+        select(WeeklyDigest)
+        .where(WeeklyDigest.profile_id == profile_id)
+        .where(WeeklyDigest.report_kind == report_kind)
+        .order_by(WeeklyDigest.anchor_date.desc(), WeeklyDigest.id.desc())
+    )
+    items = list(result.scalars().all())
+    to_delete = [item for item in items if item.anchor_date != expected_anchor]
+    for item in to_delete:
+        await db.delete(item)
+    if to_delete:
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
+    return len(to_delete)
+
+
 async def _generate_weekly_ai_analysis(
     *,
     report_kind: WeeklyDigestKind,
@@ -501,6 +538,13 @@ async def generate_weekly_digest(
     window_start = datetime.combine(start_date, time.min, tzinfo=UTC)
     window_end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=UTC)
     profile, _weights_map, enabled_kol_ids, _markets = await load_profile_rules(db, profile_id=profile_id)
+    await _purge_stale_weekly_digests(
+        db,
+        profile_id=profile.id,
+        report_kind=report_kind,
+        today=today,
+        commit=False,
+    )
     content = await _build_weekly_digest_content(
         db,
         report_kind=report_kind,
@@ -551,6 +595,12 @@ async def get_weekly_digest(
     profile_id: int = DEFAULT_PROFILE_ID,
 ) -> WeeklyDigestRead:
     await load_profile_rules(db, profile_id=profile_id)
+    await _purge_stale_weekly_digests(
+        db,
+        profile_id=profile_id,
+        report_kind=report_kind,
+        commit=True,
+    )
     result = await db.execute(
         select(WeeklyDigest)
         .where(WeeklyDigest.profile_id == profile_id)
@@ -571,6 +621,12 @@ async def list_weekly_digest_anchor_dates(
     profile_id: int = DEFAULT_PROFILE_ID,
 ) -> list[date]:
     await load_profile_rules(db, profile_id=profile_id)
+    await _purge_stale_weekly_digests(
+        db,
+        profile_id=profile_id,
+        report_kind=report_kind,
+        commit=True,
+    )
     result = await db.execute(
         select(WeeklyDigest)
         .where(WeeklyDigest.profile_id == profile_id)

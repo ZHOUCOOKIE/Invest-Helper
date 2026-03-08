@@ -44,11 +44,37 @@ type WeeklyDigest = {
   };
 };
 
+type ApiErrorBody = {
+  detail?: string;
+  message?: string;
+  request_id?: string;
+};
+
+type ParsedApiResponse<T> = {
+  data: T | ApiErrorBody | null;
+  textBody: string;
+  requestId: string | null;
+  statusCode: number;
+  requestPath: string;
+};
+
 function formatDate(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function parseDateInput(value: string): Date | null {
+  if (!value) return null;
+  const [yearRaw, monthRaw, dayRaw] = value.split("-");
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  const parsed = new Date(year, month - 1, day);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
 }
 
 function weekStartSunday(target: Date): Date {
@@ -66,6 +92,16 @@ function inferAnchorDate(kind: WeeklyDigestKind): string {
   const lastSunday = new Date(thisSunday);
   lastSunday.setDate(thisSunday.getDate() - 7);
   return formatDate(lastSunday);
+}
+
+function toReferenceDateForGenerate(kind: WeeklyDigestKind, anchorDate: string): string | null {
+  const parsed = parseDateInput(anchorDate);
+  if (!parsed) return null;
+  if (kind === "recent_week") return formatDate(parsed);
+  if (kind === "this_week") return formatDate(parsed);
+  const reference = new Date(parsed);
+  reference.setDate(reference.getDate() + 7);
+  return formatDate(reference);
 }
 
 function displayKindLabel(kind: WeeklyDigestKind): string {
@@ -89,6 +125,56 @@ function displayLocalTime(value: string | null | undefined): string {
   }).format(dt);
 }
 
+async function parseApiResponse<T>(res: Response): Promise<ParsedApiResponse<T>> {
+  const requestId = res.headers.get("x-request-id");
+  let requestPath = res.url || "unknown";
+  try {
+    const parsedUrl = new URL(res.url);
+    requestPath = `${parsedUrl.pathname}${parsedUrl.search}`;
+  } catch {
+    requestPath = res.url || "unknown";
+  }
+  const statusCode = res.status;
+  const textBody = await res.text();
+  try {
+    const parsed = JSON.parse(textBody) as T | ApiErrorBody;
+    if (parsed && typeof parsed === "object") {
+      const bodyRequestId = (parsed as ApiErrorBody).request_id;
+      return { data: parsed, textBody: "", requestId: bodyRequestId ?? requestId, statusCode, requestPath };
+    }
+    return { data: parsed, textBody: "", requestId, statusCode, requestPath };
+  } catch {
+    return { data: null, textBody, requestId, statusCode, requestPath };
+  }
+}
+
+function formatApiError(
+  fallbackMessage: string,
+  body: unknown,
+  textBody: string,
+  requestId: string | null,
+  statusCode?: number,
+  requestPath?: string,
+): string {
+  let message = fallbackMessage;
+  if (body && typeof body === "object") {
+    const obj = body as Record<string, unknown>;
+    if (typeof obj.message === "string" && obj.message) message = obj.message;
+    else if (typeof obj.detail === "string" && obj.detail) message = obj.detail;
+  } else if (textBody) {
+    const statusPart = typeof statusCode === "number" ? `状态=${statusCode}` : "状态=未知";
+    const pathPart = requestPath ? `路径=${requestPath}` : "路径=未知";
+    message = `非 JSON 错误响应（${statusPart}, ${pathPart}）：${textBody.slice(0, 300)}`;
+  }
+  return requestId ? `${message} (request_id=${requestId})` : message;
+}
+
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 export default function WeeklyDigestPage() {
   const [kind, setKind] = useState<WeeklyDigestKind>("recent_week");
   const [anchorDate, setAnchorDate] = useState(inferAnchorDate("recent_week"));
@@ -110,28 +196,30 @@ export default function WeeklyDigestPage() {
 
   const loadDates = useCallback(async (k: WeeklyDigestKind) => {
     const res = await fetch(`/api/weekly-digests/dates?kind=${k}`, { cache: "no-store" });
-    const body = (await res.json()) as string[] | { detail?: string };
-    if (!res.ok || !Array.isArray(body)) {
-      throw new Error("detail" in (body as { detail?: string }) ? ((body as { detail?: string }).detail ?? "加载周报日期失败") : "加载周报日期失败");
+    const parsed = await parseApiResponse<string[]>(res);
+    if (!res.ok || !Array.isArray(parsed.data)) {
+      throw new Error(formatApiError("加载周报日期失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath));
     }
-    const rows = body.filter((item): item is string => typeof item === "string").map((item) => item.slice(0, 10));
+    const rows = parsed.data.filter((item): item is string => typeof item === "string").map((item) => item.slice(0, 10));
     setAvailableDates(rows);
     return rows;
   }, []);
 
   const loadDigest = useCallback(async (k: WeeklyDigestKind, dateStr: string) => {
     const res = await fetch(`/api/weekly-digests?kind=${k}&anchor_date=${dateStr}`, { cache: "no-store" });
-    const body = (await res.json()) as WeeklyDigest | { detail?: string };
+    const parsed = await parseApiResponse<WeeklyDigest>(res);
     if (!res.ok) {
-      const detail = "detail" in body ? body.detail ?? "加载周报失败" : "加载周报失败";
       if (res.status === 404) {
         setDigest(null);
         setNotFound(true);
         return;
       }
-      throw new Error(detail);
+      throw new Error(formatApiError("加载周报失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath));
     }
-    setDigest(body as WeeklyDigest);
+    if (!parsed.data || typeof parsed.data !== "object" || !("id" in parsed.data)) {
+      throw new Error(formatApiError("加载周报失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath));
+    }
+    setDigest(parsed.data as WeeklyDigest);
     setNotFound(false);
   }, []);
 
@@ -140,7 +228,8 @@ export default function WeeklyDigestPage() {
     setError(null);
     try {
       const rows = await loadDates(kind);
-      const effectiveDate = rows.includes(anchorDate) ? anchorDate : rows[0] ?? inferAnchorDate(kind);
+      const inferredDate = inferAnchorDate(kind);
+      const effectiveDate = rows.includes(anchorDate) ? anchorDate : inferredDate;
       setAnchorDate(effectiveDate);
       await loadDigest(kind, effectiveDate);
     } catch (err) {
@@ -162,20 +251,44 @@ export default function WeeklyDigestPage() {
     setGenerating(true);
     setError(null);
     try {
-      const res = await fetch(`/api/weekly-digests/generate?kind=${kind}&date=${anchorDate}`, { method: "POST" });
-      const body = (await res.json()) as WeeklyDigest | { detail?: string };
-      if (!res.ok) {
-        throw new Error("detail" in body ? body.detail ?? "生成周报失败" : "生成周报失败");
+      const params = new URLSearchParams({ kind });
+      const referenceDate = toReferenceDateForGenerate(kind, anchorDate);
+      if (referenceDate) {
+        params.set("date", referenceDate);
       }
-      setDigest(body as WeeklyDigest);
+      const res = await fetch(`/api/weekly-digests/generate?${params.toString()}`, { method: "POST" });
+      const parsed = await parseApiResponse<WeeklyDigest>(res);
+      if (!res.ok) {
+        throw new Error(formatApiError("生成周报失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath));
+      }
+      if (!parsed.data || typeof parsed.data !== "object" || !("id" in parsed.data)) {
+        throw new Error(formatApiError("生成周报失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath));
+      }
+      setDigest(parsed.data as WeeklyDigest);
       setNotFound(false);
+      setAnchorDate((parsed.data as WeeklyDigest).anchor_date);
       await loadDates(kind);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "生成周报失败");
+      // The proxy request may fail while backend generation still succeeds; poll briefly to recover.
+      let recovered = false;
+      for (const delayMs of [1200, 2000, 3000, 4000]) {
+        await wait(delayMs);
+        try {
+          await loadDigest(kind, anchorDate);
+          await loadDates(kind);
+          recovered = true;
+          break;
+        } catch {
+          // Keep polling; report the original generation error if all retries fail.
+        }
+      }
+      if (!recovered) {
+        setError(err instanceof Error ? err.message : "生成周报失败");
+      }
     } finally {
       setGenerating(false);
     }
-  }, [anchorDate, kind, loadDates]);
+  }, [anchorDate, kind, loadDates, loadDigest]);
 
   return (
     <main style={{ padding: "24px", fontFamily: "monospace", display: "grid", gap: "14px" }}>
@@ -195,10 +308,12 @@ export default function WeeklyDigestPage() {
               ))}
             </select>
           </label>
-          <label>
-            锚点日期
-            <input type="date" value={anchorDate} onChange={(event) => setAnchorDate(event.target.value)} style={{ marginLeft: "8px" }} />
-          </label>
+          {kind !== "recent_week" && (
+            <label>
+              锚点日期
+              <input type="date" value={anchorDate} onChange={(event) => setAnchorDate(event.target.value)} style={{ marginLeft: "8px" }} />
+            </label>
+          )}
           <button type="button" onClick={() => void generate()} disabled={generating}>
             {generating ? "生成中..." : "生成周报"}
           </button>
@@ -206,13 +321,15 @@ export default function WeeklyDigestPage() {
             {loading ? "加载中..." : "刷新"}
           </button>
         </div>
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-          {availableDates.map((d) => (
-            <button key={d} type="button" onClick={() => setAnchorDate(d)} style={{ background: d === anchorDate ? "#111" : "#fff", color: d === anchorDate ? "#fff" : "#111" }}>
-              {d}
-            </button>
-          ))}
-        </div>
+        {kind !== "recent_week" && (
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            {availableDates.map((d) => (
+              <button key={d} type="button" onClick={() => setAnchorDate(d)} style={{ background: d === anchorDate ? "#111" : "#fff", color: d === anchorDate ? "#fff" : "#111" }}>
+                {d}
+              </button>
+            ))}
+          </div>
+        )}
       </section>
 
       {error && <p style={{ color: "crimson" }}>{error}</p>}

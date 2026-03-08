@@ -258,6 +258,12 @@ function classifyExtractFailureCategory(message: string): string {
   return "处理失败";
 }
 
+function isExtractPollingAbortError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === "AbortError") return true;
+  if (!(err instanceof Error)) return false;
+  return err.name === "AbortError" || err.message === "Aborted" || err.message === "抽取任务轮询已取消";
+}
+
 function isStandardImportJson(value: unknown): value is XImportItem[] {
   if (!Array.isArray(value)) return false;
   return value.every((item) => {
@@ -606,6 +612,11 @@ export default function IngestPage() {
         });
       }
       throw new Error("抽取任务轮询超时");
+    } catch (err) {
+      if (isExtractPollingAbortError(err)) {
+        throw new Error("抽取任务轮询已取消");
+      }
+      throw err;
     } finally {
       if (extractPollControllerRef.current === pollController) {
         extractPollControllerRef.current = null;
@@ -617,8 +628,12 @@ export default function IngestPage() {
     setWorkflowStep(`正在生成 ${dateStr} 的日报...`);
     importProgressHub.updateRunning(`正在生成 ${dateStr} 的日报...`, "refreshing");
     const res = await fetch(`/api/digests/generate?date=${dateStr}`, { method: "POST" });
-    const body = (await res.json()) as { detail?: string };
-    if (!res.ok) throw new Error(body.detail ?? "生成日报失败");
+    const parsed = await parseApiResponse<Record<string, unknown>>(res);
+    if (!res.ok) {
+      throw new Error(
+        formatApiError("生成日报失败", parsed.data, parsed.textBody, parsed.requestId, parsed.statusCode, parsed.requestPath),
+      );
+    }
   };
 
   const onSelectFile = (targetFile: File | null) => {
@@ -887,9 +902,10 @@ export default function IngestPage() {
       importProgressHub.markSuccess("导入与AI处理已完成。");
     } catch (err) {
       const message = err instanceof Error ? err.message : "流程执行失败";
-      const suppressByUnmountAbort = message === "抽取任务轮询已取消" && extractPollAbortSourceRef.current === "unmount";
+      const pollingAborted = isExtractPollingAbortError(err) || message === "抽取任务轮询已取消";
+      const suppressByUnmountAbort = pollingAborted && extractPollAbortSourceRef.current === "unmount";
       if (suppressByUnmountAbort) return;
-      if (message === "抽取任务轮询已取消" && extractPollAbortSourceRef.current === "manual") {
+      if (pollingAborted && extractPollAbortSourceRef.current === "manual") {
         const manualStopped = "手动停止：已停止抽取轮询，未完成贴文保留在待处理列表。";
         setWorkflowError(manualStopped);
         setWorkflowStep(null);

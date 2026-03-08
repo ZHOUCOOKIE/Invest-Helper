@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sys
 
@@ -378,3 +378,80 @@ def test_extractions_default_latest_only() -> None:
 
     assert pending_latest_only.status_code == 200
     assert pending_latest_only.json() == []
+
+
+def test_extractions_sorted_by_raw_posted_at_desc() -> None:
+    get_settings.cache_clear()
+    reset_runtime_counters()
+    fake_db = _FakeSession()
+    now = datetime.now(UTC)
+
+    fake_db.raw_posts[1] = RawPost(
+        id=1,
+        platform="x",
+        kol_id=1,
+        author_handle="kol_1",
+        external_id="111",
+        url="https://x.com/kol_1/status/111",
+        content_text="older post",
+        posted_at=now - timedelta(hours=1),
+        fetched_at=now,
+        review_status=ReviewStatus.unreviewed,
+        reviewed_at=None,
+        reviewed_by=None,
+        raw_json=None,
+    )
+    fake_db.raw_posts[2] = RawPost(
+        id=2,
+        platform="x",
+        kol_id=2,
+        author_handle="kol_2",
+        external_id="222",
+        url="https://x.com/kol_2/status/222",
+        content_text="newer post",
+        posted_at=now,
+        fetched_at=now,
+        review_status=ReviewStatus.unreviewed,
+        reviewed_at=None,
+        reviewed_by=None,
+        raw_json=None,
+    )
+    # extraction #101 is newer by created_at, but its raw post is older by posted_at
+    fake_db.extractions[101] = PostExtraction(
+        id=101,
+        raw_post_id=1,
+        status=ExtractionStatus.pending,
+        extracted_json={"summary": "older post newer extraction"},
+        model_name="test-model",
+        extractor_name="openai_structured",
+        last_error=None,
+        auto_applied_count=0,
+        auto_policy=None,
+        auto_applied_kol_view_ids=None,
+        created_at=now + datetime.resolution,
+    )
+    fake_db.extractions[100] = PostExtraction(
+        id=100,
+        raw_post_id=2,
+        status=ExtractionStatus.pending,
+        extracted_json={"summary": "newer post older extraction"},
+        model_name="test-model",
+        extractor_name="openai_structured",
+        last_error=None,
+        auto_applied_count=0,
+        auto_policy=None,
+        auto_applied_kol_view_ids=None,
+        created_at=now,
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/extractions?status=all&limit=20&offset=0")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["id"] for item in payload] == [100, 101]

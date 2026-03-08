@@ -48,6 +48,7 @@ TL;DR
 - `daily_digests.version` 当前写入路径固定为 `1`，不做多版本累积。
 - 周报回放：
   - `POST /weekly-digests/generate` 按 `(profile_id, report_kind, anchor_date)` 覆盖重生成。
+  - 周报在 generate/read/list 路径会按 `report_kind` 自动清理“非当前预期锚点日期”的陈旧记录。
   - `GET /weekly-digests` 按 `kind + anchor_date` 回放。
   - `GET /weekly-digests/dates` 返回对应 `kind` 的可回放锚点日期集合。
 

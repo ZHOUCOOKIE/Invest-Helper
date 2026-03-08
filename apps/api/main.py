@@ -923,6 +923,20 @@ def _extraction_status_key(extraction: PostExtraction) -> str:
     return status_value.strip().lower()
 
 
+def _to_utc_safe(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=UTC)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _extraction_sort_key_by_post_start(extraction: PostExtraction) -> tuple[datetime, int]:
+    posted_at = extraction.raw_post.posted_at if extraction.raw_post is not None else None
+    primary = posted_at if posted_at is not None else extraction.created_at
+    return (_to_utc_safe(primary), int(extraction.id or 0))
+
+
 def _review_status_key(raw_post: RawPost) -> str:
     value = getattr(raw_post, "review_status", None)
     if hasattr(value, "value"):
@@ -5394,6 +5408,7 @@ async def list_extractions(
     keyword = q.strip()
     if keyword:
         items = [item for item in items if _extraction_matches_keyword(item, keyword)]
+    items.sort(key=_extraction_sort_key_by_post_start, reverse=True)
     items = items[offset : offset + limit]
     for extraction in items:
         _prepare_extraction_for_read(extraction)

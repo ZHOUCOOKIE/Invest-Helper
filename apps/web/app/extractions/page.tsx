@@ -209,6 +209,12 @@ function displayPostedTime(rawPost: RawPost): string {
   return stripTimezoneSuffix(pickRawCreatedAtValue(rawPost.raw_json) ?? rawPost.posted_at);
 }
 
+function toSortMs(value: string | null | undefined): number {
+  if (typeof value !== "string" || !value.trim()) return 0;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
 export default function ExtractionsPage() {
   const [searchReady, setSearchReady] = useState(false);
   const [status, setStatus] = useState<ExtractionFilterStatus>("all");
@@ -261,8 +267,10 @@ export default function ExtractionsPage() {
         dedupedMap.set(item.id, item);
       }
       const deduped = Array.from(dedupedMap.values()).sort((a, b) => {
-        if (a.created_at === b.created_at) return b.id - a.id;
-        return b.created_at.localeCompare(a.created_at);
+        const aMs = toSortMs(a.raw_post?.posted_at) || toSortMs(a.created_at);
+        const bMs = toSortMs(b.raw_post?.posted_at) || toSortMs(b.created_at);
+        if (aMs !== bMs) return bMs - aMs;
+        return b.id - a.id;
       });
       setItems(deduped);
     } catch (err) {

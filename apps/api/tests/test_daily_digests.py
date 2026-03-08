@@ -653,3 +653,47 @@ def test_generate_weekly_digest_last_week_window_and_dates_listing() -> None:
     assert dates.json() == ["2026-03-01"]
     assert fetched.status_code == 200
     assert fetched.json()["report_kind"] == "last_week"
+
+
+def test_list_weekly_digest_dates_purges_stale_last_week_anchors() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    today = now.date()
+    days_since_sunday = (today.weekday() + 1) % 7
+    this_week_start = today - timedelta(days=days_since_sunday)
+    expected_last_week_anchor = this_week_start - timedelta(days=7)
+    stale_last_week_anchor = expected_last_week_anchor - timedelta(days=7)
+
+    fake_db.seed(UserProfile(id=1, name="default", created_at=now))
+    fake_db.seed(
+        WeeklyDigest(
+            id=1,
+            profile_id=1,
+            report_kind="last_week",
+            anchor_date=expected_last_week_anchor,
+            version=1,
+            days=7,
+            content={},
+            generated_at=now,
+        )
+    )
+    fake_db.seed(
+        WeeklyDigest(
+            id=2,
+            profile_id=1,
+            report_kind="last_week",
+            anchor_date=stale_last_week_anchor,
+            version=1,
+            days=7,
+            content={},
+            generated_at=now,
+        )
+    )
+
+    client = _client_with_db(fake_db)
+    dates = client.get("/weekly-digests/dates?kind=last_week")
+    app.dependency_overrides.clear()
+
+    assert dates.status_code == 200
+    assert dates.json() == [expected_last_week_anchor.isoformat()]
+    assert set(fake_db._data[WeeklyDigest].keys()) == {1}

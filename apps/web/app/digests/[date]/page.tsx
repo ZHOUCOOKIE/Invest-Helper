@@ -155,6 +155,12 @@ function formatApiError(
   return requestId ? `${message} (request_id=${requestId})` : message;
 }
 
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 export default function DailyDigestPage() {
   const params = useParams<{ date: string }>();
   const router = useRouter();
@@ -263,12 +269,21 @@ export default function DailyDigestPage() {
       await Promise.all([loadDigest(), loadDigestDates()]);
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "生成日报失败");
-      try {
-        await Promise.all([loadDigest(), loadDigestDates()]);
-        router.refresh();
-      } catch {
-        // keep original generate error when refresh fallback also fails
+      // The proxy request may fail while backend generation still succeeds; poll briefly to recover.
+      let recovered = false;
+      for (const delayMs of [1200, 2000, 3000, 4000]) {
+        await wait(delayMs);
+        try {
+          await Promise.all([loadDigest(), loadDigestDates()]);
+          router.refresh();
+          recovered = true;
+          break;
+        } catch {
+          // Keep polling; report the original generation error if all retries fail.
+        }
+      }
+      if (!recovered) {
+        setError(err instanceof Error ? err.message : "生成日报失败");
       }
     } finally {
       setGenerating(false);

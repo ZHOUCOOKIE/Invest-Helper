@@ -309,6 +309,9 @@ class XImportStatsRead(BaseModel):
     kol_created: bool = False
     skipped_not_followed_count: int = 0
     skipped_not_followed_samples: list[XSkippedNotFollowedRead] = Field(default_factory=list)
+    pending_failed_dedup_count: int = 0
+    pending_failed_dedup_ids: list[int] = Field(default_factory=list)
+    pending_failed_reason_breakdown: dict[str, int] = Field(default_factory=dict)
 
 
 class XRawPostsPreviewSampleRead(BaseModel):
@@ -432,6 +435,13 @@ class AdminFixApprovedMissingViewsRead(BaseModel):
     fixed: int
     skipped: int
     dry_run: bool
+
+
+class AdminCleanupExtractionJsonRead(BaseModel):
+    scanned: int
+    updated: int
+    dry_run: bool
+    updated_ids: list[int] = Field(default_factory=list)
 
 
 class AdminHardDeleteRead(BaseModel):
@@ -561,6 +571,16 @@ class XRetryFailedRead(BaseModel):
     failed_count: int
     skipped_count: int
     failure_reasons: dict[str, int]
+
+
+class XRetryPendingAllRead(BaseModel):
+    author_handle: str | None
+    pending_total: int
+    failed_pending_count: int
+    active_pending_count: int
+    skipped_not_followed_count: int
+    submitted_count: int
+    job_id: str | None = None
 
 
 class DashboardPendingExtractionRead(BaseModel):

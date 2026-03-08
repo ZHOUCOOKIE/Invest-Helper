@@ -2,26 +2,8 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import type { FormEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { buildMissingInferenceHints, pickAssetSymbols, pickAssetViews, pickDefaults } from "./review-inference.js";
-
-type Asset = {
-  id: number;
-  symbol: string;
-  name: string | null;
-  market: string | null;
-  created_at: string;
-};
-
-type Kol = {
-  id: number;
-  platform: string;
-  handle: string;
-  display_name: string | null;
-  enabled: boolean;
-  created_at: string;
-};
+import { pickAssetViews } from "./review-inference.js";
 
 type RawPost = {
   id: number;
@@ -96,17 +78,6 @@ type ExtractorStatus = {
   max_output_tokens: number;
 };
 
-type FormState = {
-  kol_id: string;
-  asset_id: string;
-  stance: "bull" | "bear" | "neutral";
-  horizon: "intraday" | "1w" | "1m" | "3m" | "1y";
-  confidence: string;
-  summary: string;
-  source_url: string;
-  as_of: string;
-};
-
 function todayIsoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -125,13 +96,6 @@ function getHttpErrorMessage(status: number, detail: string | undefined, fallbac
   if (status === 409) return detail ?? "状态冲突（409），该 extraction 可能已被处理。";
   if (status === 429) return detail ?? "请求过于频繁（429），请稍后再试。";
   return detail ?? fallback;
-}
-
-function statusText(status: Extraction["status"]): string {
-  if (status === "pending") return "待处理";
-  if (status === "approved") return "已通过";
-  if (status === "rejected") return "已拒绝";
-  return status;
 }
 
 function pickRawCreatedAtValue(rawJson: Record<string, unknown> | null): string | null {
@@ -171,31 +135,15 @@ export default function ExtractionDetailPage() {
   const extractionId = useMemo(() => Number(params.id), [params.id]);
 
   const [extraction, setExtraction] = useState<Extraction | null>(null);
-  const [assets, setAssets] = useState<Asset[]>([]);
-  const [kols, setKols] = useState<Kol[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
-  const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionInfo, setActionInfo] = useState<string | null>(null);
-  const [matchingAssetHint, setMatchingAssetHint] = useState<string | null>(null);
   const [reExtracting, setReExtracting] = useState(false);
   const [extractorStatus, setExtractorStatus] = useState<ExtractorStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
-  const [form, setForm] = useState<FormState>({
-    kol_id: "",
-    asset_id: "",
-    stance: "neutral",
-    horizon: "1w",
-    confidence: "50",
-    summary: "",
-    source_url: "",
-    as_of: todayIsoDate(),
-  });
-  const [rejectReason, setRejectReason] = useState("");
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
-  const [selectedBatchKeys, setSelectedBatchKeys] = useState<string[]>([]);
 
   useEffect(() => {
     const load = async () => {
@@ -212,10 +160,8 @@ export default function ExtractionDetailPage() {
       }
 
       try {
-        const [extractionRes, assetsRes, kolsRes, statusRes] = await Promise.all([
+        const [extractionRes, statusRes] = await Promise.all([
           fetch(`/api/extractions/${extractionId}`, { cache: "no-store" }),
-          fetch("/api/assets", { cache: "no-store" }),
-          fetch("/api/kols", { cache: "no-store" }),
           fetch("/api/extractor-status", { cache: "no-store" }),
         ]);
 
@@ -231,15 +177,6 @@ export default function ExtractionDetailPage() {
           );
         }
 
-        const assetsBody = (await assetsRes.json()) as Asset[] | { detail?: string };
-        if (!assetsRes.ok) {
-          throw new Error("detail" in assetsBody ? (assetsBody.detail ?? "加载资产失败") : "加载资产失败");
-        }
-
-        const kolsBody = (await kolsRes.json()) as Kol[] | { detail?: string };
-        if (!kolsRes.ok) {
-          throw new Error("detail" in kolsBody ? (kolsBody.detail ?? "加载 KOL 失败") : "加载 KOL 失败");
-        }
         const statusBody = (await statusRes.json()) as ExtractorStatus | { detail?: string };
         if (!statusRes.ok) {
           setStatusError("detail" in statusBody ? (statusBody.detail ?? "加载抽取器状态失败") : "加载失败");
@@ -248,66 +185,9 @@ export default function ExtractionDetailPage() {
         }
 
         const extractionData = extractionBody as Extraction;
-        const assetList = assetsBody as Asset[];
-        const kolList = kolsBody as Kol[];
-
         setExtraction(extractionData);
-        setAssets(assetList);
-        setKols(kolList);
-
-        const defaults = pickDefaults(extractionData.extracted_json, extractionData.raw_post.url);
-        const extractedSymbols = pickAssetSymbols(extractionData.extracted_json);
-        const uniqueSymbols = Array.from(new Set(extractedSymbols));
-        const matchedAssets = uniqueSymbols
-          .map((symbol) => assetList.find((asset) => asset.symbol.toUpperCase() === symbol))
-          .filter((asset): asset is Asset => Boolean(asset));
-
-        if (uniqueSymbols.length > 1) {
-          setMatchingAssetHint(`提取到多个资产(${uniqueSymbols.join(", ")})，请手动选择目标资产。`);
-        } else if (uniqueSymbols.length === 1 && matchedAssets.length === 0) {
-          setMatchingAssetHint(`提取到资产 ${uniqueSymbols[0]}，未匹配资产，请手动选择/先创建资产。`);
-        } else {
-          setMatchingAssetHint(null);
-        }
-
-        setForm({
-          kol_id: kolList[0] ? String(kolList[0].id) : "",
-          asset_id: uniqueSymbols.length === 1 && matchedAssets[0] ? String(matchedAssets[0].id) : "",
-          stance: "neutral",
-          horizon: "1w",
-          confidence: "50",
-          summary: "",
-          source_url: extractionData.raw_post.url,
-          as_of: todayIsoDate(),
-          ...defaults,
-        });
-
-        const extractedViews = pickAssetViews(extractionData.extracted_json);
-        const threshold = extractionData.auto_approve_confidence_threshold ?? 80;
-        const extractedAsOf = normalizeAsOfDate(
-          typeof extractionData.extracted_json.as_of === "string"
-            ? (extractionData.extracted_json.as_of as string)
-            : null,
-          extractionData.raw_post.posted_at.slice(0, 10),
-        );
-        const autoAppliedKeys = new Set(
-          (extractionData.auto_applied_views || []).map((item) =>
-            `${item.symbol.toUpperCase()}|${item.horizon}|${normalizeAsOfDate(item.as_of, extractedAsOf)}`,
-          ),
-        );
-        const selectableViews = extractedViews.filter((item) => !autoAppliedKeys.has(buildAssetViewKey(item, extractedAsOf)));
-        const highConfidenceKeys = selectableViews
-          .filter((item) => item.confidence >= threshold)
-          .map((item) => buildAssetViewKey(item, extractedAsOf));
-        if (highConfidenceKeys.length > 0) {
-          setSelectedBatchKeys(Array.from(new Set(highConfidenceKeys)));
-        } else if (selectableViews[0]) {
-          setSelectedBatchKeys([buildAssetViewKey(selectableViews[0], extractedAsOf)]);
-        } else {
-          setSelectedBatchKeys([]);
-        }
       } catch (err) {
-      setError(err instanceof Error ? err.message : "未知错误");
+        setError(err instanceof Error ? err.message : "未知错误");
       } finally {
         setLoading(false);
       }
@@ -341,129 +221,6 @@ export default function ExtractionDetailPage() {
     }
   };
 
-  const approve = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setActionError(null);
-
-    if (!form.kol_id || !form.asset_id) {
-      setActionError("请选择资产和 KOL");
-      return;
-    }
-
-    setSubmitting(true);
-    try {
-      const res = await fetch(`/api/extractions/${extractionId}/approve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          kol_id: Number(form.kol_id),
-          asset_id: Number(form.asset_id),
-          stance: form.stance,
-          horizon: form.horizon,
-          confidence: Number(form.confidence),
-          summary: form.summary.trim(),
-          source_url: form.source_url.trim(),
-          as_of: form.as_of,
-        }),
-      });
-      const body = (await res.json()) as { detail?: string };
-      if (!res.ok) {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `审核通过失败: ${res.status}`));
-      }
-      router.push("/extractions?msg=%E5%AE%A1%E6%A0%B8%E9%80%9A%E8%BF%87&status=pending");
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "审核通过失败");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const approveBatch = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setActionError(null);
-    if (!form.kol_id) {
-      setActionError("请选择 KOL");
-      return;
-    }
-    const selected = extractedAssetViews
-      .map((item) => ({ item, key: buildAssetViewKey(item, extractedAsOf) }))
-      .filter((item) => selectedBatchKeys.includes(item.key) && !autoAppliedKeySet.has(item.key));
-    if (selected.length === 0) {
-      setActionError("请至少勾选一条资产观点");
-      return;
-    }
-    const views = selected
-      .map(({ item }) => {
-        const matchedAsset = assets.find((asset) => asset.symbol.toUpperCase() === item.symbol);
-        if (!matchedAsset) {
-          return null;
-        }
-        return {
-          asset_id: matchedAsset.id,
-          stance: item.stance,
-          horizon: item.horizon,
-          confidence: item.confidence,
-          summary: (item.summary || `${item.symbol} ${item.stance}`).slice(0, 1024),
-          source_url: (form.source_url || extraction?.raw_post.url || "").trim(),
-          as_of: normalizeAsOfDate(item.as_of, extractedAsOf),
-        };
-      })
-      .filter((item): item is NonNullable<typeof item> => item !== null);
-    if (views.length === 0) {
-      setActionError("所选观点无法匹配资产，请先创建对应资产或检查 symbol");
-      return;
-    }
-
-    setSubmitting(true);
-    try {
-      const res = await fetch(`/api/extractions/${extractionId}/approve-batch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          kol_id: Number(form.kol_id),
-          views,
-        }),
-      });
-      const body = (await res.json()) as { detail?: string };
-      if (!res.ok) {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `批量审核通过失败: ${res.status}`));
-      }
-      router.push("/extractions?msg=%E6%89%B9%E9%87%8F%E5%AE%A1%E6%A0%B8%E9%80%9A%E8%BF%87&status=pending");
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "批量审核通过失败");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const reject = async () => {
-    const confirmed = window.confirm("确认拒绝该 extraction 吗？该操作将把状态设为 rejected。");
-    if (!confirmed) return;
-    setActionError(null);
-    setSubmitting(true);
-    try {
-      const res = await fetch(`/api/extractions/${extractionId}/reject`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: rejectReason.trim() || null }),
-      });
-      const body = (await res.json()) as { detail?: string };
-      if (!res.ok) {
-        throw new Error(getHttpErrorMessage(res.status, body.detail, `审核拒绝失败: ${res.status}`));
-      }
-      router.push("/extractions?msg=%E5%AE%A1%E6%A0%B8%E6%8B%92%E7%BB%9D&status=pending");
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "审核拒绝失败");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const missingInferenceHints = useMemo(() => {
-    if (!extraction) return [];
-    return buildMissingInferenceHints(extraction.extracted_json);
-  }, [extraction]);
-
   const budgetExhaustedFallback = useMemo(() => {
     if (!extraction) return false;
     if (extraction.last_error?.includes("budget_exhausted")) return true;
@@ -472,17 +229,28 @@ export default function ExtractionDetailPage() {
     return (meta as Record<string, unknown>)["fallback_reason"] === "budget_exhausted";
   }, [extraction]);
 
-  const autoRejectMeta = useMemo(() => {
+  const reviewFailure = useMemo(() => {
     if (!extraction) return null;
     const rawMeta = extraction.extracted_json["meta"];
-    if (!rawMeta || typeof rawMeta !== "object") return null;
-    const meta = rawMeta as Record<string, unknown>;
-    if (meta["auto_rejected"] !== true) return null;
-    return {
-      reason: String(meta["auto_reject_reason"] ?? "-"),
-      threshold: String(meta["auto_reject_threshold"] ?? extraction.auto_reject_confidence_threshold ?? "-"),
-      modelConfidence: String(meta["model_confidence"] ?? "-"),
-    };
+    const meta = rawMeta && typeof rawMeta === "object" ? (rawMeta as Record<string, unknown>) : null;
+    const hasAssetViews = pickAssetViews(extraction.extracted_json).length > 0;
+    const hasview = extraction.extracted_json["hasview"];
+    if (meta?.["auto_rejected"] === true) {
+      const code = String(meta["auto_review_reason"] ?? "-");
+      const threshold = String(meta["auto_review_threshold"] ?? extraction.auto_reject_confidence_threshold ?? "-");
+      const modelConfidence = String(meta["model_confidence"] ?? "-");
+      if (code === "hasview_zero") {
+        return "不通过：未识别到可审核资产观点（hasview=0 或 asset_views 为空）。";
+      }
+      if (code === "confidence_below_threshold") {
+        return `不通过：模型置信度不足（${modelConfidence} < ${threshold}）。`;
+      }
+      return `不通过：${code}。`;
+    }
+    if (hasview === 0 || !hasAssetViews) {
+      return "不通过：未识别到可审核资产观点（hasview=0 或 asset_views 为空）。";
+    }
+    return null;
   }, [extraction]);
 
   const extractedAssetViews = useMemo(() => {
@@ -582,31 +350,9 @@ export default function ExtractionDetailPage() {
               </div>
             )}
             {extraction.last_error && <div style={{ color: "crimson" }}>最后错误: {extraction.last_error}</div>}
-            {autoRejectMeta && (
-              <div style={{ color: "#8a5800", marginTop: "4px" }}>
-                自动拒绝=true, 原因={autoRejectMeta.reason}, 阈值={autoRejectMeta.threshold},
-                模型置信度={autoRejectMeta.modelConfidence}
-              </div>
-            )}
-            {typeof extraction.extracted_json["meta"] === "object" && extraction.extracted_json["meta"] !== null && (
-              <div style={{ marginTop: "4px" }}>
-                meta: provider_detected=
-                {String((extraction.extracted_json["meta"] as Record<string, unknown>)["provider_detected"] ?? "-")},
-                output_mode_used=
-                {String((extraction.extracted_json["meta"] as Record<string, unknown>)["output_mode_used"] ?? "-")},
-                parse_strategy_used=
-                {String((extraction.extracted_json["meta"] as Record<string, unknown>)["parse_strategy_used"] ?? "-")},
-                raw_len={String((extraction.extracted_json["meta"] as Record<string, unknown>)["raw_len"] ?? "-")},
-                repaired={String((extraction.extracted_json["meta"] as Record<string, unknown>)["repaired"] ?? "-")}
-              </div>
-            )}
+            {reviewFailure && <div style={{ color: "#8a5800", marginTop: "4px" }}>{reviewFailure}</div>}
             {budgetExhaustedFallback && (
               <div style={{ color: "#b35c00" }}>已自动降级 Dummy，避免过度消耗额度。</div>
-            )}
-            {missingInferenceHints.length > 0 && (
-              <div style={{ color: "#8a5800", marginTop: "6px" }}>
-                {missingInferenceHints.join("；")}。请在下方人工补齐后再审核。
-              </div>
             )}
             <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(extraction.extracted_json, null, 2)}</pre>
           </section>
@@ -702,233 +448,14 @@ export default function ExtractionDetailPage() {
           </section>
 
           <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>审核通过</h2>
-            <button
-              type="button"
-              onClick={() => void reExtract()}
-              disabled={reExtracting}
-              style={{ marginBottom: "10px" }}
-            >
+            <h2 style={{ marginTop: 0 }}>操作</h2>
+            <button type="button" onClick={() => void reExtract()} disabled={reExtracting}>
               {reExtracting ? "重新解构中..." : "用 AI 重新解构（强制）"}
-            </button>
-            <p style={{ marginTop: 0, color: "#555" }}>
-              自动审核规则：`hasview=0` 自动拒绝；`hasview=1` 时按阈值 80 执行（&gt;=80 自动通过，&lt;80 自动拒绝）；手动强制重抽默认进入待人工审核。
-            </p>
-            {matchingAssetHint && <p style={{ color: "#b35c00", marginTop: 0 }}>{matchingAssetHint}</p>}
-            <form
-              onSubmit={extractedAssetViews.length > 0 ? approveBatch : approve}
-              style={{ display: "grid", gap: "8px", maxWidth: "720px" }}
-            >
-              {extractedAssetViews.length === 0 && (
-                <label>
-                  资产
-                  <select
-                    value={form.asset_id}
-                    onChange={(event) => setForm((prev) => ({ ...prev, asset_id: event.target.value }))}
-                    style={{ display: "block", width: "100%" }}
-                    required
-                  >
-                    <option value="" disabled>
-                      请选择资产
-                    </option>
-                    {assets.map((asset) => (
-                      <option key={asset.id} value={asset.id}>
-                        {asset.symbol} {asset.name ? `- ${asset.name}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-              <label>
-                KOL
-                <select
-                  value={form.kol_id}
-                  onChange={(event) => setForm((prev) => ({ ...prev, kol_id: event.target.value }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                >
-                  <option value="" disabled>
-                    请选择 KOL
-                  </option>
-                  {kols.map((kol) => (
-                    <option key={kol.id} value={kol.id}>
-                      {kol.display_name || kol.handle} ({kol.platform}/@{kol.handle})
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {extractedAssetViews.length > 0 && (
-                <div>
-                  <div style={{ marginBottom: "6px" }}>资产观点（可多选）</div>
-                  <div style={{ display: "grid", gap: "4px" }}>
-                    {extractedAssetViews.map((item, index) => {
-                      const key = buildAssetViewKey(item, extractedAsOf);
-                      const checked = selectedBatchKeys.includes(key);
-                      const isAutoApproved = autoAppliedKeySet.has(key);
-                      return (
-                        <label
-                          key={`${index}:${key}`}
-                          style={{
-                            border: "1px solid #eee",
-                            padding: "6px",
-                            borderRadius: "6px",
-                            opacity: isAutoApproved ? 0.6 : 1,
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            disabled={isAutoApproved}
-                            onChange={(event) => {
-                              setSelectedBatchKeys((prev) => {
-                                if (event.target.checked) return Array.from(new Set([...prev, key]));
-                                return prev.filter((itemKey) => itemKey !== key);
-                              });
-                            }}
-                          />{" "}
-                          {item.symbol} | {item.stance} | {item.horizon} | 置信度={item.confidence} |{" "}
-                          {item.summary || "（无）"}
-                          {isAutoApproved && (
-                            <span
-                              style={{
-                                marginLeft: "6px",
-                                padding: "1px 6px",
-                                borderRadius: "10px",
-                                fontSize: "12px",
-                                color: "#666",
-                                background: "#f0f0f0",
-                              }}
-                            >
-                              自动通过
-                            </span>
-                          )}
-                        </label>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {extractedAssetViews.length === 0 && (
-                <label>
-                  方向
-                  <select
-                    value={form.stance}
-                    onChange={(event) => setForm((prev) => ({ ...prev, stance: event.target.value as FormState["stance"] }))}
-                    style={{ display: "block", width: "100%" }}
-                    required
-                  >
-                    <option value="bull">看涨</option>
-                    <option value="bear">看跌</option>
-                    <option value="neutral">中性</option>
-                  </select>
-                </label>
-              )}
-
-              {extractedAssetViews.length === 0 && (
-                <label>
-                  影响周期
-                  <select
-                    value={form.horizon}
-                    onChange={(event) =>
-                      setForm((prev) => ({ ...prev, horizon: event.target.value as FormState["horizon"] }))
-                    }
-                    style={{ display: "block", width: "100%" }}
-                    required
-                  >
-                    <option value="intraday">日内</option>
-                    <option value="1w">1w</option>
-                    <option value="1m">1m</option>
-                    <option value="3m">3m</option>
-                    <option value="1y">1y</option>
-                  </select>
-                </label>
-              )}
-
-              {extractedAssetViews.length === 0 && (
-                <label>
-                  置信度（0-100）
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    value={form.confidence}
-                    onChange={(event) => setForm((prev) => ({ ...prev, confidence: event.target.value }))}
-                    style={{ display: "block", width: "100%" }}
-                    required
-                  />
-                </label>
-              )}
-
-              {extractedAssetViews.length === 0 && (
-                <label>
-                  观点摘要
-                  <textarea
-                    rows={3}
-                    value={form.summary}
-                    onChange={(event) => setForm((prev) => ({ ...prev, summary: event.target.value }))}
-                    style={{ display: "block", width: "100%" }}
-                    required
-                  />
-                </label>
-              )}
-
-              <label>
-                来源链接
-                <input
-                  type="url"
-                  value={form.source_url}
-                  onChange={(event) => setForm((prev) => ({ ...prev, source_url: event.target.value }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                />
-              </label>
-
-              <label>
-                观点日期
-                <input
-                  type="date"
-                  value={form.as_of}
-                  onChange={(event) => setForm((prev) => ({ ...prev, as_of: event.target.value }))}
-                  style={{ display: "block", width: "100%" }}
-                  required
-                />
-              </label>
-
-              <button type="submit" disabled={submitting || extraction.status !== "pending"}>
-                {submitting ? "提交中..." : extractedAssetViews.length > 0 ? "批量通过" : "审核通过"}
-              </button>
-            </form>
-          </section>
-
-          <section style={{ border: "1px solid #ddd", borderRadius: "8px", padding: "10px" }}>
-            <h2 style={{ marginTop: 0 }}>审核拒绝</h2>
-            <label>
-              拒绝原因（可选）
-              <textarea
-                rows={2}
-                value={rejectReason}
-                onChange={(event) => setRejectReason(event.target.value)}
-                style={{ display: "block", width: "100%", maxWidth: "720px" }}
-              />
-            </label>
-            <button
-              type="button"
-              onClick={() => void reject()}
-              disabled={submitting || extraction.status !== "pending"}
-              style={{ marginTop: "8px" }}
-            >
-              拒绝
             </button>
           </section>
 
           {actionError && <p style={{ color: "crimson" }}>{actionError}</p>}
           {actionInfo && <p style={{ color: "green" }}>{actionInfo}</p>}
-          {extraction.status !== "pending" && (
-            <p style={{ color: "#666" }}>
-              当前状态是 {statusText(extraction.status)}，不可再次审核。reviewed_by={extraction.reviewed_by ?? "N/A"}
-            </p>
-          )}
         </div>
       )}
     </main>

@@ -14,6 +14,10 @@ Top-level model output must include these 6 core keys:
 - `asset_views` (array, can be empty)
 - `library_entry` (`null` or object)
 
+Canonical key order (read/write):
+- top-level: `as_of, source_url, islibrary, hasview, asset_views, library_entry` (`extracted_json` may append `meta`)
+- `asset_views[*]`: `symbol, market, stance, horizon, confidence, summary`
+
 ## Field Rules
 - Enum strict output (model must output exact enum values; server does not run keyword/synonym alias normalization for these fields):
   - `market`: `CRYPTO|STOCK|ETF|FOREX|OTHER` (legacy auto enum removed)
@@ -36,11 +40,23 @@ Top-level model output must include these 6 core keys:
 - `hasview` is recomputed from final `asset_views` (`1` if non-empty else `0`)
 - `islibrary=1` + invalid/missing `library_entry` => downgrade to `islibrary=0`, `library_entry=null`
 - internal observability remains in `extracted_json.meta`
+- legacy debug keys are cleaned from `meta` during read/write normalization:
+  - `auto_reject_reason`, `auto_reject_threshold`
+  - `parse_unwrapped_extracted_json`, `parse_unwrapped_key`
+  - `provider_detected`, `output_mode_used`, `parse_strategy_used`
+  - `ruleset_version`, `extraction_mode`, `repaired`, `raw_len`
+- `parsed_model_output` is persisted as ordered JSON (DB type `JSON`, not `JSONB`)
 
 ## Auto Review
 - if `hasview=0`: auto reject (`hasview_zero`)
 - auto approve requires `hasview=1` and confidence path meeting threshold (`80`)
 - `meta.auto_policy_applied` is recorded (current values: `threshold_asset|no_auto_review_user_trigger`)
+- reject reason key is `meta.auto_review_reason` (legacy `auto_reject_reason` is removed)
+
+## Parse Failure Semantics
+- when model returns content but parse fails (for example invalid JSON/truncated output after retries), extraction record is still created as `pending`
+- failure reason is written to `last_error` and/or `meta.parse_error(_reason)`
+- state classifier treats such `pending` record as failed semantics for progress/retry flows
 
 ## Backward Read Tolerance
 - read path tolerates old records and legacy fields without rewriting historical approval status

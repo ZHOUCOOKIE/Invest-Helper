@@ -37,6 +37,7 @@ from schemas import (
     AssetViewsTimelineRead,
     AssetViewsMetaRead,
     AssetRead,
+    AdminCleanupExtractionJsonRead,
     AdminDeletePendingExtractionsRead,
     AdminFixApprovedMissingViewsRead,
     AdminRecomputeExtractionStatusesRead,
@@ -83,6 +84,7 @@ from schemas import (
     XConvertErrorRead,
     XIngestProgressRead,
     XRetryFailedRead,
+    XRetryPendingAllRead,
     XRawPostsPreviewRead,
     XRawPostsPreviewSampleRead,
     XImportStatsRead,
@@ -153,6 +155,19 @@ CORS_ALLOW_ORIGINS = [
     for origin in os.getenv("CORS_ALLOW_ORIGINS", DEFAULT_CORS_ALLOW_ORIGINS).split(",")
     if origin.strip()
 ]
+EXTRACTION_META_DROP_KEYS = {
+    "auto_reject_reason",
+    "auto_reject_threshold",
+    "parse_unwrapped_extracted_json",
+    "parse_unwrapped_key",
+    "provider_detected",
+    "output_mode_used",
+    "parse_strategy_used",
+    "ruleset_version",
+    "extraction_mode",
+    "repaired",
+    "raw_len",
+}
 
 
 class ImportAICallLimitReached(Exception):
@@ -734,7 +749,24 @@ def _normalize_library_entry_for_read(value: Any) -> dict[str, Any] | None:
     }
 
 
-def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
+def _normalize_extraction_meta_for_read(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized = dict(value)
+    if (
+        "auto_review_reason" not in normalized
+        and isinstance(normalized.get("auto_reject_reason"), str)
+        and normalized.get("auto_reject_reason")
+    ):
+        normalized["auto_review_reason"] = normalized["auto_reject_reason"]
+    if "auto_review_threshold" not in normalized and "auto_reject_threshold" in normalized:
+        normalized["auto_review_threshold"] = normalized.get("auto_reject_threshold")
+    for key in EXTRACTION_META_DROP_KEYS:
+        normalized.pop(key, None)
+    return normalized or None
+
+
+def _coerce_extracted_json_core(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {
             "as_of": "",
@@ -746,17 +778,35 @@ def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
         }
     islibrary = _coerce_islibrary(payload)
     asset_views = payload.get("asset_views") if isinstance(payload.get("asset_views"), list) else []
+    ordered_asset_views: list[dict[str, Any]] = []
+    for item in asset_views:
+        if not isinstance(item, dict):
+            continue
+        ordered_item: dict[str, Any] = {}
+        for key in ("symbol", "market", "stance", "horizon", "confidence", "summary"):
+            if key in item:
+                ordered_item[key] = item.get(key)
+        # Keep any unexpected keys after canonical keys to avoid dropping data during read/cleanup.
+        for key, value in item.items():
+            if key not in ordered_item:
+                ordered_item[key] = value
+        ordered_asset_views.append(ordered_item)
     as_of_raw = payload.get("as_of")
     source_url_raw = payload.get("source_url")
-    normalized: dict[str, Any] = {
+    return {
         "as_of": as_of_raw.strip() if isinstance(as_of_raw, str) else "",
         "source_url": source_url_raw.strip() if isinstance(source_url_raw, str) else "",
         "islibrary": islibrary,
         "hasview": _coerce_hasview(payload),
-        "asset_views": asset_views,
+        "asset_views": ordered_asset_views,
         "library_entry": _normalize_library_entry_for_read(payload.get("library_entry")),
     }
-    meta = payload.get("meta")
+
+
+def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
+    normalized = _coerce_extracted_json_core(payload)
+    raw_meta = payload.get("meta") if isinstance(payload, dict) else None
+    meta = _normalize_extraction_meta_for_read(raw_meta)
     if isinstance(meta, dict):
         normalized["meta"] = meta
     return normalized
@@ -764,6 +814,9 @@ def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
 
 def _prepare_extraction_for_read(extraction: PostExtraction) -> None:
     extraction.extracted_json = _coerce_extracted_json_for_read(extraction.extracted_json)
+    if isinstance(extraction.parsed_model_output, dict):
+        parsed_unwrapped, _ = _unwrap_extracted_json_payload(extraction.parsed_model_output)
+        extraction.parsed_model_output = _coerce_extracted_json_core(parsed_unwrapped)
 
 
 def _unwrap_extracted_json_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -1961,8 +2014,6 @@ async def postprocess_auto_review(
                 "auto_review_threshold": threshold,
                 "auto_review_reason": reason,
                 "model_confidence": model_confidence,
-                "auto_reject_reason": reason,
-                "auto_reject_threshold": threshold,
                 "auto_policy_applied": "threshold_asset",
             },
         }
@@ -2060,10 +2111,15 @@ async def _apply_model_output_to_extraction(
         "raw_saved_len": raw_saved_len,
         "raw_truncated": raw_truncated,
     }
+    normalized_meta = _normalize_extraction_meta_for_read(extracted_json.get("meta"))
+    if isinstance(normalized_meta, dict):
+        extracted_json["meta"] = normalized_meta
+    else:
+        extracted_json.pop("meta", None)
 
     extraction.extracted_json = extracted_json
     extraction.raw_model_output = raw_model_output
-    extraction.parsed_model_output = parsed_payload
+    extraction.parsed_model_output = _coerce_extracted_json_core(parsed_payload)
     extraction.last_error = audit_meta.get("last_error") if isinstance(audit_meta.get("last_error"), str) else None
     await db.flush()
 
@@ -3360,6 +3416,8 @@ async def import_x_posts(
     raw_post_handle_by_id: dict[int, str] = {}
     skipped_not_followed_count = 0
     skipped_not_followed_samples: list[XSkippedNotFollowedRead] = []
+    pending_failed_dedup_ids: list[int] = []
+    pending_failed_reason_breakdown: Counter[str] = Counter()
 
     kols_result = await db.execute(select(Kol).where(Kol.platform == "x"))
     x_kols = list(kols_result.scalars().all())
@@ -3526,12 +3584,25 @@ async def import_x_posts(
         if resolved is not None:
             resolved_kol_id = resolved.id
 
+    dedup_ids_unique = list(dict.fromkeys(dedup_existing_raw_post_ids))
+    if dedup_ids_unique:
+        latest_map = await _latest_extractions_by_raw_post_id(db, raw_post_ids=set(dedup_ids_unique))
+        for raw_post_id in dedup_ids_unique:
+            latest = latest_map.get(raw_post_id)
+            if latest is None or _extraction_status_key(latest) != ExtractionStatus.pending.value:
+                continue
+            raw_post = await db.get(RawPost, raw_post_id)
+            if raw_post is None or not _is_failed_extraction(latest, raw_post):
+                continue
+            pending_failed_dedup_ids.append(raw_post_id)
+            pending_failed_reason_breakdown[_classify_last_error(latest.last_error)] += 1
+
     await db.commit()
     return XImportStatsRead(
         received_count=len(payload),
         inserted_raw_posts_count=len(inserted_raw_posts),
         inserted_raw_post_ids=inserted_raw_post_ids,
-        dedup_existing_raw_post_ids=list(dict.fromkeys(dedup_existing_raw_post_ids)),
+        dedup_existing_raw_post_ids=dedup_ids_unique,
         dedup_skipped_count=dedup_skipped_count,
         extract_success_count=extract_success_count,
         extract_failed_count=extract_failed_count,
@@ -3555,6 +3626,9 @@ async def import_x_posts(
         kol_created=kol_created,
         skipped_not_followed_count=skipped_not_followed_count,
         skipped_not_followed_samples=skipped_not_followed_samples,
+        pending_failed_dedup_count=len(pending_failed_dedup_ids),
+        pending_failed_dedup_ids=pending_failed_dedup_ids,
+        pending_failed_reason_breakdown=dict(pending_failed_reason_breakdown),
     )
 
 
@@ -4356,6 +4430,68 @@ async def retry_failed_x_extractions(
         failed_count=failed_count,
         skipped_count=skipped_count,
         failure_reasons=dict(reason_counter),
+    )
+
+
+@app.post("/ingest/x/retry-pending-all", response_model=XRetryPendingAllRead)
+async def retry_all_pending_x_extractions(
+    author_handle: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    posts = await _list_x_raw_posts(db, author_handle=author_handle)
+    post_map = {item.id: item for item in posts}
+    latest_map = await _latest_extractions_by_raw_post_id(db, raw_post_ids=set(post_map.keys()))
+
+    target_ids: list[int] = []
+    failed_pending_count = 0
+    active_pending_count = 0
+    skipped_not_followed_count = 0
+    for raw_post_id, raw_post in post_map.items():
+        latest = latest_map.get(raw_post_id)
+        if latest is None:
+            continue
+        if _extraction_status_key(latest) != ExtractionStatus.pending.value:
+            continue
+        if _terminal_review_skip_kind(raw_post=raw_post, latest_extraction=latest) is not None:
+            continue
+        if not await _raw_post_matches_enabled_x_kol(db, raw_post):
+            skipped_not_followed_count += 1
+            continue
+        target_ids.append(raw_post_id)
+        if _is_failed_extraction(latest, raw_post):
+            failed_pending_count += 1
+        else:
+            active_pending_count += 1
+
+    if not target_ids:
+        return XRetryPendingAllRead(
+            author_handle=author_handle,
+            pending_total=0,
+            failed_pending_count=0,
+            active_pending_count=0,
+            skipped_not_followed_count=skipped_not_followed_count,
+            submitted_count=0,
+            job_id=None,
+        )
+
+    create_resp = await create_extract_job(
+        ExtractJobCreateRequest(
+            raw_post_ids=target_ids,
+            mode="pending_or_failed",
+            batch_size=50,
+            batch_sleep_ms=200,
+            ai_call_limit_total=len(target_ids),
+            idempotency_key=None,
+        )
+    )
+    return XRetryPendingAllRead(
+        author_handle=author_handle,
+        pending_total=len(target_ids),
+        failed_pending_count=failed_pending_count,
+        active_pending_count=active_pending_count,
+        skipped_not_followed_count=skipped_not_followed_count,
+        submitted_count=len(target_ids),
+        job_id=create_resp.job_id,
     )
 
 
@@ -5473,8 +5609,6 @@ async def recompute_extraction_statuses(
                     "auto_review_threshold": threshold,
                     "auto_review_reason": reason,
                     "model_confidence": model_confidence,
-                    "auto_reject_reason": reason,
-                    "auto_reject_threshold": threshold,
                     "auto_policy_applied": "threshold_asset",
                 },
             }
@@ -5564,6 +5698,51 @@ async def fix_approved_missing_views(
     if not dry_run:
         await db.commit()
     return AdminFixApprovedMissingViewsRead(scanned=scanned, fixed=fixed, skipped=skipped, dry_run=dry_run)
+
+
+@app.post("/admin/extractions/cleanup-json", response_model=AdminCleanupExtractionJsonRead)
+async def cleanup_extractions_json(
+    confirm: str = Query(...),
+    days: int = Query(default=3650, ge=1, le=3650),
+    limit: int = Query(default=5000, ge=1, le=20000),
+    dry_run: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_destructive_admin_guard(confirm=confirm)
+    now = datetime.now(UTC)
+    since_ts = now - timedelta(days=days)
+    result = await db.execute(
+        select(PostExtraction)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+        .limit(limit)
+    )
+    rows = [item for item in result.scalars().all() if item.created_at is None or item.created_at >= since_ts]
+    scanned = 0
+    updated_ids: list[int] = []
+    for extraction in rows:
+        scanned += 1
+        before_extracted = extraction.extracted_json if isinstance(extraction.extracted_json, dict) else {}
+        after_extracted = _coerce_extracted_json_for_read(before_extracted)
+        before_parsed = extraction.parsed_model_output if isinstance(extraction.parsed_model_output, dict) else None
+        after_parsed: dict[str, Any] | None = None
+        if isinstance(before_parsed, dict):
+            parsed_unwrapped, _ = _unwrap_extracted_json_payload(before_parsed)
+            after_parsed = _coerce_extracted_json_core(parsed_unwrapped)
+        if before_extracted == after_extracted and before_parsed == after_parsed:
+            continue
+        updated_ids.append(extraction.id)
+        if dry_run:
+            continue
+        extraction.extracted_json = after_extracted
+        extraction.parsed_model_output = after_parsed
+    if not dry_run:
+        await db.commit()
+    return AdminCleanupExtractionJsonRead(
+        scanned=scanned,
+        updated=len(updated_ids),
+        dry_run=dry_run,
+        updated_ids=updated_ids,
+    )
 
 
 @app.get("/extractions/{extraction_id}", response_model=PostExtractionWithRawPostRead)

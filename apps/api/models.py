@@ -218,7 +218,7 @@ class PostExtraction(Base):
     prompt_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     raw_model_output: Mapped[str | None] = mapped_column(Text, nullable=True)
-    parsed_model_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    parsed_model_output: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     model_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

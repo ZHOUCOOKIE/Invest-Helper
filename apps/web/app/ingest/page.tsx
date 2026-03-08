@@ -95,6 +95,9 @@ type XImportStats = {
   kol_created: boolean;
   skipped_not_followed_count: number;
   skipped_not_followed_samples: SkippedNotFollowed[];
+  pending_failed_dedup_count: number;
+  pending_failed_dedup_ids: number[];
+  pending_failed_reason_breakdown: Record<string, number>;
 };
 
 type FollowingImportError = {
@@ -243,6 +246,18 @@ function formatExtractJobNetworkError(stage: "create" | "poll", err: unknown): s
   ].join(" ");
 }
 
+function classifyExtractFailureCategory(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes("手动停止")) return "手动停止";
+  if (lower.includes("无法连接后端") || lower.includes("network") || lower.includes("econnreset")) return "网络连接失败";
+  if (lower.includes("status=429") || lower.includes("rate_limit") || lower.includes("rate limited")) return "限流";
+  if (lower.includes("timeout")) return "超时";
+  if (lower.includes("status=503") || lower.includes("service unavailable")) return "服务不可用";
+  if (lower.includes("parse") || lower.includes("json")) return "解析失败";
+  if (lower.includes("budget_exhausted") || lower.includes("import_limit_reached")) return "额度不足";
+  return "处理失败";
+}
+
 function isStandardImportJson(value: unknown): value is XImportItem[] {
   if (!Array.isArray(value)) return false;
   return value.every((item) => {
@@ -299,7 +314,9 @@ export default function IngestPage() {
   const [followingImportStats, setFollowingImportStats] = useState<FollowingImportStats | null>(null);
   const extractPollControllerRef = useRef<AbortController | null>(null);
   const extractPollRunIdRef = useRef(0);
-  const cancelExtractPolling = (reason?: string) => {
+  const extractPollAbortSourceRef = useRef<"manual" | "unmount" | "replace" | "none">("none");
+  const cancelExtractPolling = (reason?: string, source: "manual" | "unmount" | "replace" = "manual") => {
+    extractPollAbortSourceRef.current = source;
     extractPollRunIdRef.current += 1;
     extractPollControllerRef.current?.abort();
     extractPollControllerRef.current = null;
@@ -319,7 +336,7 @@ export default function IngestPage() {
 
   useEffect(() => {
     return () => {
-      cancelExtractPolling();
+      cancelExtractPolling(undefined, "unmount");
     };
   }, []);
 
@@ -496,9 +513,10 @@ export default function IngestPage() {
         ? Math.max(0, Math.floor(aiCallLimitTotal))
         : null;
     const idempotencyKey = `ingest:${mode}:${Math.max(1, batchSize)}:${normalizedAiLimit ?? "none"}:${stableIds.join(",")}`.slice(0, 256);
-    cancelExtractPolling();
+    cancelExtractPolling(undefined, "replace");
     const pollController = new AbortController();
     extractPollControllerRef.current = pollController;
+    extractPollAbortSourceRef.current = "none";
     const runId = extractPollRunIdRef.current + 1;
     extractPollRunIdRef.current = runId;
     let createRes: Response;
@@ -781,6 +799,13 @@ export default function IngestPage() {
       importProgressHub.updateRunning("正在导入到 raw_posts...", "importing");
       const imported = await importRows(rows);
       setImportStats(imported);
+      if (imported.pending_failed_dedup_count > 0) {
+        setWorkflowStep(
+          `检测到 ${imported.pending_failed_dedup_count} 条待处理失败贴文，${
+            autoExtract ? "将重新上传AI模型进行解析..." : "请开启自动抽取或到待处理列表执行一键重传。"
+          }`,
+        );
+      }
 
       if (autoExtract && Object.keys(imported.imported_by_handle).length > 0) {
         setWorkflowStep("正在为 pending/failed/no_extraction 贴文续跑抽取...");
@@ -862,9 +887,20 @@ export default function IngestPage() {
       importProgressHub.markSuccess("导入与AI处理已完成。");
     } catch (err) {
       const message = err instanceof Error ? err.message : "流程执行失败";
-      setWorkflowError(message);
+      const suppressByUnmountAbort = message === "抽取任务轮询已取消" && extractPollAbortSourceRef.current === "unmount";
+      if (suppressByUnmountAbort) return;
+      if (message === "抽取任务轮询已取消" && extractPollAbortSourceRef.current === "manual") {
+        const manualStopped = "手动停止：已停止抽取轮询，未完成贴文保留在待处理列表。";
+        setWorkflowError(manualStopped);
+        setWorkflowStep(null);
+        importProgressHub.markError(manualStopped);
+        return;
+      }
+      const category = classifyExtractFailureCategory(message);
+      const labeledMessage = `[${category}] ${message}`;
+      setWorkflowError(labeledMessage);
       setWorkflowStep(null);
-      importProgressHub.markError(message);
+      importProgressHub.markError(labeledMessage);
     } finally {
       setWorkflowBusy(false);
     }
@@ -1037,7 +1073,7 @@ export default function IngestPage() {
           <button type="button" onClick={() => void refreshProgress()} disabled={workflowBusy}>
             刷新进度
           </button>
-          <button type="button" onClick={() => cancelExtractPolling("用户已取消抽取任务轮询。")}>
+          <button type="button" onClick={() => cancelExtractPolling("用户已取消抽取任务轮询。", "manual")}>
             停止轮询
           </button>
         </div>
@@ -1051,6 +1087,11 @@ export default function IngestPage() {
         {convertResult && <p style={{ margin: 0 }}>未关注排除（转换阶段）={convertResult.skipped_not_followed_count}</p>}
         {importStats && <p style={{ margin: 0 }}>导入接收={importStats.received_count}, 导入成功={importStats.inserted_raw_posts_count}</p>}
         {importStats && <p style={{ margin: 0 }}>去重排除={importStats.dedup_skipped_count}, 未关注排除（导入阶段）={importStats.skipped_not_followed_count}</p>}
+        {importStats && importStats.pending_failed_dedup_count > 0 && (
+          <p style={{ margin: 0, color: "#8a5800" }}>
+            本次文件命中待处理失败贴文={importStats.pending_failed_dedup_count}（将/需重新上传AI模型解析）
+          </p>
+        )}
         {extractStats && (
           <p style={{ margin: 0 }}>
             上传到AI模型={extractStats.success_count + extractStats.failed_count}, AI处理成功={extractStats.success_count}

@@ -22,10 +22,18 @@ It extracts structured signals, supports review workflows, and provides Daily Di
 - Extraction pipeline with single, batch, and async execution paths.
 - Prompt SSOT in `apps/api/services/prompts/extraction_prompt.py`.
 - Runtime normalize contract: `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
+- Canonical output order:
+  - top-level: `as_of, source_url, islibrary, hasview, asset_views, library_entry` (`extracted_json` may append `meta`)
+  - `asset_views[*]`: `symbol, market, stance, horizon, confidence, summary`
 - Strict enum handling for `market`, `stance`, and `horizon`.
 - Auto-review flow:
   - `hasview=0` => auto reject
   - `hasview=1` + valid confidence path => threshold review (`80`)
+  - reject reason key: `meta.auto_review_reason` (legacy `auto_reject_*` removed)
+- Parse-failure semantics:
+  - when model returns content but parse fails, extraction is still persisted as `pending`
+  - failure reason is recorded in `last_error`/parse meta and treated as failed semantics in progress/retry classifier
+- `parsed_model_output` is stored as ordered DB `JSON` (not `JSONB`) for deterministic key order replay/debug.
 - Traceability chain across `raw_posts -> post_extractions -> kol_views -> daily_digests`.
 - Replay-ready digests stored by unique `profile_id + digest_date` rows (current write path uses profile `id=1`).
 

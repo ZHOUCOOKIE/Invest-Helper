@@ -27,3 +27,8 @@ When changing extraction rules, update all of:
 - Top-level strict business keys: `as_of/source_url/islibrary/hasview/asset_views/library_entry`
 - Asset views keep `confidence>=70`
 - Library entry shape: `library_entry={tag,summary}` (`summary` 必须是 `测试`)
+- Canonical order:
+  - top-level: `as_of,source_url,islibrary,hasview,asset_views,library_entry`
+  - `asset_views[*]`: `symbol,market,stance,horizon,confidence,summary`
+- `parsed_model_output` uses DB `JSON` (ordered), not `JSONB`
+- parse-failed model output is persisted as extraction `pending` with `last_error`/parse meta and failed semantics in classifier

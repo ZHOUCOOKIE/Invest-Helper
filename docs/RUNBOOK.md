@@ -32,10 +32,30 @@ Expected business keys:
 - `hasview`
 - `asset_views`
 - `library_entry`
+Canonical key order:
+- top-level: `as_of, source_url, islibrary, hasview, asset_views, library_entry` (`meta` optional at tail)
+- `asset_views[*]`: `symbol, market, stance, horizon, confidence, summary`
 
 ## Inspect Normalize/Auto-Review Meta
 ```bash
 curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_error,extracted_json:{as_of:.extracted_json.as_of,source_url:.extracted_json.source_url,islibrary:.extracted_json.islibrary,hasview:.extracted_json.hasview,asset_views:.extracted_json.asset_views,library_entry:.extracted_json.library_entry},meta:.extracted_json.meta}'
+```
+
+## Inspect Parsed Model Output (ordered)
+```bash
+curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,parsed_model_output}'
+```
+Expected `parsed_model_output` order:
+- `as_of, source_url, islibrary, hasview, asset_views, library_entry`
+- stored as DB `JSON` (not `JSONB`) to keep insertion order
+
+## Cleanup Historical Extraction JSON/Parsed JSON
+```bash
+# dry-run
+curl -s -X POST "http://localhost:8000/admin/extractions/cleanup-json?confirm=YES&days=3650&limit=5000&dry_run=true" | jq
+
+# apply
+curl -s -X POST "http://localhost:8000/admin/extractions/cleanup-json?confirm=YES&days=3650&limit=5000&dry_run=false" | jq
 ```
 
 ## Typical Checks

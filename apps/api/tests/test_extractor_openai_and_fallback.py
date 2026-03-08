@@ -482,7 +482,7 @@ def test_non_library_without_asset_views_auto_rejected() -> None:
     meta = extraction.extracted_json.get("meta")
     assert isinstance(meta, dict)
     assert meta.get("auto_rejected") is True
-    assert meta.get("auto_reject_reason") == "hasview_zero"
+    assert meta.get("auto_review_reason") == "hasview_zero"
 
 
 def test_non_library_hasview_zero_auto_rejected_even_if_asset_views_present() -> None:
@@ -520,7 +520,7 @@ def test_non_library_hasview_zero_auto_rejected_even_if_asset_views_present() ->
     assert extraction.status == ExtractionStatus.rejected
     meta = extraction.extracted_json.get("meta")
     assert isinstance(meta, dict)
-    assert meta.get("auto_reject_reason") == "hasview_zero"
+    assert meta.get("auto_review_reason") == "hasview_zero"
 
 
 def test_hasview_one_with_asset_views_and_confidence_ge_80_auto_approved() -> None:

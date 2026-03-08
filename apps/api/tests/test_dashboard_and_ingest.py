@@ -1238,6 +1238,8 @@ def test_multi_handle_reupload_dedup_and_pending_or_failed_only_resumes_failed(m
     assert second_body["dedup_skipped_count"] == 2
     assert second_body["imported_by_handle"]["alice"]["dedup"] == 1
     assert second_body["imported_by_handle"]["bob"]["dedup"] == 1
+    assert second_body["pending_failed_dedup_count"] == 1
+    assert second_body["pending_failed_reason_breakdown"]["rate_limited"] == 1
 
     extract_resp = client.post(
         "/raw-posts/extract-batch",
@@ -1255,6 +1257,118 @@ def test_multi_handle_reupload_dedup_and_pending_or_failed_only_resumes_failed(m
     assert body["resumed_success"] == 1
     assert body["resumed_skipped"] == 0
     assert called_ids == [inserted_ids[1]]
+
+
+def test_retry_pending_all_creates_job_for_latest_pending_only(monkeypatch) -> None:  # noqa: ANN001
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
+    fake_db.seed(Kol(id=2, platform="x", handle="bob", display_name="Bob", enabled=True, created_at=now))
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="retry-pending-1",
+            url="https://x.com/alice/status/retry-pending-1",
+            content_text="failed pending",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            kol_id=1,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=2,
+            platform="x",
+            author_handle="alice",
+            external_id="retry-pending-2",
+            url="https://x.com/alice/status/retry-pending-2",
+            content_text="active pending",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            kol_id=1,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=3,
+            platform="x",
+            author_handle="bob",
+            external_id="retry-pending-3",
+            url="https://x.com/bob/status/retry-pending-3",
+            content_text="approved",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            kol_id=2,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=800,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "failed", "meta": {"parse_error": True}},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error="OpenAIRequestError: status=429",
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=801,
+            raw_post_id=2,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "active"},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=802,
+            raw_post_id=3,
+            status=ExtractionStatus.approved,
+            extracted_json={"summary": "ok"},
+            model_name="gpt-4o-mini",
+            extractor_name="openai_structured",
+            last_error=None,
+            created_at=now,
+        )
+    )
+
+    captured_payload: dict[str, object] = {}
+
+    async def fake_create_extract_job(payload):  # noqa: ANN001
+        captured_payload["raw_post_ids"] = payload.raw_post_ids
+        captured_payload["mode"] = payload.mode
+        return SimpleNamespace(job_id="job-retry-pending-1")
+
+    monkeypatch.setattr("main.create_extract_job", fake_create_extract_job)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.post("/ingest/x/retry-pending-all")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pending_total"] == 2
+    assert body["failed_pending_count"] == 1
+    assert body["active_pending_count"] == 1
+    assert body["submitted_count"] == 2
+    assert body["job_id"] == "job-retry-pending-1"
+    assert captured_payload["mode"] == "pending_or_failed"
+    assert captured_payload["raw_post_ids"] == [1, 2]
 
 
 def test_reject_then_reupload_same_file_skips_rejected_and_no_pending_created(monkeypatch) -> None:  # noqa: ANN001
@@ -2631,7 +2745,23 @@ def test_import_without_kol_multiple_handles_auto_creates_kols_and_import_shape(
     assert body["imported_by_handle"]["alice"]["inserted"] == 1
     assert body["imported_by_handle"]["bob"]["inserted"] == 1
     assert sorted(item["handle"] for item in body["created_kols"]) == ["alice", "bob"]
-    assert all("kol" in key or "handle" in key or "created" in key or "raw_post" in key or "dedup" in key or "warnings" in key or "extract" in key or "received" in key or "inserted" in key or "imported" in key or "skipped" in key for key in body.keys())
+    assert all(
+        "kol" in key
+        or "handle" in key
+        or "created" in key
+        or "raw_post" in key
+        or "dedup" in key
+        or "warnings" in key
+        or "extract" in key
+        or "received" in key
+        or "inserted" in key
+        or "imported" in key
+        or "skipped" in key
+        or "pending" in key
+        or "failed" in key
+        or "reason" in key
+        for key in body.keys()
+    )
     rows = list(fake_db._data[RawPost].values())
     assert len(rows) == 2
     by_external = {item.external_id: item for item in rows}

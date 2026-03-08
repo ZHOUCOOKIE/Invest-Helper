@@ -16,6 +16,9 @@
 - `hasview`
 - `asset_views`
 - `library_entry`
+键顺序约束（读写规范）：
+- 顶层：`as_of, source_url, islibrary, hasview, asset_views, library_entry`
+- `asset_views[*]`：`symbol, market, stance, horizon, confidence, summary`
 
 说明：
 - `islibrary` 只能是 `0|1`（int）
@@ -45,6 +48,13 @@
 - `hasview=0` 会自动拒绝
 - 自动通过必须满足 `hasview=1` 且走置信度阈值路径（`>=80`）
 - 记录 `meta.auto_policy_applied`
+- 自动拒绝原因键为 `meta.auto_review_reason`（历史 `auto_reject_*` 已清理）
+
+## 4.1 解析失败语义
+- 模型返回内容但解析失败时，仍会落一条 extraction（DB `status=pending`）
+- 错误信息进入 `last_error` 与 parse meta
+- 运行时分类将其判为 failed 语义（用于进度统计与重试）
 
 ## 5. 可追溯性
 - 通过 `prompt_hash` + `prompt_version` + `raw_model_output` + `parsed_model_output` 回放与审计。
+- `parsed_model_output` 以 DB `JSON` 保序存储（非 `JSONB`）。

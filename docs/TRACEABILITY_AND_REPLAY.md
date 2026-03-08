@@ -17,6 +17,8 @@ TL;DR
 - 审计：`prompt_version`, `prompt_text`, `prompt_hash`, `raw_model_output`, `parsed_model_output`
 - Prompt 组装来源：`apps/api/services/prompts/extraction_prompt.py`（`prompt_version` 当前为 `extract_v1`）
 - 状态：`status`, `extracted_json`, `last_error`
+- `parsed_model_output` 存储类型：`JSON`（保序，非 `JSONB`）
+- `parsed_model_output` 当前规范键顺序：`as_of, source_url, islibrary, hasview, asset_views, library_entry`
 
 3. `kol_views`
 - 观点证据：`source_url`, `kol_id`, `asset_id`, `horizon`, `stance`, `confidence`, `as_of`
@@ -60,6 +62,12 @@ Digest 摘要流排序时间字段回退顺序：
 
 - 任何文档提到“可追溯/可回放”时，必须与本文一致。
 - 任何运行命令示例必须引用 `docs/RUNBOOK.md`，避免重复版本。
+
+## Extraction Failure Semantics
+
+- 当模型返回内容但解析失败（例如 invalid JSON / truncated output after retries）时，仍会创建 extraction 记录。
+- 该记录数据库 `status` 保持 `pending`，并写入 `last_error` 与相关 parse meta。
+- 运行时分类会将其归为 failed 语义（用于进度统计、重试筛选）。
 
 ## Not Implemented
 

@@ -5,6 +5,9 @@
 - Prompt SSOT is `apps/api/services/prompts/extraction_prompt.py` only.
 - Structured schema and normalize logic aligned to `islibrary` contract.
 - Top-level contract is `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
+- Canonical key order is fixed:
+  - top-level: `as_of,source_url,islibrary,hasview,asset_views,library_entry` (`meta` optional at tail)
+  - `asset_views[*]`: `symbol,market,stance,horizon,confidence,summary`
 - `market` enum is `CRYPTO|STOCK|ETF|FOREX|OTHER`; legacy auto enum value is removed.
 - `stance/horizon/market` must be model-direct exact enum output; server does not apply alias-map keyword/synonym normalization.
 - `asset_views` keeps only `confidence>=70`.
@@ -20,6 +23,17 @@
   - `hasview=0` auto reject
   - auto approve requires `hasview=1` + threshold flow (`80`)
   - writes `meta.auto_policy_applied`
+  - reject reason key is `meta.auto_review_reason` (legacy `auto_reject_*` removed)
+- Parse-failure semantics:
+  - parse-failed extraction remains `pending` at row status
+  - error is captured in `last_error`/`meta.parse_error(_reason)`
+  - classifier treats these rows as failed semantics for progress/retry
+- `parsed_model_output` DB type is `JSON` (ordered), not `JSONB`
+- Meta normalization drops legacy/debug keys:
+  - `auto_reject_reason`, `auto_reject_threshold`
+  - `parse_unwrapped_extracted_json`, `parse_unwrapped_key`
+  - `provider_detected`, `output_mode_used`, `parse_strategy_used`
+  - `ruleset_version`, `extraction_mode`, `repaired`, `raw_len`
 - Daily Digest replay contract:
   - single-row overwrite by `profile_id + digest_date`
   - generation API params are `date/to_ts` only (`profile_id` not exposed; current fixed `1`)

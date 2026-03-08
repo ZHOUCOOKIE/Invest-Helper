@@ -61,10 +61,38 @@ type RecomputeStatusesResponse = {
   updated_ids: number[];
 };
 
+type RetryPendingAllResponse = {
+  author_handle: string | null;
+  pending_total: number;
+  failed_pending_count: number;
+  active_pending_count: number;
+  skipped_not_followed_count: number;
+  submitted_count: number;
+  job_id: string | null;
+};
+
 const PAGE_SIZE = 20;
 const statusOptions: ExtractionFilterStatus[] = ["all", "pending", "approved", "rejected", "library"];
 
 function summarizeExtraction(extracted: Record<string, unknown>): string {
+  const rawAssetViews = extracted.asset_views;
+  if (Array.isArray(rawAssetViews) && rawAssetViews.length > 0) {
+    let bestSummary = "";
+    let bestConfidence = -1;
+    for (const item of rawAssetViews) {
+      if (!item || typeof item !== "object") continue;
+      const view = item as Record<string, unknown>;
+      const summary = typeof view.summary === "string" ? view.summary.trim() : "";
+      if (!summary) continue;
+      const confidence = typeof view.confidence === "number" ? view.confidence : -1;
+      if (confidence >= bestConfidence) {
+        bestConfidence = confidence;
+        bestSummary = summary;
+      }
+    }
+    if (bestSummary) return bestSummary;
+  }
+
   if (typeof extracted.summary === "string" && extracted.summary.trim()) {
     return extracted.summary;
   }
@@ -80,15 +108,25 @@ function summarizeExtraction(extracted: Record<string, unknown>): string {
   return "（无摘要）";
 }
 
-function autoRejectInfo(extracted: Record<string, unknown>): { reason: string; threshold: string } | null {
+function buildRejectReason(extracted: Record<string, unknown>): string {
   const rawMeta = extracted.meta;
-  if (!rawMeta || typeof rawMeta !== "object") return null;
-  const meta = rawMeta as Record<string, unknown>;
-  if (meta.auto_rejected !== true) return null;
-  return {
-    reason: String(meta.auto_reject_reason ?? "-"),
-    threshold: String(meta.auto_reject_threshold ?? "-"),
-  };
+  const meta = rawMeta && typeof rawMeta === "object" ? (rawMeta as Record<string, unknown>) : null;
+  const assetViews = extracted.asset_views;
+  const hasAssetViews = Array.isArray(assetViews) && assetViews.length > 0;
+  const hasview = extracted.hasview;
+
+  if (meta?.auto_rejected === true) {
+    const code = String(meta.auto_review_reason ?? "-");
+    const threshold = String(meta.auto_review_threshold ?? "-");
+    const modelConfidence = String(meta.model_confidence ?? "-");
+    if (code === "hasview_zero") return "未识别到可审核资产观点（hasview=0 或 asset_views 为空）";
+    if (code === "confidence_below_threshold") return `模型置信度不足（${modelConfidence} < ${threshold}）`;
+    return code;
+  }
+  if (hasview === 0 || !hasAssetViews) {
+    return "未识别到可审核资产观点（hasview=0 或 asset_views 为空）";
+  }
+  return "规则判定拒绝";
 }
 
 function parseUrlNumericId(url: string): string | null {
@@ -183,6 +221,7 @@ export default function ExtractionsPage() {
   const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
   const [progress, setProgress] = useState<XProgress | null>(null);
   const [recomputeBusy, setRecomputeBusy] = useState(false);
+  const [retryPendingBusy, setRetryPendingBusy] = useState(false);
   const requestSeqRef = useRef(0);
 
   const canPrev = useMemo(() => offset > 0, [offset]);
@@ -318,6 +357,32 @@ export default function ExtractionsPage() {
     }
   };
 
+  const retryAllPending = async () => {
+    setRetryPendingBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/ingest/x/retry-pending-all", { method: "POST" });
+      const body = (await res.json()) as RetryPendingAllResponse | { detail?: string };
+      if (!res.ok) {
+        throw new Error("detail" in body ? (body.detail ?? "提交重传任务失败") : "提交重传任务失败");
+      }
+      const done = body as RetryPendingAllResponse;
+      if (!done.job_id || done.submitted_count === 0) {
+        setMessage("当前待处理列表没有可重传的贴文。");
+      } else {
+        setMessage(
+          `已提交重传任务 job_id=${done.job_id}，待处理总计=${done.pending_total}，失败待重传=${done.failed_pending_count}，进行中=${done.active_pending_count}。`,
+        );
+      }
+      await Promise.all([load(), refreshProgress()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交重传任务失败");
+    } finally {
+      setRetryPendingBusy(false);
+    }
+  };
+
   return (
     <main style={{ padding: "24px", fontFamily: "monospace" }}>
       <h1>抽取审核</h1>
@@ -368,6 +433,9 @@ export default function ExtractionsPage() {
         </button>
         {status === "pending" && (
           <>
+            <button type="button" onClick={() => void retryAllPending()} disabled={loading || retryPendingBusy}>
+              {retryPendingBusy ? "提交中..." : "重新全部上传 AI 解析"}
+            </button>
             <label>
               <input
                 type="checkbox"
@@ -397,7 +465,8 @@ export default function ExtractionsPage() {
 
       <div style={{ display: "grid", gap: "10px" }}>
         {items.map((item, idx) => {
-          const autoRejected = autoRejectInfo(item.extracted_json);
+          const rejectedReason = item.status === "rejected" ? buildRejectReason(item.extracted_json) : null;
+          const summaryText = summarizeExtraction(item.extracted_json);
           const serialNo = offset + idx + 1;
           const publicId = buildPublicId(item);
           return (
@@ -418,10 +487,10 @@ export default function ExtractionsPage() {
                 </a>
               </div>
               <div>发布时间: {displayPostedTime(item.raw_post)}</div>
-              <div style={{ marginTop: "6px" }}>摘要: {summarizeExtraction(item.extracted_json)}</div>
-              {autoRejected && (
+              {item.status === "approved" && <div style={{ marginTop: "6px" }}>摘要: {summaryText}</div>}
+              {item.status === "rejected" && rejectedReason && (
                 <div style={{ marginTop: "4px", color: "#8a5800" }}>
-                  自动拒绝=true, 原因={autoRejected.reason}, 阈值={autoRejected.threshold}
+                  异常已拒绝：{rejectedReason}
                 </div>
               )}
               <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>

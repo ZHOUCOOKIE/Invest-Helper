@@ -5,6 +5,12 @@
 docker compose up -d db db_test redis
 ```
 
+## Install Dependencies
+```bash
+pnpm install
+cd /home/zhoucookie/code/investpulse/apps/api && uv sync
+```
+
 ## One-Command Reset Dev DB Only (Keep Test DB)
 ```bash
 bash -lc 'cd /home/zhoucookie/code/investpulse && docker compose exec -T db psql -U postgres -d postgres -c "DROP DATABASE IF EXISTS investpulse WITH (FORCE);" && docker compose exec -T db psql -U postgres -d postgres -c "CREATE DATABASE investpulse;" && cd /home/zhoucookie/code/investpulse/apps/api && ENV=local DEBUG=false DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse uv run alembic upgrade head'
@@ -20,6 +26,45 @@ ENV=local DEBUG=true DATABASE_URL=postgresql+asyncpg://postgres:postgres@localho
 ```bash
 bash -lc 'cd /home/zhoucookie/code/investpulse/apps/api && ENV=local DEBUG=true DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse uv run uvicorn main:app --reload & cd /home/zhoucookie/code/investpulse/apps/web && pnpm dev'
 ```
+
+## Background Start/Stop Helper
+One-time install into current WSL user PATH:
+```bash
+mkdir -p ~/.local/bin
+ln -sf /home/zhoucookie/code/investpulse/scripts/investpulse ~/.local/bin/investpulse
+```
+
+Start in background and open browser tabs for Web + API docs:
+```bash
+investpulse start
+```
+
+Stop background services:
+```bash
+investpulse end
+```
+
+Check status / logs:
+```bash
+investpulse status
+investpulse logs
+investpulse logs api
+investpulse logs web
+investpulse restart
+```
+Behavior:
+- API runs at `http://localhost:8000`
+- Web runs at `http://localhost:3000`
+- logs are written to `logs/api.log` and `logs/web.log`
+- PID files are written to `.runtime/`
+- `start` tries `docker compose up -d db db_test redis` first; if WSL Docker integration is unavailable, it falls back to Windows Docker Desktop when available
+- API startup runs `alembic upgrade head` against dev DB `postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse`
+- supported env overrides:
+  - `INVESTPULSE_API_PORT`
+  - `INVESTPULSE_WEB_PORT`
+  - `INVESTPULSE_DB_HOST`
+  - `INVESTPULSE_DB_PORT`
+  - `INVESTPULSE_OPEN_BROWSER=0` to disable auto-open browser tabs
 
 ## Verify Extraction Output (latest)
 ```bash
@@ -40,6 +85,18 @@ Canonical key order:
 ```bash
 curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_error,extracted_json:{as_of:.extracted_json.as_of,source_url:.extracted_json.source_url,islibrary:.extracted_json.islibrary,hasview:.extracted_json.hasview,asset_views:.extracted_json.asset_views,library_entry:.extracted_json.library_entry},meta:.extracted_json.meta}'
 ```
+Note:
+- `meta` is intentionally compact now; many legacy/debug counters are removed during read normalization
+- rows without meaningful meta will omit `extracted_json.meta`
+
+## Inspect Extraction Repository Counts
+```bash
+curl -s "http://localhost:8000/extractions/stats" | jq
+```
+Returns:
+- `raw_posts_count`
+- `post_extractions_count`
+- `duplicate_raw_post_count`
 
 ## Inspect Parsed Model Output (ordered)
 ```bash
@@ -57,6 +114,46 @@ curl -s -X POST "http://localhost:8000/admin/extractions/cleanup-json?confirm=YE
 # apply
 curl -s -X POST "http://localhost:8000/admin/extractions/cleanup-json?confirm=YES&days=3650&limit=5000&dry_run=false" | jq
 ```
+
+## Refresh Approved Rows With Missing `asset_views`
+```bash
+# dry-run
+curl -s -X POST "http://localhost:8000/admin/extractions/refresh-wrong-extracted-json?confirm=YES&days=365&limit=2000&dry_run=true" | jq
+
+# apply
+curl -s -X POST "http://localhost:8000/admin/extractions/refresh-wrong-extracted-json?confirm=YES&days=365&limit=2000&dry_run=false" | jq
+```
+
+## Recompute Extraction Statuses
+```bash
+# dry-run
+curl -s -X POST "http://localhost:8000/admin/extractions/recompute-statuses?confirm=YES&days=365&limit=5000&dry_run=true" | jq
+
+# apply
+curl -s -X POST "http://localhost:8000/admin/extractions/recompute-statuses?confirm=YES&days=365&limit=5000&dry_run=false" | jq
+```
+
+## Force Replace One Extraction
+```bash
+curl -s -X POST "http://localhost:8000/extractions/123/re-extract" | jq
+```
+Behavior:
+- creates one replacement extraction for the same `raw_post`
+- when the new AI result is valid, older extraction rows for that `raw_post` are deleted together with `kol_views` referenced only by those deleted rows
+- when the new extraction is still failed semantics, old rows are kept
+
+## Inspect Async Extract Job
+```bash
+curl -s "http://localhost:8000/extract-jobs/<job_id>" | jq
+```
+Key fields:
+- `ai_call_used`
+- `openai_call_attempted_count`
+- `success_count`
+- `failed_count`
+- `skipped_count`
+- `max_concurrency_used`
+- `last_error_summary`
 
 ## Typical Checks
 - Enum strictness:

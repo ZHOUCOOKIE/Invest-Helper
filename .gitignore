@@ -12,3 +12,7 @@ RUNBOOK_LOCAL.*.txt
 
 # exported X data
 twitter-*.json
+
+# local runtime artifacts
+logs/
+.runtime/

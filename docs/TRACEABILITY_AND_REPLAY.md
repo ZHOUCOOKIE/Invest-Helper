@@ -17,8 +17,10 @@ TL;DR
 - 审计：`prompt_version`, `prompt_text`, `prompt_hash`, `raw_model_output`, `parsed_model_output`
 - Prompt 组装来源：`apps/api/services/prompts/extraction_prompt.py`（`prompt_version` 当前为 `extract_v1`）
 - 状态：`status`, `extracted_json`, `last_error`
+- `extracted_json.meta` 当前为精简读模型：仅保留影响自动审核、异常回放和状态解释的关键字段；无有效键时可省略 `meta`
 - `parsed_model_output` 存储类型：`JSON`（保序，非 `JSONB`）
 - `parsed_model_output` 当前规范键顺序：`as_of, source_url, islibrary, hasview, asset_views, library_entry`
+- 管理清理接口会把历史 `parsed_model_output.meta` 去掉，只保留核心业务键
 
 3. `kol_views`
 - 观点证据：`source_url`, `kol_id`, `asset_id`, `horizon`, `stance`, `confidence`, `as_of`
@@ -46,6 +48,10 @@ TL;DR
 - `GET /digests/dates` 返回系统 profile 可回放日期集合。
 - 日报保留窗口固定为近 `3` 天（今天及往前 `2` 天）；超出窗口数据会在读/列出路径自动清理。
 - `daily_digests.version` 当前写入路径固定为 `1`，不做多版本累积。
+- `POST /extractions/{id}/re-extract` 属于显式替换操作：
+  - 当新 extraction 成为有效 AI 结果时，同一 `raw_post` 的旧 extraction 行会被删除
+  - 仅被这些旧行引用的 `kol_views` 也会一起删除
+  - 当新 extraction 仍属 failed 语义时，旧行保留
 - 周报回放：
   - `POST /weekly-digests/generate` 按 `(profile_id, report_kind, anchor_date)` 覆盖重生成。
   - 周报在 generate/read/list 路径会按 `report_kind` 自动清理“非当前预期锚点日期”的陈旧记录。

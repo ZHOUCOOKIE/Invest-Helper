@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+RUNTIME_DIR="$ROOT_DIR/.runtime"
+LOG_DIR="$ROOT_DIR/logs"
+API_PID_FILE="$RUNTIME_DIR/api.pid"
+WEB_PID_FILE="$RUNTIME_DIR/web.pid"
+API_LOG_FILE="$LOG_DIR/api.log"
+WEB_LOG_FILE="$LOG_DIR/web.log"
+
+API_PORT="${INVESTPULSE_API_PORT:-8000}"
+WEB_PORT="${INVESTPULSE_WEB_PORT:-3000}"
+API_URL="http://127.0.0.1:${API_PORT}"
+WEB_URL="http://127.0.0.1:${WEB_PORT}"
+DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse}"
+DB_HOST="${INVESTPULSE_DB_HOST:-127.0.0.1}"
+DB_PORT="${INVESTPULSE_DB_PORT:-5432}"
+ENV_NAME="${ENV:-local}"
+DEBUG_VALUE="${DEBUG:-false}"
+OPEN_BROWSER="${INVESTPULSE_OPEN_BROWSER:-1}"
+
+usage() {
+  cat <<'EOF'
+Usage: investpulse <start|end|stop|restart|status|logs>
+
+  start    Start API and Web in the background
+  end      Stop API and Web
+  stop     Alias of end
+  restart  Restart API and Web
+  status   Show process status and URLs
+  logs     Show recent logs. Usage: investpulse logs [api|web]
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
+  touch "$API_LOG_FILE" "$WEB_LOG_FILE"
+}
+
+read_pid() {
+  local pid_file="$1"
+  if [[ -f "$pid_file" ]]; then
+    tr -d '[:space:]' <"$pid_file"
+  fi
+}
+
+is_pid_running() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+is_running() {
+  local pid_file="$1"
+  local pid
+  pid="$(read_pid "$pid_file")"
+  if is_pid_running "$pid"; then
+    return 0
+  fi
+  rm -f "$pid_file"
+  return 1
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "( sport = :${port} )" 2>/dev/null | grep -q .
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  return 1
+}
+
+listener_pid_for_port() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp "( sport = :${port} )" 2>/dev/null | grep -o 'pid=[0-9]\+' | head -n 1 | cut -d= -f2
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -n 1
+    return 0
+  fi
+  return 1
+}
+
+process_group_id() {
+  local pid="$1"
+  ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]'
+}
+
+wait_for_http() {
+  local name="$1"
+  local url="$2"
+  local pid_file="$3"
+  local log_file="$4"
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! is_running "$pid_file"; then
+      echo "$name failed to stay up. Recent log output:"
+      tail -n 40 "$log_file" || true
+      return 1
+    fi
+    sleep 1
+  done
+
+  echo "Timed out waiting for $name at $url. Recent log output:"
+  tail -n 40 "$log_file" || true
+  return 1
+}
+
+wait_for_port() {
+  local name="$1"
+  local host="$2"
+  local port="$3"
+  local attempt
+
+  for attempt in $(seq 1 60); do
+    if bash -lc "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Timed out waiting for $name at ${host}:${port}."
+  return 1
+}
+
+windows_docker_ready() {
+  command -v powershell.exe >/dev/null 2>&1 || return 1
+  powershell.exe -NoProfile -Command "docker compose version" >/dev/null 2>&1
+}
+
+start_windows_docker_desktop() {
+  command -v powershell.exe >/dev/null 2>&1 || return 1
+  powershell.exe -NoProfile -Command "if (Test-Path 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe') { Start-Process 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe'; exit 0 } exit 1" >/dev/null 2>&1
+}
+
+windows_compose_up() {
+  command -v powershell.exe >/dev/null 2>&1 || return 1
+  command -v wslpath >/dev/null 2>&1 || return 1
+
+  local windows_root
+  windows_root="$(wslpath -w "$ROOT_DIR")"
+  powershell.exe -NoProfile -Command "Set-Location '$windows_root'; docker compose up -d db db_test redis"
+}
+
+maybe_start_dependencies() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    (
+      cd "$ROOT_DIR"
+      docker compose up -d db db_test redis
+    )
+    wait_for_port "database" "$DB_HOST" "$DB_PORT"
+    return 0
+  fi
+
+  if ! windows_docker_ready; then
+    start_windows_docker_desktop || true
+    for _ in $(seq 1 60); do
+      if windows_docker_ready; then
+        break
+      fi
+      sleep 2
+    done
+  fi
+
+  if windows_docker_ready; then
+    windows_compose_up
+    wait_for_port "database" "$DB_HOST" "$DB_PORT"
+    return 0
+  fi
+
+  echo "Skipping docker compose. Docker Desktop is not ready in WSL or Windows."
+}
+
+run_migrations() {
+  if ! wait_for_port "database" "$DB_HOST" "$DB_PORT"; then
+    echo "Database is not reachable at ${DB_HOST}:${DB_PORT}."
+    echo "Start Docker Desktop or a local PostgreSQL instance, then rerun investpulse start."
+    return 1
+  fi
+  (
+    cd "$ROOT_DIR/apps/api"
+    env -u DEBUG -u ENV -u DATABASE_URL ENV="$ENV_NAME" DATABASE_URL="$DATABASE_URL" uv run alembic upgrade head
+  )
+}
+
+start_api() {
+  ensure_dirs
+
+  if is_running "$API_PID_FILE"; then
+    echo "API is already running (pid $(read_pid "$API_PID_FILE"))."
+    return 0
+  fi
+
+  if port_in_use "$API_PORT"; then
+    echo "Port ${API_PORT} is already in use. Refusing to start a second API process."
+    return 1
+  fi
+
+  maybe_start_dependencies
+  run_migrations
+
+  setsid bash -lc "cd \"$ROOT_DIR/apps/api\" && exec env -u DEBUG -u ENV -u DATABASE_URL ENV=\"$ENV_NAME\" DATABASE_URL=\"$DATABASE_URL\" uv run uvicorn main:app --host 0.0.0.0 --port \"$API_PORT\"" >>"$API_LOG_FILE" 2>&1 </dev/null &
+  echo "$!" >"$API_PID_FILE"
+
+  wait_for_http "API" "$API_URL/health" "$API_PID_FILE" "$API_LOG_FILE"
+  echo "API started at $API_URL (pid $(read_pid "$API_PID_FILE"))."
+}
+
+start_web() {
+  ensure_dirs
+
+  if is_running "$WEB_PID_FILE"; then
+    echo "Web is already running (pid $(read_pid "$WEB_PID_FILE"))."
+    return 0
+  fi
+
+  if port_in_use "$WEB_PORT"; then
+    echo "Port ${WEB_PORT} is already in use. Refusing to start a second Web process."
+    return 1
+  fi
+
+  setsid bash -lc "cd \"$ROOT_DIR/apps/web\" && exec ./node_modules/.bin/next dev --hostname 0.0.0.0 --port \"$WEB_PORT\"" >>"$WEB_LOG_FILE" 2>&1 </dev/null &
+  echo "$!" >"$WEB_PID_FILE"
+
+  wait_for_http "Web" "$WEB_URL" "$WEB_PID_FILE" "$WEB_LOG_FILE"
+  echo "Web started at $WEB_URL (pid $(read_pid "$WEB_PID_FILE"))."
+}
+
+stop_service() {
+  local name="$1"
+  local pid_file="$2"
+  local port="${3:-}"
+  local pid
+  local pgid
+  local attempt
+
+  pid="$(read_pid "$pid_file")"
+  if ! is_pid_running "$pid" && [[ -n "$port" ]]; then
+    pid="$(listener_pid_for_port "$port")"
+  fi
+
+  if ! is_pid_running "$pid"; then
+    rm -f "$pid_file"
+    echo "$name is not running."
+    return 0
+  fi
+
+  pgid="$(process_group_id "$pid")"
+  if [[ -n "$pgid" ]]; then
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+  fi
+  kill "$pid" 2>/dev/null || true
+
+  for attempt in $(seq 1 15); do
+    if ! is_pid_running "$pid" && { [[ -z "$port" ]] || ! port_in_use "$port"; }; then
+      rm -f "$pid_file"
+      echo "$name stopped."
+      return 0
+    fi
+    sleep 1
+  done
+
+  if [[ -n "$pgid" ]]; then
+    kill -KILL -- "-${pgid}" 2>/dev/null || true
+  fi
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$pid_file"
+  echo "$name killed after timeout."
+}
+
+open_browser_tabs() {
+  if [[ "$OPEN_BROWSER" != "1" ]]; then
+    return 0
+  fi
+  if ! command -v powershell.exe >/dev/null 2>&1; then
+    return 0
+  fi
+  powershell.exe -NoProfile -Command "Start-Process '${WEB_URL}'; Start-Process '${API_URL}/docs'" >/dev/null 2>&1 || true
+}
+
+print_status_line() {
+  local name="$1"
+  local pid_file="$2"
+  local url="$3"
+  if is_running "$pid_file"; then
+    echo "$name: running (pid $(read_pid "$pid_file")) $url"
+  else
+    echo "$name: stopped $url"
+  fi
+}
+
+show_status() {
+  ensure_dirs
+  print_status_line "API" "$API_PID_FILE" "$API_URL"
+  print_status_line "Web" "$WEB_PID_FILE" "$WEB_URL"
+  echo "Logs: $API_LOG_FILE | $WEB_LOG_FILE"
+}
+
+show_logs() {
+  ensure_dirs
+  case "${2:-all}" in
+    api)
+      tail -n 80 "$API_LOG_FILE"
+      ;;
+    web)
+      tail -n 80 "$WEB_LOG_FILE"
+      ;;
+    all)
+      echo "[api]"
+      tail -n 40 "$API_LOG_FILE"
+      echo
+      echo "[web]"
+      tail -n 40 "$WEB_LOG_FILE"
+      ;;
+    *)
+      echo "Unknown log target: ${2:-}"
+      usage
+      return 1
+      ;;
+  esac
+}
+
+start_all() {
+  start_api
+  start_web
+  open_browser_tabs
+  show_status
+}
+
+stop_all() {
+  stop_service "Web" "$WEB_PID_FILE" "$WEB_PORT"
+  stop_service "API" "$API_PID_FILE" "$API_PORT"
+}
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+    start)
+      start_all
+      ;;
+    end|stop)
+      stop_all
+      ;;
+    restart)
+      stop_all
+      start_all
+      ;;
+    status)
+      show_status
+      ;;
+    logs)
+      show_logs "$@"
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

@@ -2,7 +2,9 @@
 
 ## Extraction Prompt SSOT
 - Prompt rules and template live only in `apps/api/services/prompts/extraction_prompt.py`.
+- Current prompt body is Chinese instructions and currently renders these input fields into the single user message: `author_handle`, `url`, `posted_at`, `content_text`.
 - Runtime uses `render_prompt_bundle(...)` only, and sends a single `messages` item (`role=user`) from `apps/api/services/extraction.py`.
+- `platform` still exists in the render function signature, but the current template does not emit a `platform:` line.
 - `lang` prompt field is removed (it was only a language hint and not used by business logic/audit/replay).
 
 ## Model Output JSON (required core keys)
@@ -26,7 +28,9 @@ Canonical key order (read/write):
 - `asset_views[*]`:
   - exact shape: `{symbol, market, stance, horizon, confidence, summary}`
   - `confidence`: integer; normalize keeps only `>=70` (prompt text asks model to output `80..100`)
-  - `summary`: Chinese only
+  - `summary`: Chinese only, and prompt requires a short reason chain
+  - direct mention is strict: the post text itself must contain the asset ticker/name/symbol string
+  - `hasview=1` requires a real forward-looking or action-oriented investment claim; hypothetical, educational, sarcastic, meme-only content should stay `hasview=0`
 - `library_entry`:
   - when `islibrary=0`: must be `null` (normalize forces null)
   - when `islibrary=1`: must be `{tag,summary}`
@@ -39,19 +43,47 @@ Canonical key order (read/write):
 - `asset_views` with `confidence<70` are dropped
 - `hasview` is recomputed from final `asset_views` (`1` if non-empty else `0`)
 - `islibrary=1` + invalid/missing `library_entry` => downgrade to `islibrary=0`, `library_entry=null`
-- internal observability remains in `extracted_json.meta`
-- legacy debug keys are cleaned from `meta` during read/write normalization:
-  - `auto_reject_reason`, `auto_reject_threshold`
-  - `parse_unwrapped_extracted_json`, `parse_unwrapped_key`
-  - `provider_detected`, `output_mode_used`, `parse_strategy_used`
-  - `ruleset_version`, `extraction_mode`, `repaired`, `raw_len`
-- `parsed_model_output` is persisted as ordered JSON (DB type `JSON`, not `JSONB`)
+- `extracted_json.meta` is stored in compact form:
+  - keep auto-review result fields such as `auto_approved/auto_rejected/auto_review_reason/auto_review_threshold/model_confidence/auto_policy_applied`
+  - keep exceptional replay/status fields only when applicable, such as `library_downgraded(_reason)`, `parse_error(_reason)`, `fallback_reason`, `dummy_fallback`, `retry_source`, `truncated`, `raw_truncated`
+  - drop runtime/debug counters and null/false placeholders during read/write normalization
+  - if nothing meaningful remains, `meta` is omitted entirely on read/write normalization
+- `parsed_model_output` is persisted as ordered JSON (DB type `JSON`, not `JSONB`) and cleanup strips `meta` from that stored parsed payload
 
 ## Auto Review
 - if `hasview=0`: auto reject (`hasview_zero`)
 - auto approve requires `hasview=1` and confidence path meeting threshold (`80`)
-- `meta.auto_policy_applied` is recorded (current values: `threshold_asset|no_auto_review_user_trigger`)
+- `meta.auto_policy_applied` is recorded (current value: `threshold_asset`)
 - reject reason key is `meta.auto_review_reason` (legacy `auto_reject_reason` is removed)
+- user-triggered `POST /extractions/{id}/re-extract` goes through the same standard auto-review path after runtime validation succeeds
+- there is no special keep-pending bypass for `islibrary=1` user-triggered rows; if the normalized payload yields `hasview=0`, it is auto rejected by the standard rules
+
+## X Import And Extract Jobs (Current)
+- `POST /ingest/x/import`
+  - returns:
+    - `inserted_raw_post_ids`
+    - `dedup_existing_raw_post_ids`
+    - `pending_failed_dedup_count`
+    - `pending_failed_dedup_ids`
+    - `pending_failed_reason_breakdown`
+  - dedup raw posts whose latest extraction is still failed semantics (`status=pending` + error semantics) are surfaced via `pending_failed_dedup_*`
+  - dedup raw posts that already have successful / approved / rejected terminal results are not surfaced in `pending_failed_dedup_ids`
+- `POST /extract-jobs`
+  - creates an async extract job for a deduplicated list of `raw_post_ids`
+  - in-flight jobs reuse the existing job when all requested ids are already covered by queued/running work
+- `GET /extract-jobs/{job_id}`
+  - returns async job counters including:
+    - `ai_call_used`
+    - `openai_call_attempted_count`
+    - `max_concurrency_used`
+    - `last_error_summary`
+  - UI should prefer `ai_call_used` as the uploaded-to-AI count, then fall back to `openai_call_attempted_count`, then `success_count + failed_count`
+- `GET /ingest/x/progress`
+  - returns current global or per-author counts for `extracted_success/pending/failed/no_extraction`
+- `POST /ingest/x/retry-failed`
+  - retries latest failed-semantics rows only, skipping already-successful or terminal-reviewed raw posts
+- `POST /ingest/x/retry-pending-all`
+  - creates one async job covering all current pending raw posts that still match enabled X KOL scope
 
 ## Parse Failure Semantics
 - when model returns content but parse fails (for example invalid JSON/truncated output after retries), extraction record is still created as `pending`
@@ -64,6 +96,30 @@ Canonical key order (read/write):
     - primary: `raw_post.posted_at`
     - fallback: `post_extractions.created_at`
   - tie-breaker: extraction `id` desc
+- `GET /extractions/stats`
+  - returns current repository-level counts for:
+    - `raw_posts_count`
+    - `post_extractions_count`
+    - `duplicate_raw_post_count` (how many `raw_post` currently have multiple extraction rows)
+- `POST /extractions/{id}/re-extract`
+  - creates a new replacement extraction for the same `raw_post`
+  - once the new AI result is accepted by runtime validation, it immediately goes through the standard auto-review flow
+  - when the new extraction is a valid AI result (not failed parse/request/dummy fallback), it replaces all prior extraction results for that `raw_post`
+    - deletes all older extraction rows for that `raw_post`, including previously manual-approved rows
+    - deletes related `kol_views` that are referenced only by those deleted rows
+    - if the replacement row is still `pending`, `raw_post.review_status` is reset to `unreviewed`
+  - if the new extraction itself is failed semantics, old rows are kept
+
+## Admin Repair Endpoints (Current)
+- `POST /admin/extractions/refresh-wrong-extracted-json`
+  - scans approved rows whose `auto_applied_kol_view_ids` exist but `extracted_json.asset_views` is empty/missing
+  - rebuilds `asset_views` from referenced `kol_views`
+  - rewrites `meta` into compact form if meaningful keys remain, otherwise removes `meta`
+- `POST /admin/extractions/cleanup-json`
+  - rewrites historical `extracted_json` into the current normalized read shape
+  - rewrites `parsed_model_output` into ordered core JSON and removes parsed `meta`
+- `POST /admin/extractions/recompute-statuses`
+  - recomputes current auto-review status using normalized `extracted_json`, optionally preferring `parsed_model_output` when it yields a stronger decision
 
 ## Backward Read Tolerance
 - read path tolerates old records and legacy fields without rewriting historical approval status

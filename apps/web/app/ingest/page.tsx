@@ -3,6 +3,7 @@
 import type { DragEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useImportProgressHub } from "../components/import-progress-hub";
+import { getAiUploadCount, getExtractTargetIds } from "./import-stats.js";
 
 type ExtractorStatus = {
   mode: "auto" | "dummy" | "openai" | string;
@@ -140,6 +141,8 @@ type ExtractBatchStats = {
   resumed_success: number;
   resumed_failed: number;
   resumed_skipped: number;
+  ai_call_used?: number;
+  openai_call_attempted_count?: number;
 };
 
 type ExtractJobCreateResponse = {
@@ -822,7 +825,8 @@ export default function IngestPage() {
         );
       }
 
-      if (autoExtract && Object.keys(imported.imported_by_handle).length > 0) {
+      const extractTargetIds = getExtractTargetIds(imported);
+      if (autoExtract && extractTargetIds.length > 0) {
         setWorkflowStep("正在为 pending/failed/no_extraction 贴文续跑抽取...");
         importProgressHub.updateRunning("正在上传到AI模型处理...", "extracting");
         const totals: ExtractBatchStats = {
@@ -844,41 +848,41 @@ export default function IngestPage() {
           resumed_failed: 0,
           resumed_skipped: 0,
         };
-        const allIds = Array.from(new Set(Object.values(imported.imported_by_handle).flatMap((byHandle) => byHandle.raw_post_ids ?? [])));
-        if (allIds.length > 0) {
-          const extracted = await runExtractJob(allIds, extractBatchSize, "pending_or_failed", allIds.length, {
-            onJobCreated: (jobId) => importProgressHub.attachExtractJob(jobId),
-            onJobProgress: (job) => {
-              importProgressHub.applyExtractStats({
-                requested: job.requested_count,
-                success: job.success_count,
-                failed: job.failed_count,
-                skipped: job.skipped_count,
-              });
-              importProgressHub.updateRunning(
-                `AI处理中：成功=${job.success_count}，失败=${job.failed_count}，完成=${job.success_count + job.failed_count + job.skipped_count}/${job.requested_count}`,
-                "extracting",
-              );
-            },
-          });
-          totals.requested_count = extracted.requested_count;
-          totals.success_count = extracted.success_count;
-          totals.skipped_count = extracted.skipped_count;
-          totals.skipped_already_extracted_count = extracted.skipped_already_extracted_count;
-          totals.skipped_already_pending_count = extracted.skipped_already_pending_count;
-          totals.skipped_already_success_count = extracted.skipped_already_success_count;
-          totals.skipped_already_has_result_count = extracted.skipped_already_has_result_count;
-          totals.skipped_already_rejected_count = extracted.skipped_already_rejected_count;
-          totals.skipped_already_approved_count = extracted.skipped_already_approved_count;
-          totals.skipped_due_to_import_limit_count = extracted.skipped_due_to_import_limit_count;
-          totals.skipped_not_followed_count = extracted.skipped_not_followed_count;
-          totals.failed_count = extracted.failed_count;
-          totals.auto_rejected_count = extracted.auto_rejected_count;
-          totals.resumed_requested_count = extracted.resumed_requested_count;
-          totals.resumed_success = extracted.resumed_success;
-          totals.resumed_failed = extracted.resumed_failed;
-          totals.resumed_skipped = extracted.resumed_skipped;
-        }
+        const extracted = await runExtractJob(extractTargetIds, extractBatchSize, "pending_or_failed", extractTargetIds.length, {
+          onJobCreated: (jobId) => importProgressHub.attachExtractJob(jobId),
+          onJobProgress: (job) => {
+            importProgressHub.applyExtractStats({
+              requested: job.requested_count,
+              success: job.success_count,
+              failed: job.failed_count,
+              skipped: job.skipped_count,
+              uploaded: getAiUploadCount(job),
+            });
+            importProgressHub.updateRunning(
+              `AI处理中：成功=${job.success_count}，失败=${job.failed_count}，完成=${job.success_count + job.failed_count + job.skipped_count}/${job.requested_count}`,
+              "extracting",
+            );
+          },
+        });
+        totals.requested_count = extracted.requested_count;
+        totals.success_count = extracted.success_count;
+        totals.skipped_count = extracted.skipped_count;
+        totals.skipped_already_extracted_count = extracted.skipped_already_extracted_count;
+        totals.skipped_already_pending_count = extracted.skipped_already_pending_count;
+        totals.skipped_already_success_count = extracted.skipped_already_success_count;
+        totals.skipped_already_has_result_count = extracted.skipped_already_has_result_count;
+        totals.skipped_already_rejected_count = extracted.skipped_already_rejected_count;
+        totals.skipped_already_approved_count = extracted.skipped_already_approved_count;
+        totals.skipped_due_to_import_limit_count = extracted.skipped_due_to_import_limit_count;
+        totals.skipped_not_followed_count = extracted.skipped_not_followed_count;
+        totals.failed_count = extracted.failed_count;
+        totals.auto_rejected_count = extracted.auto_rejected_count;
+        totals.resumed_requested_count = extracted.resumed_requested_count;
+        totals.resumed_success = extracted.resumed_success;
+        totals.resumed_failed = extracted.resumed_failed;
+        totals.resumed_skipped = extracted.resumed_skipped;
+        totals.ai_call_used = extracted.ai_call_used;
+        totals.openai_call_attempted_count = extracted.openai_call_attempted_count;
         setExtractByHandle({});
         setExtractStats(totals);
         importProgressHub.applyExtractStats({
@@ -886,6 +890,7 @@ export default function IngestPage() {
           success: totals.success_count,
           failed: totals.failed_count,
           skipped: totals.skipped_count,
+          uploaded: getAiUploadCount(totals),
         });
       }
 
@@ -1110,7 +1115,7 @@ export default function IngestPage() {
         )}
         {extractStats && (
           <p style={{ margin: 0 }}>
-            上传到AI模型={extractStats.success_count + extractStats.failed_count}, AI处理成功={extractStats.success_count}
+            上传到AI模型={getAiUploadCount(extractStats)}, AI处理成功={extractStats.success_count}
           </p>
         )}
         {extractStats && <p style={{ margin: 0 }}>AI处理失败={extractStats.failed_count}</p>}

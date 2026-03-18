@@ -3,6 +3,7 @@
 ## Implemented
 - Extraction prompt rules upgraded to strict 6-key JSON: `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
 - Prompt SSOT is `apps/api/services/prompts/extraction_prompt.py` only.
+- Current extraction prompt body is Chinese and renders `author_handle/url/posted_at/content_text` into one user message.
 - Structured schema and normalize logic aligned to `islibrary` contract.
 - Top-level contract is `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
 - Canonical key order is fixed:
@@ -14,6 +15,10 @@
 - Chinese summary validation is enforced for:
   - `asset_views[*].summary`
   - `library_entry.summary`
+- Prompt-level extraction rules additionally enforce:
+  - strict direct-mention detection from the post text itself
+  - `hasview=1` only for real future/action-oriented investment claims
+  - `asset_views[*].summary` should carry a short reason chain in Chinese
 - Library boundary current contract:
   - `library_entry` final shape is `{tag, summary}`
   - `tag` enum: `macro|industry|thesis|strategy|risk|events`
@@ -29,11 +34,11 @@
   - error is captured in `last_error`/`meta.parse_error(_reason)`
   - classifier treats these rows as failed semantics for progress/retry
 - `parsed_model_output` DB type is `JSON` (ordered), not `JSONB`
-- Meta normalization drops legacy/debug keys:
-  - `auto_reject_reason`, `auto_reject_threshold`
-  - `parse_unwrapped_extracted_json`, `parse_unwrapped_key`
-  - `provider_detected`, `output_mode_used`, `parse_strategy_used`
-  - `ruleset_version`, `extraction_mode`, `repaired`, `raw_len`
+- Meta is stored in compact form:
+  - keeps auto-review result fields
+  - keeps exceptional state fields only when they affect replay/status (`library_downgraded`, `parse_error`, `fallback_reason`, `retry_source`, truncation flags)
+  - drops legacy/debug/runtime counters and empty placeholders
+  - omits `meta` completely when nothing meaningful remains
 - Daily Digest replay contract:
   - single-row overwrite by `profile_id + digest_date`
   - generation API params are `date/to_ts` only (`profile_id` not exposed; current fixed `1`)
@@ -50,14 +55,26 @@
   - generate/read/list paths auto-purge stale rows whose `anchor_date` is not the expected current anchor for that `report_kind`
 - Extractions listing:
   - `/extractions` response order is by business post time desc (`raw_post.posted_at`, fallback `extraction.created_at`), then by `id` desc
+  - `/extractions/stats` exposes current `raw_posts/post_extractions/duplicate_raw_post` counts
+  - manual force re-extract replaces all prior extraction rows for the same `raw_post` once the new AI result is valid; previous manual-approved rows are also deleted
+  - manual force re-extract uses the same auto-review rules as normal extraction after runtime validation succeeds
+- X ingest / extract-job operations:
+  - `/ingest/x/import` returns `pending_failed_dedup_count`, `pending_failed_dedup_ids`, and `pending_failed_reason_breakdown`
+  - dedup raw posts are only surfaced for follow-up extraction when their latest extraction is failed semantics
+  - `/extract-jobs/{job_id}` exposes `ai_call_used` in addition to OpenAI attempt counters
 - Portfolio holdings advice:
   - added `POST /portfolio/advice` for AI aggregation on user-provided holdings context
   - request supports `holding_reason_text/sell_timing_text/support_citations/risk_citations`
   - when `OPENAI_API_KEY` is missing or AI request fails, API returns deterministic fallback advice (no hard failure)
+- Local runtime helper:
+  - `scripts/investpulse` starts/stops API and Web in background, manages `.runtime/*.pid`, tails `logs/*.log`, and auto-runs API migrations on start
 - Web robustness updates:
   - daily/weekly digest pages retry short polling after generate-call proxy errors to recover eventual-success writes
   - weekly page shows request-aware API error context (`request_id`)
   - ingest page handles polling abort/unmount/manual-stop errors with explicit user-facing messages
+  - ingest progress prefers `ai_call_used` as uploaded-to-AI count and only falls back to attempt counters / success+failed for legacy payloads
+  - extractions page shows repository totals for `raw_posts`, `post_extractions`, and duplicate-version raw posts
+  - portfolio page delete now confirms and persists local storage immediately
 
 ## Not Implemented
 - Event reminder entity and reminder lifecycle workflow.

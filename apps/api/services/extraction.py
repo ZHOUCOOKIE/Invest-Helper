@@ -254,28 +254,23 @@ def normalize_extracted_json(
     normalized_meta: dict[str, Any] = {}
     if isinstance(extracted_json.get("meta"), dict):
         normalized_meta = dict(extracted_json["meta"])
-    normalized_meta["ruleset_version"] = LIBRARY_RULESET_VERSION
     alias_map = _normalize_alias_symbol_mapping(alias_to_symbol or {})
     known_symbol_set = _normalize_known_symbols(known_symbols)
 
     asset_views_raw = normalized.get("asset_views")
-    normalized_meta["asset_views_dropped_empty_symbol_count"] = _count_empty_symbol_asset_views_from_raw(asset_views_raw)
     normalized_asset_views = _normalize_asset_views(
         asset_views_raw,
         allow_missing_symbol=bool(alias_map),
     )
     normalized["asset_views"] = normalized_asset_views
     if alias_map and normalized["asset_views"]:
-        corrections = _apply_alias_symbol_corrections(
+        _apply_alias_symbol_corrections(
             normalized["asset_views"],
             alias_to_symbol=alias_map,
             known_symbols=known_symbol_set,
         )
-        if corrections:
-            normalized_meta["alias_corrections"] = corrections
-    valid_asset_views, asset_views_meta = _filter_asset_views_by_symbol_quality(normalized["asset_views"])
+    valid_asset_views, _asset_views_meta = _filter_asset_views_by_symbol_quality(normalized["asset_views"])
     normalized["asset_views"] = valid_asset_views
-    _merge_symbol_drop_meta(normalized_meta, asset_views_meta)
 
     as_of_raw = normalized.get("as_of")
     normalized_as_of = _normalize_as_of(
@@ -291,17 +286,12 @@ def normalize_extracted_json(
     )
 
     raw_islibrary = extracted_json.get("islibrary")
-    if raw_islibrary is not None:
-        normalized_meta["islibrary_raw"] = raw_islibrary
     islibrary = _normalize_islibrary(raw_islibrary)
     normalized["islibrary"] = islibrary
 
     raw_library_entry = normalized.get("library_entry")
     normalized_library_entry, library_entry_drop_reason = _normalize_library_entry(raw_library_entry)
     normalized["library_entry"] = normalized_library_entry
-    if library_entry_drop_reason is not None:
-        normalized_meta["library_entry_dropped"] = True
-        normalized_meta["library_entry_drop_reason"] = library_entry_drop_reason
 
     if islibrary == 1 and normalized_library_entry is None:
         normalized["islibrary"] = 0
@@ -312,18 +302,14 @@ def normalize_extracted_json(
 
     if islibrary == 0:
         normalized["library_entry"] = None
-    else:
-        normalized_meta["library_entry_kept"] = normalized_library_entry is not None
 
-    normalized_asset_views, threshold_meta = _filter_asset_views_by_confidence(
+    normalized_asset_views, _threshold_meta = _filter_asset_views_by_confidence(
         normalized["asset_views"],
         min_confidence=ASSET_VIEW_MIN_CONFIDENCE,
     )
     normalized["asset_views"] = normalized_asset_views
-    normalized_meta.update(threshold_meta)
-    normalized_asset_views, language_meta = _filter_asset_views_by_summary_language(normalized["asset_views"])
+    normalized_asset_views, _language_meta = _filter_asset_views_by_summary_language(normalized["asset_views"])
     normalized["asset_views"] = normalized_asset_views
-    normalized_meta.update(language_meta)
     normalized["hasview"] = 1 if normalized["asset_views"] else 0
 
     if include_meta and normalized_meta:
@@ -766,16 +752,12 @@ class OpenAIExtractor(Extractor):
         self.openrouter_app_name = openrouter_app_name.strip()
         self.provider_detected = detect_provider_from_base_url(self.base_url)
         self.output_mode = resolve_extraction_output_mode(self.base_url)
-        self.summary_language_retry_hint = False
         self.truncated_retry_hint = False
         self.invalid_json_retry_hint = False
         self._last_parse_error_meta: dict[str, Any] = {}
         self._truncated_retry_used = False
         self._invalid_json_retry_used = False
         self._audit = ExtractionAudit()
-
-    def set_summary_language_retry_hint(self, enabled: bool) -> None:
-        self.summary_language_retry_hint = bool(enabled)
 
     def _reset_parse_error_context(self) -> None:
         self._last_parse_error_meta = {}

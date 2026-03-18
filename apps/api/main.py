@@ -57,6 +57,7 @@ from schemas import (
     DashboardRead,
     DashboardTopAssetRead,
     DailyDigestRead,
+    ExtractionStatsRead,
     WeeklyDigestRead,
     ExtractJobCreateRead,
     ExtractJobCreateRequest,
@@ -103,11 +104,9 @@ from services.extraction import (
     OpenAIFallbackError,
     OpenAIExtractor,
     parse_text_json_object,
-    detect_provider_from_base_url,
     default_extracted_json,
     normalize_extracted_json,
     get_openai_call_budget_remaining,
-    resolve_extraction_output_mode,
     reset_openai_call_budget_counter,
     select_extractor,
     try_consume_openai_call_budget,
@@ -155,9 +154,7 @@ CORS_ALLOW_ORIGINS = [
     for origin in os.getenv("CORS_ALLOW_ORIGINS", DEFAULT_CORS_ALLOW_ORIGINS).split(",")
     if origin.strip()
 ]
-EXTRACTION_META_DROP_KEYS = {
-    "auto_reject_reason",
-    "auto_reject_threshold",
+EXTRACTION_META_LEGACY_DROP_KEYS = {
     "parse_unwrapped_extracted_json",
     "parse_unwrapped_key",
     "provider_detected",
@@ -167,6 +164,27 @@ EXTRACTION_META_DROP_KEYS = {
     "extraction_mode",
     "repaired",
     "raw_len",
+    "truncated_retry_used",
+    "invalid_json_retry_used",
+    "asset_views_dropped_empty_symbol_count",
+    "islibrary_raw",
+    "asset_views_min_confidence_threshold",
+    "asset_views_dropped_low_confidence_count",
+    "asset_views_dropped_non_zh_summary_count",
+    "asset_views_capped",
+    "asset_views_original_count",
+    "asset_views_final_count",
+    "asset_views_cap_reason",
+    "asset_views_kept_symbols",
+    "summary_language",
+    "summary_language_violation",
+    "summary_language_retry_used",
+    "extra_retry_budget_total",
+    "extra_retry_budget_used",
+    "library_entry_dropped",
+    "library_entry_drop_reason",
+    "library_entry_kept",
+    "alias_corrections",
 }
 
 
@@ -661,9 +679,6 @@ def _build_extraction_meta(
     extractor: DummyExtractor | OpenAIExtractor,
     fallback_reason: str | None,
     last_error: str | None,
-    summary_language: str,
-    summary_language_violation: bool,
-    summary_language_retry_used: bool,
 ) -> dict[str, Any]:
     base_meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
     safe_meta = dict(base_meta)
@@ -681,9 +696,6 @@ def _build_extraction_meta(
         safe_meta["dummy_fallback"] = True
     if last_error:
         safe_meta["parse_error"] = safe_meta.get("parse_error") or ("json" in last_error.lower() and "openai" in last_error.lower())
-    safe_meta["summary_language"] = summary_language
-    safe_meta["summary_language_violation"] = summary_language_violation
-    safe_meta["summary_language_retry_used"] = summary_language_retry_used
     return safe_meta
 
 
@@ -749,21 +761,85 @@ def _normalize_library_entry_for_read(value: Any) -> dict[str, Any] | None:
     }
 
 
-def _normalize_extraction_meta_for_read(value: Any) -> dict[str, Any] | None:
+def _copy_compact_int_meta(raw: dict[str, Any], compact: dict[str, Any], *, key: str, minimum: int | None = None) -> None:
+    value = raw.get(key)
+    if not isinstance(value, int):
+        return
+    if minimum is not None and value < minimum:
+        return
+    compact[key] = value
+
+
+def _compact_extraction_meta(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    normalized = dict(value)
+
+    raw = dict(value)
     if (
-        "auto_review_reason" not in normalized
-        and isinstance(normalized.get("auto_reject_reason"), str)
-        and normalized.get("auto_reject_reason")
+        "auto_review_reason" not in raw
+        and isinstance(raw.get("auto_reject_reason"), str)
+        and raw.get("auto_reject_reason")
     ):
-        normalized["auto_review_reason"] = normalized["auto_reject_reason"]
-    if "auto_review_threshold" not in normalized and "auto_reject_threshold" in normalized:
-        normalized["auto_review_threshold"] = normalized.get("auto_reject_threshold")
-    for key in EXTRACTION_META_DROP_KEYS:
-        normalized.pop(key, None)
-    return normalized or None
+        raw["auto_review_reason"] = raw["auto_reject_reason"]
+    if "auto_review_threshold" not in raw and isinstance(raw.get("auto_reject_threshold"), int):
+        raw["auto_review_threshold"] = raw["auto_reject_threshold"]
+    for key in EXTRACTION_META_LEGACY_DROP_KEYS:
+        raw.pop(key, None)
+
+    compact: dict[str, Any] = {}
+    if raw.get("auto_approved") is True:
+        compact["auto_approved"] = True
+    if raw.get("auto_rejected") is True:
+        compact["auto_rejected"] = True
+    auto_review_reason = raw.get("auto_review_reason")
+    if isinstance(auto_review_reason, str) and auto_review_reason.strip():
+        compact["auto_review_reason"] = auto_review_reason.strip()
+    _copy_compact_int_meta(raw, compact, key="auto_review_threshold", minimum=0)
+    _copy_compact_int_meta(raw, compact, key="model_confidence", minimum=0)
+    auto_policy_applied = raw.get("auto_policy_applied")
+    if isinstance(auto_policy_applied, str):
+        normalized_policy = auto_policy_applied.strip()
+        if normalized_policy == "threshold_asset":
+            compact["auto_policy_applied"] = normalized_policy
+
+    if raw.get("library_downgraded") is True:
+        compact["library_downgraded"] = True
+        downgrade_reason = raw.get("library_downgrade_reason")
+        if isinstance(downgrade_reason, str) and downgrade_reason.strip():
+            compact["library_downgrade_reason"] = downgrade_reason.strip()
+
+    if raw.get("parse_error") is True:
+        compact["parse_error"] = True
+    parse_error_reason = raw.get("parse_error_reason")
+    if isinstance(parse_error_reason, str) and parse_error_reason.strip():
+        compact["parse_error_reason"] = parse_error_reason.strip()
+
+    fallback_reason = raw.get("fallback_reason")
+    if isinstance(fallback_reason, str) and fallback_reason.strip():
+        compact["fallback_reason"] = fallback_reason.strip()
+    if raw.get("dummy_fallback") is True:
+        compact["dummy_fallback"] = True
+
+    if raw.get("retry_exhausted") is True:
+        compact["retry_exhausted"] = True
+    retry_source = raw.get("retry_source")
+    if isinstance(retry_source, str) and retry_source.strip():
+        compact["retry_source"] = retry_source.strip()
+
+    if raw.get("truncated") is True:
+        compact["truncated"] = True
+        _copy_compact_int_meta(raw, compact, key="original_length", minimum=1)
+        _copy_compact_int_meta(raw, compact, key="max_length", minimum=1)
+
+    if raw.get("raw_truncated") is True:
+        compact["raw_truncated"] = True
+        _copy_compact_int_meta(raw, compact, key="raw_saved_len", minimum=0)
+
+    return compact or None
+
+
+def _normalize_extraction_meta_for_read(value: Any) -> dict[str, Any] | None:
+    return _compact_extraction_meta(value)
 
 
 def _coerce_extracted_json_core(payload: Any) -> dict[str, Any]:
@@ -807,6 +883,10 @@ def _coerce_extracted_json_for_read(payload: Any) -> dict[str, Any]:
     normalized = _coerce_extracted_json_core(payload)
     raw_meta = payload.get("meta") if isinstance(payload, dict) else None
     meta = _normalize_extraction_meta_for_read(raw_meta)
+    if isinstance(meta, dict) and "model_confidence" not in meta and meta.get("auto_approved") is True:
+        derived_confidence = _coerce_extraction_confidence(normalized)
+        if isinstance(derived_confidence, int):
+            meta["model_confidence"] = derived_confidence
     if isinstance(meta, dict):
         normalized["meta"] = meta
     return normalized
@@ -1417,40 +1497,13 @@ def _cap_asset_views_for_runtime_rules(
     extracted_json: dict[str, Any],
 ) -> None:
     views = extracted_json.get("asset_views")
-    meta = extracted_json.get("meta") if isinstance(extracted_json.get("meta"), dict) else {}
     if not isinstance(views, list):
+        extracted_json["asset_views"] = []
         extracted_json["hasview"] = 0
-        extracted_json["meta"] = {
-            **meta,
-            "asset_views_capped": False,
-            "asset_views_original_count": 0,
-            "asset_views_final_count": 0,
-            "asset_views_cap_reason": None,
-            "asset_views_kept_symbols": [],
-        }
         return
 
-    original_count = len(views)
-    cap_reason: str | None = None
-    capped = False
-    kept_views = views
-    final_count = len(kept_views)
-    kept_symbols: list[str] = []
-    for item in kept_views:
-        if isinstance(item, dict):
-            symbol = _normalize_asset_symbol(item.get("symbol"))
-            if symbol:
-                kept_symbols.append(symbol)
-    extracted_json["asset_views"] = kept_views
-    extracted_json["hasview"] = 1 if kept_views else 0
-    extracted_json["meta"] = {
-        **meta,
-        "asset_views_capped": capped,
-        "asset_views_original_count": original_count,
-        "asset_views_final_count": final_count,
-        "asset_views_cap_reason": cap_reason,
-        "asset_views_kept_symbols": kept_symbols,
-    }
+    extracted_json["asset_views"] = views
+    extracted_json["hasview"] = 1 if views else 0
 
 
 async def upsert_asset(
@@ -1896,13 +1949,6 @@ def _resolve_auto_review_trigger(
     force_reextract: bool,
     force_reextract_triggered_by: str | None,
 ) -> Literal["auto", "user", "bulk"]:
-    if not force_reextract:
-        return "auto"
-    source = _normalize_force_reextract_trigger_value(force_reextract_triggered_by)
-    if source == FORCE_REEXTRACT_TRIGGER_USER:
-        return "user"
-    if source == FORCE_REEXTRACT_TRIGGER_BULK_PENDING_RETRY:
-        return "bulk"
     return "auto"
 
 
@@ -1996,19 +2042,9 @@ async def postprocess_auto_review(
     trigger: Literal["auto", "user", "bulk"] = "auto",
 ) -> str | None:
     threshold = AUTO_REVIEW_CONFIDENCE_THRESHOLD
-    if classify_extraction_state(extraction, raw_post) != ClassifiedExtractionState.success:
+    if classify_extraction_state(extraction, None) != ClassifiedExtractionState.success:
         return None
     if not isinstance(extraction.extracted_json, dict):
-        return None
-    if trigger not in {"auto", "bulk"}:
-        base_meta = extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json.get("meta"), dict) else {}
-        extraction.extracted_json = {
-            **extraction.extracted_json,
-            "meta": {
-                **base_meta,
-                "auto_policy_applied": "no_auto_review_user_trigger",
-            },
-        }
         return None
     decision, reason, model_confidence = _evaluate_auto_review_decision(
         extraction.extracted_json,
@@ -2151,6 +2187,13 @@ async def _apply_model_output_to_extraction(
     except Exception as exc:  # noqa: BLE001
         auto_error = _build_last_error(exc)
         extraction.last_error = auto_error if not extraction.last_error else f"{extraction.last_error}; auto_apply={auto_error}"
+    final_payload = _coerce_extracted_json_core(extraction.extracted_json)
+    final_meta = _normalize_extraction_meta_for_read(
+        extraction.extracted_json.get("meta") if isinstance(extraction.extracted_json, dict) else None
+    )
+    if isinstance(final_meta, dict):
+        final_payload["meta"] = final_meta
+    extraction.extracted_json = final_payload
     return auto_review_outcome
 
 
@@ -2172,6 +2215,96 @@ def _is_active_extraction_unique_index_candidate(extraction: PostExtraction) -> 
         return False
     last_error = (extraction.last_error or "").strip()
     return last_error == ""
+
+
+def _iter_auto_applied_kol_view_ids(extraction: PostExtraction) -> list[int]:
+    raw_ids = extraction.auto_applied_kol_view_ids
+    if not isinstance(raw_ids, list):
+        return []
+    return [int(item) for item in raw_ids if isinstance(item, int)]
+
+
+def _iter_referenced_kol_view_ids(extraction: PostExtraction) -> list[int]:
+    ids: list[int] = []
+    if isinstance(extraction.applied_kol_view_id, int):
+        ids.append(int(extraction.applied_kol_view_id))
+    for item in _iter_auto_applied_kol_view_ids(extraction):
+        if item not in ids:
+            ids.append(item)
+    return ids
+
+
+def _extraction_references_kol_view(extraction: PostExtraction, kol_view_id: int) -> bool:
+    return kol_view_id in _iter_referenced_kol_view_ids(extraction)
+
+
+def _should_cleanup_replaced_extractions_for_force_reextract(extraction: PostExtraction) -> bool:
+    return classify_extraction_state(extraction, None) != ClassifiedExtractionState.failed
+
+
+async def _delete_owned_auto_applied_views_for_extraction(
+    db: AsyncSession,
+    *,
+    extraction: PostExtraction,
+    all_rows: list[PostExtraction],
+) -> list[int]:
+    deleted_ids: list[int] = []
+    for view_id in _iter_referenced_kol_view_ids(extraction):
+        referenced_elsewhere = any(
+            row.id != extraction.id and _extraction_references_kol_view(row, view_id)
+            for row in all_rows
+        )
+        if referenced_elsewhere:
+            continue
+        kol_view = await db.get(KolView, view_id)
+        if kol_view is None:
+            continue
+        await db.delete(kol_view)
+        deleted_ids.append(view_id)
+    extraction.auto_applied_count = 0
+    extraction.auto_policy = None
+    extraction.auto_applied_kol_view_ids = []
+    return deleted_ids
+
+
+async def _cleanup_replaced_extractions_for_force_reextract(
+    db: AsyncSession,
+    *,
+    raw_post: RawPost,
+    keep_extraction_id: int,
+) -> tuple[list[int], list[int]]:
+    result = await db.execute(
+        select(PostExtraction)
+        .where(PostExtraction.raw_post_id == raw_post.id)
+        .order_by(PostExtraction.created_at.desc(), PostExtraction.id.desc())
+    )
+    rows = list(result.scalars().all())
+    keep = next((item for item in rows if item.id == keep_extraction_id), None)
+    deleted_extraction_ids: list[int] = []
+    deleted_kol_view_ids: list[int] = []
+
+    for row in rows:
+        if row.id == keep_extraction_id:
+            continue
+        deleted_kol_view_ids.extend(
+            await _delete_owned_auto_applied_views_for_extraction(
+                db,
+                extraction=row,
+                all_rows=rows,
+            )
+        )
+        deleted_extraction_ids.append(int(row.id))
+        await db.delete(row)
+
+    keep_status = _extraction_status_key(keep) if keep is not None else ""
+    if keep_status not in {ExtractionStatus.approved.value, ExtractionStatus.rejected.value}:
+        raw_post.review_status = ReviewStatus.unreviewed
+        raw_post.reviewed_at = None
+        raw_post.reviewed_by = None
+
+    if deleted_extraction_ids or deleted_kol_view_ids:
+        await db.flush()
+    return deleted_extraction_ids, deleted_kol_view_ids
 
 
 async def _deactivate_active_extraction_for_raw_post(
@@ -2312,9 +2445,6 @@ async def create_pending_extraction(
     budget_exhausted = False
     fallback_reason: str | None = None
     force_fail_reason: str | None = None
-    summary_language = "zh"
-    summary_language_violation = False
-    summary_language_retry_used = False
     allow_dummy_fallback = bool(settings.dummy_fallback) or settings.extractor_mode.strip().lower() == "dummy"
 
     runtime_budget_total = (
@@ -2366,76 +2496,18 @@ async def create_pending_extraction(
     if not isinstance(extracted_json, dict):
         extracted_json = default_extracted_json(extraction_input)
     parsed_for_apply = extracted_json.copy()
-    summary_language = _detect_extracted_summary_language(extracted_json)
-    summary_language_violation = summary_language == "non_zh"
-    parse_error_meta = _extract_openai_parse_error_meta(extractor)
-    truncated_retry_used = bool(parse_error_meta.get("truncated_retry_used"))
-    invalid_json_retry_used = bool(parse_error_meta.get("invalid_json_retry_used"))
-    if summary_language_violation and force_fail_reason is None and isinstance(extractor, OpenAIExtractor):
-        if truncated_retry_used or invalid_json_retry_used:
-            last_error = _append_last_error(last_error, "summary_language_violation_no_retry_budget_after_parse_retry")
-        else:
-            retry_call_allowed = False
-            if openai_call_limiter is not None:
-                retry_call_allowed = openai_call_limiter.try_consume()
-            else:
-                retry_call_allowed = try_consume_openai_call_budget(
-                    settings,
-                    budget_total=runtime_budget_total,
-                )
-            if retry_call_allowed:
-                summary_language_retry_used = True
-                extractor.set_summary_language_retry_hint(True)
-                try:
-                    extracted_json_retry = await _run_extractor_extract(extractor, extraction_input)
-                    if isinstance(extracted_json_retry, dict):
-                        extracted_json_retry = extracted_json_retry.copy()
-                    else:
-                        extracted_json_retry = default_extracted_json(extraction_input)
-                    extracted_json = normalize_extracted_json(
-                        extracted_json_retry,
-                        posted_at=extraction_input.posted_at,
-                        include_meta=True,
-                        alias_to_symbol=alias_to_symbol,
-                        known_symbols=known_symbols,
-                    )
-                    parsed_for_apply = extracted_json.copy()
-                    summary_language = _detect_extracted_summary_language(extracted_json)
-                    summary_language_violation = summary_language == "non_zh"
-                    if summary_language_violation:
-                        last_error = _append_last_error(last_error, "summary_language_violation_after_retry")
-                except Exception as retry_exc:  # noqa: BLE001
-                    last_error = _append_last_error(last_error, f"summary_language_retry_failed: {_build_last_error(retry_exc)}")
-                finally:
-                    extractor.set_summary_language_retry_hint(False)
-            else:
-                no_retry_budget_reason = "summary_language_violation_no_retry_budget"
-                if openai_call_limiter is not None:
-                    no_retry_budget_reason = "summary_language_violation_no_retry_import_limit"
-                last_error = _append_last_error(last_error, no_retry_budget_reason)
-
     parse_error_meta = _extract_openai_parse_error_meta(extractor)
     extraction_meta = _build_extraction_meta(
         extracted_json=extracted_json,
         extractor=extractor,
         fallback_reason=fallback_reason,
         last_error=last_error,
-        summary_language=summary_language,
-        summary_language_violation=summary_language_violation,
-        summary_language_retry_used=summary_language_retry_used,
     )
     if parse_error_meta:
         extraction_meta = {
             **extraction_meta,
             **parse_error_meta,
         }
-    extraction_meta = {
-        **extraction_meta,
-        # Additional retry budget is capped at one extra model call after the first attempt.
-        "extra_retry_budget_total": 1,
-        "extra_retry_budget_used": 1 if (summary_language_retry_used or truncated_retry_used or invalid_json_retry_used) else 0,
-    }
-
     if truncation_meta:
         extraction_meta = {
             **extraction_meta,
@@ -2448,13 +2520,6 @@ async def create_pending_extraction(
             **extraction_meta,
             "fallback_reason": "budget_exhausted",
             "dummy_fallback": True,
-        }
-    if force_reextract:
-        extraction_meta = {
-            **extraction_meta,
-            "force_reextract": True,
-            "force_reextract_triggered_by": (force_reextract_triggered_by or FORCE_REEXTRACT_TRIGGER_AUTO),
-            "source_extraction_id": source_extraction_id,
         }
 
     audit = extractor.get_audit()
@@ -2517,6 +2582,12 @@ async def create_pending_extraction(
         raw_post=raw_post,
         keep_extraction_id=extraction.id,
     )
+    if force_reextract and _should_cleanup_replaced_extractions_for_force_reextract(extraction):
+        await _cleanup_replaced_extractions_for_force_reextract(
+            db,
+            raw_post=raw_post,
+            keep_extraction_id=extraction.id,
+        )
     _attach_extraction_auto_approve_settings(extraction)
     return extraction
 
@@ -4919,25 +4990,23 @@ async def _create_failed_extraction(
     batch_retry_count: int,
 ) -> PostExtraction:
     settings = get_settings()
-    provider_detected = detect_provider_from_base_url(settings.openai_base_url)
-    output_mode = resolve_extraction_output_mode(settings.openai_base_url)
     extraction = PostExtraction(
         raw_post_id=raw_post.id,
         status=ExtractionStatus.pending,
         extracted_json={
             **default_extracted_json(raw_post),
-            "meta": {
-                "retry_exhausted": True,
-                "retry_source": "extract_batch",
-                "error_category": error_category,
-                "batch_retry_count": batch_retry_count,
-                "provider_detected": provider_detected,
-                "output_mode_used": output_mode,
-                "parse_strategy_used": "failed",
-                "raw_len": 0,
-                "repaired": False,
-                "parse_error": True,
-            },
+            "meta": _compact_extraction_meta(
+                {
+                    "retry_exhausted": True,
+                    "retry_source": "extract_batch",
+                    "error_category": error_category,
+                    "batch_retry_count": batch_retry_count,
+                    "parse_strategy_used": "failed",
+                    "raw_len": 0,
+                    "repaired": False,
+                    "parse_error": True,
+                }
+            ),
         },
         model_name=settings.openai_model,
         extractor_name="openai_structured",
@@ -5416,6 +5485,21 @@ async def list_extractions(
     return items
 
 
+@app.get("/extractions/stats", response_model=ExtractionStatsRead)
+async def get_extraction_stats(db: AsyncSession = Depends(get_db)):
+    raw_posts_result = await db.execute(select(RawPost).order_by(RawPost.id.asc()))
+    raw_posts = list(raw_posts_result.scalars().all())
+    extractions_result = await db.execute(select(PostExtraction).order_by(PostExtraction.id.asc()))
+    extractions = list(extractions_result.scalars().all())
+    counts_by_raw_post_id = Counter(int(item.raw_post_id) for item in extractions)
+    duplicate_raw_post_count = sum(1 for count in counts_by_raw_post_id.values() if count > 1)
+    return ExtractionStatsRead(
+        raw_posts_count=len(raw_posts),
+        post_extractions_count=len(extractions),
+        duplicate_raw_post_count=duplicate_raw_post_count,
+    )
+
+
 @app.post("/admin/extractions/refresh-wrong-extracted-json", response_model=AdminRefreshWrongExtractedJsonRead)
 async def refresh_wrong_extracted_json(
     confirm: str = Query(...),
@@ -5475,17 +5559,15 @@ async def refresh_wrong_extracted_json(
         if not rebuilt_views:
             continue
 
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         next_payload = {
             **payload,
             "asset_views": rebuilt_views,
-            "meta": {
-                **meta,
-                "asset_views_original_count": len(rebuilt_views),
-                "asset_views_final_count": len(rebuilt_views),
-                "asset_views_cap_reason": None,
-            },
         }
+        compact_meta = _compact_extraction_meta(payload.get("meta"))
+        if isinstance(compact_meta, dict):
+            next_payload["meta"] = compact_meta
+        else:
+            next_payload.pop("meta", None)
         if next_payload == extraction.extracted_json:
             continue
         updated_ids.append(extraction.id)

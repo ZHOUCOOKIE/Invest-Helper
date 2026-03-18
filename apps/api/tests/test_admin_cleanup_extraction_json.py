@@ -57,6 +57,13 @@ def _seed_data(fake_db: FakeAsyncSession) -> None:
                     "auto_rejected": True,
                     "auto_reject_reason": "hasview_zero",
                     "auto_reject_threshold": 80,
+                    "auto_policy_applied": "no_auto_review_user_trigger",
+                    "summary_language": "zh",
+                    "summary_language_violation": False,
+                    "asset_views_original_count": 1,
+                    "asset_views_final_count": 0,
+                    "raw_saved_len": 401,
+                    "raw_truncated": False,
                 },
             },
             parsed_model_output={
@@ -97,6 +104,13 @@ def test_cleanup_extractions_json_rewrites_legacy_keys() -> None:
     assert meta["auto_review_threshold"] == 80
     assert "auto_reject_reason" not in meta
     assert "auto_reject_threshold" not in meta
+    assert "auto_policy_applied" not in meta
+    assert "summary_language" not in meta
+    assert "summary_language_violation" not in meta
+    assert "asset_views_original_count" not in meta
+    assert "asset_views_final_count" not in meta
+    assert "raw_saved_len" not in meta
+    assert "raw_truncated" not in meta
     assert cleaned.parsed_model_output is not None
     assert "meta" not in cleaned.parsed_model_output
     assert "legacy" not in cleaned.parsed_model_output

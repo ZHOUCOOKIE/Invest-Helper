@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { readHoldings, removeHoldingAndPersist, writeHoldings } from "./storage.js";
 
 type AssetItem = {
   id: number;
@@ -170,25 +171,7 @@ export default function PortfolioPage() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as HoldingItem[];
-      if (!Array.isArray(parsed)) return;
-      setHoldings(
-        parsed.map((item) => ({
-          ...item,
-          support_citations: Array.isArray(item.support_citations) ? item.support_citations : [],
-          risk_citations: Array.isArray(item.risk_citations) ? item.risk_citations : [],
-          ai_evaluation:
-            item.ai_evaluation && typeof item.ai_evaluation === "object"
-              ? item.ai_evaluation
-              : null,
-        })),
-      );
-    } catch {
-      setHoldings([]);
-    }
+    setHoldings(readHoldings(window.localStorage, STORAGE_KEY) as HoldingItem[]);
   }, []);
 
   useEffect(() => {
@@ -251,11 +234,15 @@ export default function PortfolioPage() {
     });
   };
 
-  const removeHolding = (localId: string) => {
+  const removeHolding = (holding: HoldingItem) => {
+    if (typeof window === "undefined") return;
+    const confirmed = window.confirm(`确认删除持仓 ${holding.symbol}？删除后会立即更新已保存的持仓列表。`);
+    if (!confirmed) return;
     setSaveMessage(null);
-    setHoldings((prev) => prev.filter((item) => item.local_id !== localId));
-    if (viewHoldingId === localId) setViewHoldingId(null);
-    if (editHoldingId === localId) setEditHoldingId(null);
+    setHoldings((prev) => removeHoldingAndPersist(window.localStorage, STORAGE_KEY, prev, holding.local_id));
+    if (viewHoldingId === holding.local_id) setViewHoldingId(null);
+    if (editHoldingId === holding.local_id) setEditHoldingId(null);
+    setSaveMessage(`已删除 ${holding.symbol}，并同步保存本地持仓。`);
   };
 
   const updateHolding = (localId: string, patch: Partial<HoldingItem>) => {
@@ -265,7 +252,7 @@ export default function PortfolioPage() {
 
   const saveHoldings = () => {
     if (typeof window === "undefined") return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(holdings));
+    writeHoldings(window.localStorage, STORAGE_KEY, holdings);
     setSaveMessage(`已保存 ${new Date().toLocaleString()}`);
   };
 
@@ -465,7 +452,7 @@ export default function PortfolioPage() {
                   >
                     {isEditing ? "收起编辑" : "编辑"}
                   </button>
-                  <button type="button" onClick={() => removeHolding(holding.local_id)}>移除</button>
+                  <button type="button" onClick={() => removeHolding(holding)}>移除</button>
                 </div>
               </div>
 

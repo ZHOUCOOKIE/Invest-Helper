@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from enums import ExtractionStatus
-from main import _detect_extracted_summary_language, postprocess_auto_review
+from main import _coerce_extracted_json_for_read, _detect_extracted_summary_language, postprocess_auto_review
 from models import Asset, AssetAlias, Kol, KolView, PostExtraction, RawPost
 from services import extraction as extraction_service
 from services.extraction import normalize_extracted_json
@@ -154,9 +154,10 @@ def test_prompt_bundle_has_new_contract_phrases() -> None:
         content_text="NVDA BTC",
     )
     prompt_text = bundle.text
-    assert "Top-level fields MUST be exactly" in prompt_text
+    assert "[InvestPulse 提取提示词]" in prompt_text
+    assert "顶层字段必须且只能是：" in prompt_text
     assert "as_of, source_url, islibrary, hasview, asset_views, library_entry" in prompt_text
-    assert "Now output the final JSON object only." in prompt_text
+    assert "现在只输出最终的 JSON 对象。" in prompt_text
     lowered = prompt_text.lower()
     assert ("content" + "_kind") not in lowered
     assert ("never output " + "name") not in lowered
@@ -320,7 +321,7 @@ def test_normalize_drops_asset_view_below_70() -> None:
     )
     assert len(normalized["asset_views"]) == 1
     assert normalized["asset_views"][0]["symbol"] == "BTC"
-    assert normalized["meta"]["asset_views_dropped_low_confidence_count"] == 1
+    assert "meta" not in normalized
 
 
 def test_normalize_empty_assets_filled_noneany() -> None:
@@ -593,7 +594,7 @@ def test_islibrary_one_hasview_zero_with_asset_views_is_not_auto_approved() -> N
     assert extraction.status == ExtractionStatus.rejected
 
 
-def test_islibrary_one_user_trigger_is_not_auto_reviewed() -> None:
+def test_islibrary_one_user_trigger_uses_standard_auto_review() -> None:
     raw_post = _raw_post()
     extraction = _extraction(
         {
@@ -615,5 +616,40 @@ def test_islibrary_one_user_trigger_is_not_auto_reviewed() -> None:
         )
     )
 
-    assert outcome is None
-    assert extraction.status == ExtractionStatus.pending
+    assert outcome == "rejected"
+    assert extraction.status == ExtractionStatus.rejected
+    meta = extraction.extracted_json.get("meta")
+    assert isinstance(meta, dict)
+    assert meta.get("auto_review_reason") == "hasview_zero"
+    assert meta.get("auto_policy_applied") == "threshold_asset"
+
+
+def test_read_normalization_derives_model_confidence_for_legacy_auto_approved_row() -> None:
+    payload = {
+        "as_of": "2026-03-05",
+        "source_url": "https://twitter.com/example/status/1",
+        "islibrary": 1,
+        "hasview": 1,
+        "asset_views": [
+            {
+                "symbol": "BTC",
+                "market": "CRYPTO",
+                "stance": "bull",
+                "horizon": "1m",
+                "confidence": 85,
+                "summary": "看多BTC",
+            }
+        ],
+        "library_entry": {"tag": "strategy", "summary": "测试"},
+        "meta": {
+            "auto_review_reason": "library_flag",
+            "auto_review_threshold": 70,
+            "auto_policy_applied": "threshold_asset",
+            "auto_approved": True,
+        },
+    }
+
+    normalized = _coerce_extracted_json_for_read(payload)
+
+    assert normalized["meta"]["auto_approved"] is True
+    assert normalized["meta"]["model_confidence"] == 85

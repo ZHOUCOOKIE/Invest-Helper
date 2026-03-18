@@ -200,7 +200,7 @@ export default function ExtractionDetailPage() {
     if (!extraction) {
       return;
     }
-    if (!window.confirm("确认强制重新提取？这会创建新的 extraction 版本并消耗预算（不会覆盖历史）。")) {
+    if (!window.confirm("确认强制重新提取？当 AI 成功返回新的解析结果后，会直接替换并删除这条原始贴文之前的所有 extraction 结果。")) {
       return;
     }
     setActionError(null);
@@ -212,7 +212,7 @@ export default function ExtractionDetailPage() {
       if (!res.ok || typeof body.id !== "number") {
         throw new Error(getHttpErrorMessage(res.status, body.detail, `重新抽取失败: ${res.status}`));
       }
-      setActionInfo(`已创建新 extraction #${body.id}，正在跳转...`);
+      setActionInfo(`已生成 replacement extraction #${body.id}，正在跳转...`);
       router.push(`/extractions/${body.id}`);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "重新抽取失败");

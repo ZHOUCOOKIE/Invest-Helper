@@ -71,6 +71,12 @@ type RetryPendingAllResponse = {
   job_id: string | null;
 };
 
+type ExtractionStats = {
+  raw_posts_count: number;
+  post_extractions_count: number;
+  duplicate_raw_post_count: number;
+};
+
 const PAGE_SIZE = 20;
 const statusOptions: ExtractionFilterStatus[] = ["all", "pending", "approved", "rejected", "library"];
 
@@ -226,6 +232,7 @@ export default function ExtractionsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [clearAlsoDeleteRawPosts, setClearAlsoDeleteRawPosts] = useState(false);
   const [progress, setProgress] = useState<XProgress | null>(null);
+  const [stats, setStats] = useState<ExtractionStats | null>(null);
   const [recomputeBusy, setRecomputeBusy] = useState(false);
   const [retryPendingBusy, setRetryPendingBusy] = useState(false);
   const requestSeqRef = useRef(0);
@@ -296,16 +303,25 @@ export default function ExtractionsPage() {
     setProgress(body as XProgress);
   }, []);
 
+  const refreshStats = useCallback(async () => {
+    const res = await fetch("/api/extractions/stats", { cache: "no-store" });
+    const body = (await res.json()) as ExtractionStats | { detail?: string };
+    if (!res.ok) {
+      throw new Error("detail" in body ? (body.detail ?? "加载统计失败") : "加载统计失败");
+    }
+    setStats(body as ExtractionStats);
+  }, []);
+
   useEffect(() => {
     const loadAux = async () => {
       try {
-        await refreshProgress();
+        await Promise.all([refreshProgress(), refreshStats()]);
       } catch (err) {
         setError(err instanceof Error ? err.message : "加载进度失败");
       }
     };
     void loadAux();
-  }, [refreshProgress]);
+  }, [refreshProgress, refreshStats]);
 
   const clearPending = async () => {
     const confirmText = window.prompt(
@@ -329,7 +345,7 @@ export default function ExtractionsPage() {
       setMessage(
         `已删除抽取=${done.deleted_extractions_count}，已删原始贴文=${done.deleted_raw_posts_count}。`,
       );
-      await Promise.all([load(), refreshProgress()]);
+      await Promise.all([load(), refreshProgress(), refreshStats()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "清空待处理失败");
     }
@@ -357,7 +373,7 @@ export default function ExtractionsPage() {
       setMessage(
         `重算完成：扫描=${done.scanned}，更新=${done.updated}，待处理=${done.pending_count}，通过=${done.approved_count}，拒绝=${done.rejected_count}。`,
       );
-      await Promise.all([load(), refreshProgress()]);
+      await Promise.all([load(), refreshProgress(), refreshStats()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "重算状态失败");
     } finally {
@@ -383,7 +399,7 @@ export default function ExtractionsPage() {
           `已提交重传任务 job_id=${done.job_id}，待处理总计=${done.pending_total}，失败待重传=${done.failed_pending_count}，进行中=${done.active_pending_count}。`,
         );
       }
-      await Promise.all([load(), refreshProgress()]);
+      await Promise.all([load(), refreshProgress(), refreshStats()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "提交重传任务失败");
     } finally {
@@ -466,6 +482,12 @@ export default function ExtractionsPage() {
           进度[{progress.scope}] AI处理成功={Math.max(0, progress.total_raw_posts - progress.pending_count)}, 已通过=
           {progress.extracted_success_count}, 待处理={progress.pending_count}, 已拒绝={progress.failed_count}, 已入库=
           {progress.no_extraction_count}
+        </p>
+      )}
+      {stats && (
+        <p style={{ color: "#555" }}>
+          当前库：原始贴文={stats.raw_posts_count}，AI解析结果={stats.post_extractions_count}，存在重复版本的原始贴文=
+          {stats.duplicate_raw_post_count}
         </p>
       )}
 

@@ -86,18 +86,14 @@ def test_keep_parsed_asset_views_when_direct_mentions_le_3(monkeypatch: pytest.M
     body = response.json()
     views = body["extracted_json"]["asset_views"]
     symbols = {item["symbol"] for item in views}
-    meta = body["extracted_json"]["meta"]
     assert len(views) == 5
     assert symbols == {"AAPL", "TSLA", "BTC", "MSFT", "NVDA"}
-    assert meta["asset_views_capped"] is False
-    assert meta["asset_views_original_count"] == 5
-    assert meta["asset_views_final_count"] == 5
-    assert meta["asset_views_cap_reason"] is None
-    assert set(meta["asset_views_kept_symbols"]) == {"AAPL", "TSLA", "BTC", "MSFT", "NVDA"}
-    assert "original_count" not in meta
-    assert "final_count" not in meta
-    assert "cap_reason" not in meta
-    assert "kept_symbols" not in meta
+    meta = body["extracted_json"].get("meta") or {}
+    assert "asset_views_capped" not in meta
+    assert "asset_views_original_count" not in meta
+    assert "asset_views_final_count" not in meta
+    assert "asset_views_cap_reason" not in meta
+    assert "asset_views_kept_symbols" not in meta
 
 
 def test_keep_parsed_asset_views_when_direct_mentions_gt_3(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,11 +127,11 @@ def test_keep_parsed_asset_views_when_direct_mentions_gt_3(monkeypatch: pytest.M
     symbols = {item["symbol"] for item in body["extracted_json"]["asset_views"]}
     assert symbols == {"AAPL", "TSLA", "BTC", "USD/JPY", "EUR/USD"}
     assert "AMZN" not in symbols
-    meta = body["extracted_json"]["meta"]
-    assert body["extracted_json"]["meta"]["asset_views_capped"] is False
-    assert meta["asset_views_cap_reason"] is None
-    assert meta["asset_views_original_count"] == 5
-    assert meta["asset_views_final_count"] == 5
+    meta = body["extracted_json"].get("meta") or {}
+    assert "asset_views_capped" not in meta
+    assert "asset_views_cap_reason" not in meta
+    assert "asset_views_original_count" not in meta
+    assert "asset_views_final_count" not in meta
 
 
 def test_keep_parsed_asset_views_when_no_direct_mentions_even_in_macro_post(
@@ -171,11 +167,11 @@ def test_keep_parsed_asset_views_when_no_direct_mentions_even_in_macro_post(
     body = response.json()
     symbols = {item["symbol"] for item in body["extracted_json"]["asset_views"]}
     assert symbols == {"SPY", "GLD", "BTC", "ETH"}
-    meta = body["extracted_json"]["meta"]
-    assert meta["asset_views_capped"] is False
-    assert meta["asset_views_original_count"] == 4
-    assert meta["asset_views_final_count"] == 4
-    assert meta["asset_views_cap_reason"] is None
+    meta = body["extracted_json"].get("meta") or {}
+    assert "asset_views_capped" not in meta
+    assert "asset_views_original_count" not in meta
+    assert "asset_views_final_count" not in meta
+    assert "asset_views_cap_reason" not in meta
 
 
 def test_keep_parsed_asset_views_when_no_direct_mentions_and_no_macro(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -203,7 +199,8 @@ def test_keep_parsed_asset_views_when_no_direct_mentions_and_no_macro(monkeypatc
     views = body["extracted_json"]["asset_views"]
     assert len(views) == 1
     assert views[0]["symbol"] == "HYNIX"
-    assert body["extracted_json"]["meta"]["asset_views_cap_reason"] is None
+    meta = body["extracted_json"].get("meta") or {}
+    assert "asset_views_cap_reason" not in meta
 
 
 def test_precious_crypto_fx_symbols_can_persist_and_display(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -352,8 +349,8 @@ def test_extract_batch_counters_include_capped_horizon_coerced_and_raw_truncated
     assert "final_count" not in meta
     assert "cap_reason" not in meta
     assert "kept_symbols" not in meta
-    assert meta["asset_views_original_count"] == 0
-    assert meta["asset_views_final_count"] == 0
+    assert "asset_views_original_count" not in meta
+    assert "asset_views_final_count" not in meta
 
 
 def test_get_extraction_detail_returns_single_top_level_payload(monkeypatch: pytest.MonkeyPatch) -> None:

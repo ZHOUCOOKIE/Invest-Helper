@@ -221,6 +221,12 @@ class PostExtractionWithRawPostRead(PostExtractionRead):
     raw_post: RawPostRead
 
 
+class ExtractionStatsRead(BaseModel):
+    raw_posts_count: int
+    post_extractions_count: int
+    duplicate_raw_post_count: int
+
+
 class ManualIngestRead(BaseModel):
     raw_post: RawPostRead
     extraction: PostExtractionRead

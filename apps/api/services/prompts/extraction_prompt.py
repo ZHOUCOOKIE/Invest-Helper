@@ -4,13 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 
-EXTRACT_V1_TEMPLATE = """[InvestPulse Extraction Prompt]
+EXTRACT_V1_TEMPLATE = """[InvestPulse 提取提示词]
 
-Task: Extract structured investment signals from ONE post. Return exactly ONE JSON object and nothing else.
+任务：从一条帖子中提取结构化投资信号。只返回且必须精确返回一个 JSON 对象，不得输出其他任何内容。
 
-Input:
-
-platform: {platform}
+输入：
 
 author_handle: {author_handle}
 
@@ -18,17 +16,20 @@ url: {url}
 
 posted_at: {posted_at}
 
-Post Content:
+帖子内容：
 {content_text}
 
-Hard rules (must follow):
+输出硬性规则（必须遵守）：
 
-Output MUST be exactly one JSON object. No markdown, no code fences, no extra text.
+输出必须且只能是一个 JSON 对象。
+不要使用 markdown。
+不要使用代码围栏。
+不要输出额外文本。
 
-Top-level fields MUST be exactly:
+顶层字段必须且只能是：
 as_of, source_url, islibrary, hasview, asset_views, library_entry
 
-JSON schema (fixed):
+固定 JSON 结构：
 {
 "as_of": "YYYY-MM-DD",
 "source_url": "string",
@@ -46,75 +47,115 @@ JSON schema (fixed):
 ],
 "library_entry": {
   "tag": "macro|industry|thesis|strategy|risk|events",
-  "summary": "测试"
+"summary": "测试"
 }
 }
 
-Field constraints:
+字段约束：
 
-as_of: must be YYYY-MM-DD.
+as_of：
+必须为 YYYY-MM-DD。
 
-source_url: must equal the input url exactly.
+source_url：
+必须与输入的 url 完全一致。
 
-islibrary: must be integer 0 or 1.
+islibrary：
+必须为整数 0 或 1。
 
-hasview: must be integer 0 or 1.
+hasview：
+必须为整数 0 或 1。
 
-market: MUST be one of CRYPTO, STOCK, ETF, FOREX, OTHER.
+market：
+必须是 CRYPTO、STOCK、ETF、FOREX、OTHER 之一。
 
-stance: must be one of bull, bear, neutral.
-Stance rule: Prefer the author’s explicit stance. If the post describes an event/trend and you map it to a likely impacted tradable target, infer stance only when the direction is strongly implied by the post; otherwise without a clear one-way forecast, set stance to neutral.
+stance：
+必须是 bull、bear、neutral 之一。
+优先采用作者明确表达的立场。
+如果帖子描述的是某个事件/趋势，而你将其映射到一个可能受影响的可交易标的，只有当帖子强烈暗示方向性时才可推断 stance。
+如果没有明确的单向预测，则将 stance 设为 neutral。
+如果该观点是条件性的，例如“如果 X 那么 Y”、区间规则、阈值规则，除非作者明确表示该条件预计会在所选 horizon 内发生或正在发生，否则将 stance 设为 neutral。
 
-horizon: must be one of intraday, 1w, 1m, 3m, 1y.
-Horizon rule: Prefer the author’s explicit time point / holding window / expected duration. If none is stated, choose the most reliable horizon implied by the content (nearest reasonable window).
+horizon：
+必须是 intraday、1w、1m、3m、1y 之一。
+优先采用作者明确给出的时间点、持有窗口或预期持续时间。
+如果没有明确说明，则选择内容所隐含的最可靠 horizon，即最近的合理窗口。
 
-summary: MUST be Chinese (only validate summary language) and concise (avoid long explanations; keep it short).
+summary：
+总结帖子内容的观点
+必须为中文，只校验 summary 的语言。
+其中必须包含一个简短的论证理由，例如“事件X → 机制Y → 影响该资产Z”。
 
-confidence: MUST be integer 80..100.
-Meaning: confidence is your certainty that the post content meaningfully impacts or is strongly associated with THIS asset (including plausible, directly-impacted targets) given the event/trend described.
+confidence：
+必须为整数 80..100。
+含义：confidence 表示在给定所描述事件/趋势的前提下，你对帖子内容是否会对该资产产生有意义影响，或是否与该资产高度相关，包括合理且直接受影响的目标，的确定程度。
 
-85..100: clearly about a specific asset / direct event / concrete claim.
+85..100：明显是在谈论一个特定资产 / 直接事件 / 具体主张。
 
-80..85: broader but still very likely impacts the asset meaningfully.
-If you think confidence < 80 for an asset: DO NOT output that asset at all.
+80..85：范围更宽，但仍然很可能对该资产产生有意义的影响。
+如果你认为某个资产的 confidence < 80：完全不要输出该资产。
 
-Extraction rules:
+asset_views 输出条件与判定规则：
 
-You may include asset_views for (a) assets explicitly mentioned OR (b) assets that are very likely impacted by the described event/trend, as long as your confidence is >= 80.
+你可以为明确提及的资产输出 asset_views。
+对于未提及的资产，只有当该事件/趋势意味着对该可交易目标存在高度可能且直接的影响，且 confidence >= 80，并且你能够用简短、具体的理由说明该映射时，才可以输出。
 
-Only set hasview=1 and output an asset_views item if the post makes a real directional investment claim about that specific asset (explicitly or strongly implied).
+直接提及规则（严格）：
+只有当帖子文本本身包含该资产的 ticker、name 或 symbol 字符串时，你才可以认定该资产是“明确提及”的。
+不要使用作者历史、典型价格水平或你自己的先验知识来判断该资产是什么。
 
-Do NOT treat hypothetical examples, educational lists, illustrative content, or posts that are mainly sarcasm / moral judgment / rhetorical questions / memes as a directional investment claim. In all such cases, set hasview=0 and output asset_views: [].
+只有当帖子对该特定资产提出了真实的方向性投资主张（明确提出或强烈暗示）时，才设置 hasview=1 并输出 asset_views 条目。
 
-Symbol rules:
+方向性投资主张必须是面向未来的或行动导向的，例如预期、预测、买入计划、卖出计划、持有计划、目标、价位。
+仅仅分享过去收益或单纯炒作，不构成主张。
 
-CN/HK stocks: symbol MUST be the full Chinese stock name.
+不要将以下内容视为方向性投资主张：
+假设性示例；
+教学式清单；
+说明性内容；
+主要是讽刺、道德评判、反问或梗图的帖子。
+在所有这些情况下，都将 hasview 设为 0，并输出 asset_views: []。
 
-US/overseas stocks: symbol MUST be a tradable ticker.
+symbol 规则：
 
-ETF/Index: allow common tickers/symbols.
+中国内地/香港股票：
+symbol 必须为完整中文股票名称。
 
-CRYPTO: use standard symbols/pairs.
+美国/海外股票：
+symbol 必须为可交易 ticker。
 
-FOREX/Commodities: prefer standard codes / tradable symbols.
+ETF/指数：
+允许使用常见 ticker 或 symbol。
 
-Example symbols: "贵州茅台", "NVDA", "SPX", "IGV", "BTC", "XAUUSD", "WTI"
+CRYPTO：
+使用标准 symbol 或 pair。
 
-Library branch:
+FOREX/大宗商品：
+优先使用标准代码或可交易 symbol。
 
-If islibrary=0: library_entry must be null.
+示例 symbol：
+"贵州茅台", "NVDA", "SPX", "IGV", "BTC", "XAUUSD", "WTI"
 
-If islibrary=1:
+Library 分支规则：
 
-islibrary=1 MUST mean the post is highly valuable and worth saving for repeated reading (deep insights, strong analysis, tight reasoning chain). Use your own strict judgment.
+如果 islibrary=0：
+library_entry 必须为 null。
 
-library_entry must include tag(only 1), summary(Chinese)
+如果 islibrary=1：
 
-tag must come from: macro, industry, thesis, strategy, risk, events
+islibrary=1 必须表示该帖子具有很高价值，值得保存以供反复阅读，例如深度洞见、强分析、严密推理链。
+请使用你自己的严格判断。
 
-IMPORTANT: library_entry.summary must be exactly "测试" (and nothing else).
+library_entry 必须包含：
+tag（只能有 1 个）；
+summary（中文）。
 
-Now output the final JSON object only.
+tag 必须从以下值中选择：
+macro、industry、thesis、strategy、risk、events
+
+重要：
+library_entry.summary 必须精确等于 "测试"，且不能有其他任何内容。
+
+现在只输出最终的 JSON 对象。
 """
 
 

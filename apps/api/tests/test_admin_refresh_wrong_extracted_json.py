@@ -98,8 +98,7 @@ def test_refresh_wrong_extracted_json_updates_from_applied_views() -> None:
     refreshed = fake_db._data[PostExtraction][476].extracted_json
     assert isinstance(refreshed.get("asset_views"), list)
     assert refreshed["asset_views"][0]["symbol"] == "HYNIX"
-    assert refreshed["meta"]["asset_views_final_count"] == 1
-    assert refreshed["meta"]["asset_views_cap_reason"] is None
+    assert "meta" not in refreshed
 
 
 def test_refresh_wrong_extracted_json_dry_run_does_not_write() -> None:

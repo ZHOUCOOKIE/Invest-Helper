@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { getAiUploadCount } from "../ingest/import-stats.js";
 
 type ProgressPhase = "idle" | "confirm" | "converting" | "importing" | "extracting" | "refreshing" | "done";
 type ProgressStatus = "idle" | "running" | "success" | "error" | "pending_confirm";
@@ -14,6 +15,7 @@ type ImportProgressState = {
   error: string | null;
   extractJobId: string | null;
   extractRequested: number;
+  extractUploaded: number;
   extractSuccess: number;
   extractFailed: number;
   extractSkipped: number;
@@ -29,7 +31,7 @@ type ImportProgressContextValue = {
   markPendingConfirm: (message: string) => void;
   updateRunning: (message: string, phase?: ProgressPhase) => void;
   attachExtractJob: (jobId: string) => void;
-  applyExtractStats: (stats: { requested: number; success: number; failed: number; skipped: number }) => void;
+  applyExtractStats: (stats: { requested: number; uploaded: number; success: number; failed: number; skipped: number }) => void;
   markSuccess: (message: string) => void;
   markError: (message: string) => void;
   toggleMinimized: () => void;
@@ -44,6 +46,8 @@ type ExtractJobPayload = {
   success_count?: number;
   failed_count?: number;
   skipped_count?: number;
+  ai_call_used?: number;
+  openai_call_attempted_count?: number;
   last_error_summary?: string | null;
 };
 
@@ -59,6 +63,7 @@ const initialState: ImportProgressState = {
   error: null,
   extractJobId: null,
   extractRequested: 0,
+  extractUploaded: 0,
   extractSuccess: 0,
   extractFailed: 0,
   extractSkipped: 0,
@@ -130,6 +135,7 @@ export function ImportProgressProvider({ children }: { children: React.ReactNode
         const success = toNumber(job.success_count);
         const failed = toNumber(job.failed_count);
         const skipped = toNumber(job.skipped_count);
+        const uploaded = getAiUploadCount(job);
         const terminal = Boolean(job.is_terminal);
         const status = typeof job.status === "string" ? job.status : "";
         const isFailed = status === "failed" || status === "cancelled" || status === "timeout";
@@ -138,6 +144,7 @@ export function ImportProgressProvider({ children }: { children: React.ReactNode
             phase: "extracting",
             message: `AI处理中：成功=${success}，失败=${failed}${requested > 0 ? `，完成=${success + failed + skipped}/${requested}` : ""}`,
             extractRequested: requested,
+            extractUploaded: uploaded,
             extractSuccess: success,
             extractFailed: failed,
             extractSkipped: skipped,
@@ -212,10 +219,11 @@ export function ImportProgressProvider({ children }: { children: React.ReactNode
           }),
         );
       },
-      applyExtractStats: ({ requested, success, failed, skipped }) => {
+      applyExtractStats: ({ requested, uploaded, success, failed, skipped }) => {
         setState((prev) =>
           mergeState(prev, {
             extractRequested: requested,
+            extractUploaded: uploaded,
             extractSuccess: success,
             extractFailed: failed,
             extractSkipped: skipped,
@@ -261,7 +269,7 @@ export function ImportProgressProvider({ children }: { children: React.ReactNode
 
   const totalHandled = state.extractSuccess + state.extractFailed + state.extractSkipped;
   const percent = state.extractRequested > 0 ? Math.min(100, Math.round((totalHandled / state.extractRequested) * 100)) : null;
-  const uploadCount = state.extractSuccess + state.extractFailed;
+  const uploadCount = state.extractUploaded;
   const compactPercent = percent ?? (state.status === "running" ? 35 : state.status === "success" ? 100 : 0);
   const compactTitle = state.status === "success" ? "导入完成" : state.status === "error" ? "导入失败" : "导入进度";
 

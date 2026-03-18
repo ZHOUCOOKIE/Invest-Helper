@@ -35,10 +35,13 @@ InvestPulse is designed to turn the flow of `post -> extraction -> review -> vie
 - Confidence-based auto approval uses the `>=80` threshold path.
 - Rejection reasons are recorded under `meta.auto_review_reason`.
 - Parse-failed model outputs are still persisted as `pending`, while retry and progress flows classify them as failed semantics.
+- Manual `POST /extractions/{id}/re-extract` now acts as replacement: once the new AI result is valid, older extraction rows for the same raw post are deleted together with owned `kol_views`.
+- `/ingest/x/import` now reports deduplicated raw posts whose latest extraction is still failed semantics via `pending_failed_dedup_*`, so follow-up extract jobs can target only the rows that still need AI work.
 - Daily digests use a 3-day retention window and purge expired rows on read/list paths.
 - Weekly digests purge stale rows whose anchor date no longer matches the current expected anchor for the selected `report_kind`.
 - `/extractions` is ordered by business post time descending, using `raw_post.posted_at` and falling back to `created_at`.
-- The web UI includes recovery polling for digest generation requests that may succeed in the backend after a proxy-side failure, plus clearer request-aware error messages.
+- The web UI includes recovery polling for digest generation requests that may succeed in the backend after a proxy-side failure, extraction repository stats on the review queue, and AI upload progress derived from `ai_call_used` when available.
+- `scripts/investpulse` can start/stop API and Web in the background, run migrations on start, and manage local logs/PID files.
 
 ## Product Surface
 
@@ -95,6 +98,14 @@ Unified verification after changes:
 
 ```bash
 DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@localhost:5433/investpulse_test make verify
+```
+
+Optional background helper:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf /home/zhoucookie/code/investpulse/scripts/investpulse ~/.local/bin/investpulse
+investpulse start
 ```
 
 ## Documentation Map

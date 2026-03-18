@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 import json
 import math
@@ -14,7 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db import get_db
 from enums import ExtractionStatus, Horizon, ReviewStatus, Stance
-from main import _build_x_raw_posts_preview_query, app, reset_runtime_counters
+from main import (
+    _build_x_raw_posts_preview_query,
+    _cleanup_replaced_extractions_for_force_reextract,
+    _should_cleanup_replaced_extractions_for_force_reextract,
+    app,
+    reset_runtime_counters,
+)
 from models import Asset, Kol, KolView, PostExtraction, ProfileKolWeight, RawPost
 from services.extraction import OpenAIRequestError
 from settings import get_settings
@@ -1518,6 +1525,78 @@ def test_rejected_only_force_reextract_can_create_pending(monkeypatch) -> None: 
     assert calls == [True]
 
 
+def test_force_reextract_valid_ai_result_is_auto_reviewed(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    raw_post = RawPost(
+        id=1,
+        platform="x",
+        author_handle="alice",
+        external_id="force-auto-review-1",
+        url="https://x.com/alice/status/force-auto-review-1",
+        content_text="GOEASY keeps trending higher.",
+        posted_at=now,
+        fetched_at=now,
+        raw_json=None,
+        review_status=ReviewStatus.rejected,
+        reviewed_at=now,
+        reviewed_by="human-review",
+    )
+    fake_db.seed(raw_post)
+    fake_db.seed(
+        PostExtraction(
+            id=910,
+            raw_post_id=1,
+            status=ExtractionStatus.rejected,
+            extracted_json={"summary": "old rejected"},
+            model_name="dummy-v1",
+            extractor_name="dummy",
+            reviewed_at=now,
+            reviewed_by="human-review",
+            review_note="noise",
+            created_at=now,
+        )
+    )
+
+    monkeypatch.setenv("EXTRACTOR_MODE", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_extract(self, raw_post):  # noqa: ANN001
+        return {
+            "hasview": 1,
+            "asset_views": [
+                {
+                    "symbol": "GOEASY",
+                    "stance": "bull",
+                    "horizon": "1w",
+                    "confidence": 90,
+                    "summary": "看多 GOEASY",
+                }
+            ],
+        }
+
+    async def override_get_db():
+        yield fake_db
+
+    monkeypatch.setattr("services.extraction.OpenAIExtractor.extract", fake_extract)
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    forced = client.post("/extractions/910/re-extract")
+    app.dependency_overrides.clear()
+
+    assert forced.status_code == 201
+    body = forced.json()
+    assert body["status"] == "approved"
+    meta = body["extracted_json"]["meta"]
+    assert meta["auto_approved"] is True
+    assert meta["auto_review_reason"] == "confidence_at_or_above_threshold"
+    assert meta["auto_policy_applied"] == "threshold_asset"
+    latest = max(fake_db._data[PostExtraction].values(), key=lambda item: item.id or 0)
+    assert latest.status == ExtractionStatus.approved
+    assert fake_db._data[RawPost][1].review_status == ReviewStatus.approved
+
+
 def test_x_import_template_endpoint() -> None:
     client = TestClient(app)
     response = client.get("/ingest/x/import/template")
@@ -1916,6 +1995,221 @@ def test_post_extractions_active_unique_index_declared() -> None:
     where_clause = index.dialect_options["postgresql"].get("where")
     assert where_clause is not None
     assert "status = 'pending'" in str(where_clause)
+
+
+def test_force_reextract_cleanup_removes_all_replaced_results() -> None:
+    async def run() -> None:
+        fake_db = FakeAsyncSession()
+        now = datetime.now(UTC)
+        raw_post = RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="replace-1",
+            url="https://x.com/alice/status/replace-1",
+            content_text="replace me",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+            review_status=ReviewStatus.approved,
+            reviewed_at=now,
+            reviewed_by="auto",
+        )
+        fake_db.seed(raw_post)
+        fake_db.seed(
+            KolView(
+                id=55,
+                kol_id=1,
+                asset_id=1,
+                stance=Stance.bull,
+                horizon=Horizon.intraday,
+                confidence=90,
+                summary="旧自动观点",
+                source_url=raw_post.url,
+                as_of=now.date(),
+                created_at=now,
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=10,
+                raw_post_id=1,
+                status=ExtractionStatus.approved,
+                extracted_json={"summary": "old approved"},
+                model_name="gpt-old",
+                extractor_name="openai_structured",
+                reviewed_at=now,
+                reviewed_by="auto",
+                auto_applied_count=1,
+                auto_applied_kol_view_ids=[55],
+                created_at=now - timedelta(hours=2),
+            )
+        )
+        fake_db.seed(
+            KolView(
+                id=56,
+                kol_id=1,
+                asset_id=1,
+                stance=Stance.bear,
+                horizon=Horizon.one_week,
+                confidence=80,
+                summary="旧人工观点",
+                source_url=raw_post.url,
+                as_of=now.date(),
+                created_at=now,
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=11,
+                raw_post_id=1,
+                status=ExtractionStatus.approved,
+                extracted_json={"summary": "old manual approved"},
+                model_name="gpt-old",
+                extractor_name="openai_structured",
+                reviewed_at=now - timedelta(hours=1),
+                reviewed_by="reviewer",
+                applied_kol_view_id=56,
+                created_at=now - timedelta(hours=1),
+            )
+        )
+        fake_db.seed(
+            PostExtraction(
+                id=12,
+                raw_post_id=1,
+                status=ExtractionStatus.pending,
+                extracted_json={"summary": "new pending"},
+                model_name="gpt-new",
+                extractor_name="openai_structured",
+                created_at=now,
+            )
+        )
+
+        deleted_extraction_ids, deleted_kol_view_ids = await _cleanup_replaced_extractions_for_force_reextract(
+            fake_db,
+            raw_post=raw_post,
+            keep_extraction_id=12,
+        )
+
+        assert deleted_extraction_ids == [11, 10]
+        assert deleted_kol_view_ids == [56, 55]
+        assert set(fake_db._data[PostExtraction].keys()) == {12}
+        assert fake_db._data[KolView] == {}
+        assert raw_post.review_status == ReviewStatus.unreviewed
+        assert raw_post.reviewed_at is None
+        assert raw_post.reviewed_by is None
+
+    asyncio.run(run())
+
+
+def test_force_reextract_cleanup_runs_only_for_valid_new_result() -> None:
+    failed = PostExtraction(
+        id=1,
+        raw_post_id=1,
+        status=ExtractionStatus.pending,
+        extracted_json={"summary": "failed"},
+        model_name="gpt",
+        extractor_name="openai_structured",
+        last_error="OpenAIRequestError: timeout",
+    )
+    valid = PostExtraction(
+        id=2,
+        raw_post_id=1,
+        status=ExtractionStatus.pending,
+        extracted_json={
+            "as_of": date.today().isoformat(),
+            "source_url": "https://x.com/alice/status/1",
+            "islibrary": 0,
+            "hasview": 0,
+            "asset_views": [],
+            "library_entry": None,
+        },
+        model_name="gpt",
+        extractor_name="openai_structured",
+        last_error=None,
+    )
+
+    assert _should_cleanup_replaced_extractions_for_force_reextract(failed) is False
+    assert _should_cleanup_replaced_extractions_for_force_reextract(valid) is True
+
+
+def test_get_extraction_stats_counts_raw_posts_and_ai_results() -> None:
+    fake_db = FakeAsyncSession()
+    now = datetime.now(UTC)
+    fake_db.seed(
+        RawPost(
+            id=1,
+            platform="x",
+            author_handle="alice",
+            external_id="stats-1",
+            url="https://x.com/alice/status/stats-1",
+            content_text="a",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        RawPost(
+            id=2,
+            platform="x",
+            author_handle="bob",
+            external_id="stats-2",
+            url="https://x.com/bob/status/stats-2",
+            content_text="b",
+            posted_at=now,
+            fetched_at=now,
+            raw_json=None,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=101,
+            raw_post_id=1,
+            status=ExtractionStatus.approved,
+            extracted_json={"summary": "one"},
+            model_name="gpt",
+            extractor_name="openai_structured",
+            created_at=now,
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=102,
+            raw_post_id=1,
+            status=ExtractionStatus.pending,
+            extracted_json={"summary": "two"},
+            model_name="gpt",
+            extractor_name="openai_structured",
+            created_at=now + timedelta(seconds=1),
+        )
+    )
+    fake_db.seed(
+        PostExtraction(
+            id=103,
+            raw_post_id=2,
+            status=ExtractionStatus.rejected,
+            extracted_json={"summary": "three"},
+            model_name="gpt",
+            extractor_name="openai_structured",
+            created_at=now + timedelta(seconds=2),
+        )
+    )
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+    response = client.get("/extractions/stats")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "raw_posts_count": 2,
+        "post_extractions_count": 3,
+        "duplicate_raw_post_count": 1,
+    }
 
 
 def test_x_progress_counts_pending_failed_and_success() -> None:

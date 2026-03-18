@@ -132,7 +132,7 @@ def _client_with_db(fake_db: FakeAsyncSession) -> TestClient:
 
 def test_generate_digest_uses_latest_hasview_extraction_only() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
     today = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
@@ -197,13 +197,13 @@ def test_generate_digest_uses_latest_hasview_extraction_only() -> None:
 
 def test_generate_digest_window_and_time_priority_sorting() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
     digest_date = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
     fake_db.seed(Kol(id=1, platform="x", handle="alice", display_name="Alice", enabled=True, created_at=now))
 
-    # row A: as_of => business_ts=2026-03-05 00:00 UTC
+    # row A: as_of => business_ts=digest_date-1 00:00 UTC
     fake_db.seed(
         RawPost(
             id=21,
@@ -213,7 +213,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             external_id="p21",
             url="https://x.com/alice/21",
             content_text="content a",
-            posted_at=datetime(2026, 3, 5, 6, 0, 0, tzinfo=UTC),
+            posted_at=datetime.combine(digest_date - timedelta(days=1), datetime.min.time(), tzinfo=UTC) + timedelta(hours=6),
             fetched_at=now,
             raw_json=None,
         )
@@ -223,14 +223,14 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             id=201,
             raw_post_id=21,
             status=ExtractionStatus.approved,
-            extracted_json={"as_of": "2026-03-05", "hasview": 1, "summary": "A"},
+            extracted_json={"as_of": (digest_date - timedelta(days=1)).isoformat(), "hasview": 1, "summary": "A"},
             model_name="dummy",
             extractor_name="dummy",
             created_at=now - timedelta(hours=6),
         )
     )
 
-    # row B: no as_of => use posted_at=2026-03-06 03:00 UTC
+    # row B: no as_of => use posted_at=digest_date 03:00 UTC
     fake_db.seed(
         RawPost(
             id=22,
@@ -240,7 +240,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             external_id="p22",
             url="https://x.com/alice/22",
             content_text="content b",
-            posted_at=datetime(2026, 3, 6, 3, 0, 0, tzinfo=UTC),
+            posted_at=datetime.combine(digest_date, datetime.min.time(), tzinfo=UTC) + timedelta(hours=3),
             fetched_at=now,
             raw_json=None,
         )
@@ -267,7 +267,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             external_id="p23",
             url="https://x.com/alice/23",
             content_text="content c",
-            posted_at=datetime(2026, 3, 7, 1, 0, 0, tzinfo=UTC),  # outside window but should be ignored by posted_at if used
+            posted_at=datetime.combine(digest_date + timedelta(days=1), datetime.min.time(), tzinfo=UTC) + timedelta(hours=1),
             fetched_at=now,
             raw_json=None,
         )
@@ -280,7 +280,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
             extracted_json={"as_of": "", "hasview": 1, "summary": "C"},
             model_name="dummy",
             extractor_name="dummy",
-            created_at=datetime(2026, 3, 6, 5, 0, 0, tzinfo=UTC),
+            created_at=datetime.combine(digest_date, datetime.min.time(), tzinfo=UTC) + timedelta(hours=5),
         )
     )
 
@@ -300,7 +300,7 @@ def test_generate_digest_window_and_time_priority_sorting() -> None:
 
 def test_generate_digest_replaces_same_profile_date() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
     digest_date = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
@@ -360,7 +360,7 @@ def test_get_digest_not_found() -> None:
 
 def test_generate_digest_content_is_json_safe_before_persist() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
     digest_date = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))
@@ -425,7 +425,7 @@ def test_generate_digest_returns_json_when_service_raises(monkeypatch) -> None: 
 
 def test_generate_digest_ai_author_summaries_include_asset_fields() -> None:
     fake_db = FakeAsyncSession()
-    now = datetime(2026, 3, 6, 12, 0, 0, tzinfo=UTC)
+    now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
     digest_date = now.date()
 
     fake_db.seed(UserProfile(id=1, name="default", created_at=now))

@@ -1,85 +1,77 @@
 # STATUS
 
 ## Implemented
-- Extraction prompt rules upgraded to strict 6-key JSON: `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
-- Prompt SSOT is `apps/api/services/prompts/extraction_prompt.py` only.
-- Current extraction prompt body is Chinese and renders `author_handle/url/posted_at/content_text` into one user message.
-- Structured schema and normalize logic aligned to `islibrary` contract.
-- Top-level contract is `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
+
+### Extraction
+- Prompt SSOT is [extraction_prompt.py](/home/zhoucookie/code/investpulse/apps/api/services/prompts/extraction_prompt.py).
+- Prompt currently renders `author_handle`, `url`, `posted_at`, `content_text` into one user message.
+- Normalized extraction core keys are `as_of`, `source_url`, `islibrary`, `hasview`, `asset_views`, `library_entry`.
 - Canonical key order is fixed:
-  - top-level: `as_of,source_url,islibrary,hasview,asset_views,library_entry` (`meta` optional at tail)
-  - `asset_views[*]`: `symbol,market,stance,horizon,confidence,summary`
-- `market` enum is `CRYPTO|STOCK|ETF|FOREX|OTHER`; legacy auto enum value is removed.
-- `stance/horizon/market` must be model-direct exact enum output; server does not apply alias-map keyword/synonym normalization.
-- `asset_views` keeps only `confidence>=70`.
-- Chinese summary validation is enforced for:
-  - `asset_views[*].summary`
-  - `library_entry.summary`
-- Prompt-level extraction rules additionally enforce:
-  - strict direct-mention detection from the post text itself
-  - `hasview=1` only for real future/action-oriented investment claims
-  - `asset_views[*].summary` should carry a short reason chain in Chinese
-- Library boundary current contract:
-  - `library_entry` final shape is `{tag, summary}`
-  - `tag` enum: `macro|industry|thesis|strategy|risk|events`
-  - `library_entry.summary` must be exact `测试`
-  - invalid/missing `library_entry` downgrades to `islibrary=0`
-- Auto review:
-  - `hasview=0` auto reject
-  - auto approve requires `hasview=1` + threshold flow (`80`)
-  - writes `meta.auto_policy_applied`
-  - reject reason key is `meta.auto_review_reason` (legacy `auto_reject_*` removed)
-- Parse-failure semantics:
-  - parse-failed extraction remains `pending` at row status
-  - error is captured in `last_error`/`meta.parse_error(_reason)`
-  - classifier treats these rows as failed semantics for progress/retry
-- `parsed_model_output` DB type is `JSON` (ordered), not `JSONB`
-- Meta is stored in compact form:
-  - keeps auto-review result fields
-  - keeps exceptional state fields only when they affect replay/status (`library_downgraded`, `parse_error`, `fallback_reason`, `retry_source`, truncation flags)
-  - drops legacy/debug/runtime counters and empty placeholders
-  - omits `meta` completely when nothing meaningful remains
-- Daily Digest replay contract:
-  - single-row overwrite by `profile_id + digest_date`
-  - generation API params are `date/to_ts` only (`profile_id` not exposed; current fixed `1`)
-  - read API params are `date` only (`profile_id` not exposed; current fixed `1`)
-  - retention window is fixed to recent `3` days (today and previous `2` days)
-  - read/list paths auto-purge digests older than `3` days
-  - `daily_digests.version` is currently written as `1`
-- Weekly Digest replay contract:
-  - weekly report kinds: `recent_week|this_week|last_week`
-  - write key: `(profile_id, report_kind, anchor_date)` overwrite
-  - `this_week` starts at latest Sunday; `last_week` is previous full Sunday-Saturday
-  - weekly AI prompt pipeline is independent from daily digest
-  - weekly AI input aggregation is by day (`ai_input_by_day`)
-  - generate/read/list paths auto-purge stale rows whose `anchor_date` is not the expected current anchor for that `report_kind`
-- Extractions listing:
-  - `/extractions` response order is by business post time desc (`raw_post.posted_at`, fallback `extraction.created_at`), then by `id` desc
-  - `/extractions/stats` exposes current `raw_posts/post_extractions/duplicate_raw_post` counts
-  - manual force re-extract replaces all prior extraction rows for the same `raw_post` once the new AI result is valid; previous manual-approved rows are also deleted
-  - manual force re-extract uses the same auto-review rules as normal extraction after runtime validation succeeds
-- X ingest / extract-job operations:
-  - `/ingest/x/import` returns `pending_failed_dedup_count`, `pending_failed_dedup_ids`, and `pending_failed_reason_breakdown`
-  - dedup raw posts are only surfaced for follow-up extraction when their latest extraction is failed semantics
-  - `/extract-jobs/{job_id}` exposes `ai_call_used` in addition to OpenAI attempt counters
-- Portfolio holdings advice:
-  - added `POST /portfolio/advice` for AI aggregation on user-provided holdings context
-  - request supports `holding_reason_text/sell_timing_text/support_citations/risk_citations`
-  - when `OPENAI_API_KEY` is missing or AI request fails, API returns deterministic fallback advice (no hard failure)
-- Local runtime helper:
-  - `scripts/investpulse` starts/stops API and Web in background, manages `.runtime/*.pid`, tails `logs/*.log`, and auto-runs API migrations on start
-- Web robustness updates:
-  - daily/weekly digest pages retry short polling after generate-call proxy errors to recover eventual-success writes
-  - weekly page shows request-aware API error context (`request_id`)
-  - ingest page handles polling abort/unmount/manual-stop errors with explicit user-facing messages
-  - ingest progress prefers `ai_call_used` as uploaded-to-AI count and only falls back to attempt counters / success+failed for legacy payloads
-  - extractions page shows repository totals for `raw_posts`, `post_extractions`, and duplicate-version raw posts
-  - portfolio page delete now confirms and persists local storage immediately
+  - top level: `as_of, source_url, islibrary, hasview, asset_views, library_entry`
+  - `asset_views[*]`: `symbol, market, stance, horizon, confidence, summary`
+- Enum constraints are enforced:
+  - `market`: `CRYPTO|STOCK|ETF|FOREX|OTHER`
+  - `stance`: `bull|bear|neutral`
+  - `horizon`: `intraday|1w|1m|3m|1y`
+- `asset_views` normalization keeps only rows with `confidence >= 70`.
+- `hasview` is recomputed from the final normalized `asset_views`.
+- `asset_views[*].summary` and `library_entry.summary` must pass Chinese-summary validation.
+- Symbol normalization supports ASCII ticker forms and CJK asset names; invalid symbols are dropped.
+- `islibrary=1` with invalid or missing `library_entry` is downgraded to `islibrary=0` instead of failing the row.
+- Current library contract is still strict and test-shaped:
+  - `library_entry` shape is `{tag, summary}`
+  - `tag` enum is `macro|industry|thesis|strategy|risk|events`
+  - `summary` must equal exact literal `测试`
+- `parsed_model_output` is stored as ordered DB `JSON`.
+
+### Review And Failure Semantics
+- `hasview=0` auto-rejects.
+- Auto-approve requires `hasview=1` and confidence threshold `>= 80`.
+- Auto-review writes compact meta such as `auto_policy_applied`, `auto_review_reason`, `auto_review_threshold`, `model_confidence`.
+- Parse-failed model output is still persisted as an extraction row with DB `status=pending`.
+- Retry/progress logic treats parse-failed pending rows as failed semantics.
+- `POST /extractions/{id}/re-extract` is replacement-style:
+  - a valid new AI result can delete older extraction rows for the same `raw_post`
+  - `kol_views` referenced only by deleted rows are also removed
+  - if the new extraction is still failed semantics, old rows remain
+
+### Ingest And Jobs
+- X import, convert, preview, following-import, batch extract, async extract jobs, retry-failed, and retry-pending-all are implemented.
+- `/ingest/x/import` returns `pending_failed_dedup_count`, `pending_failed_dedup_ids`, and `pending_failed_reason_breakdown`.
+- `/extract-jobs/{job_id}` exposes `ai_call_used`, OpenAI attempt counters, and concurrency stats.
+
+### Views, Dashboard, And Assets
+- Assets, KOLs, KOL asset summaries, asset views, asset feed, asset timeline, and post-detail endpoints are implemented.
+- Dashboard aggregates pending extraction queue, top assets, clarity, active KOLs, recent extraction stats, and latest views.
+
+### Daily And Weekly Digests
+- Daily digest replay is unique by `(profile_id, digest_date)` and current API uses the system profile `id=1`.
+- Daily digest retention window is recent 3 days; read/list paths purge expired rows.
+- Weekly digest replay is unique by `(profile_id, report_kind, anchor_date)`.
+- Weekly digest kinds are `recent_week`, `this_week`, `last_week`.
+- Weekly digest stale rows are auto-purged when their anchor no longer matches the expected current anchor for that kind.
+- Weekly digest AI input is aggregated by day as `ai_input_by_day`.
+- Weekly digest AI prompt is independent from daily digest AI prompt.
+- Current weekly AI prompt emphasizes:
+  - focus on intraday and next `1w` to `1m`
+  - `3m+` views only as brief tail context
+  - explicit consensus vs disagreement criteria
+  - `trading_observations` grouped by author when short-term trade actions exist
+
+### Portfolio Advice
+- `POST /portfolio/advice` is implemented as request-time AI aggregation over user-supplied holdings and citations.
+- When `OPENAI_API_KEY` is missing, the API returns deterministic fallback advice with `status=skipped_no_api_key`.
+- When the AI call fails, the API returns fallback advice with `status=failed` instead of hard-failing the request.
+
+### Local Tooling
+- `scripts/investpulse` starts and stops API and Web in background, runs API migrations on start, writes logs to `logs/`, and manages PID files in `.runtime/`.
+- Root `make verify` runs migrations, ruff, lint, API tests, web tests, and root-level tests.
 
 ## Not Implemented
 - Event reminder entity and reminder lifecycle workflow.
-- Portfolio advice 历史版本化存储与回放实体。
+- Portfolio advice historical persistence and replay entity.
+- Public profile-management API endpoints. Profile tables and server-side rules exist, but no public route family is exposed.
 
-## Notes
-- Legacy read tolerance remains for historical records; old `library_tags` is ignored.
-- Prompt text currently asks model output `asset_views.confidence>=80`; runtime normalize threshold is `>=70`, and auto-review threshold is `>=80`.
+## Legacy / Boundary Notes
+- Historical records that still contain legacy `library_tags` are tolerated and ignored on read.
+- Reddit-related remnants are legacy only and are not an active product direction.

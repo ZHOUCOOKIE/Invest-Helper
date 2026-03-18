@@ -2,7 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-InvestPulse is an evidence-traceable investment signal dashboard built for research and trading workflows. It turns multi-source posts into structured views, supports review workflows, and provides replayable daily and weekly digests.
+InvestPulse is an evidence-traceable investment signal dashboard built for research and trading workflows. It turns source posts into structured views, supports review workflows, and provides replayable daily and weekly digests.
 
 ## UI Preview
 
@@ -14,7 +14,7 @@ Investment decisions built directly from social posts usually break down in thre
 
 - Information is fragmented across sources and hard to aggregate consistently.
 - Conclusions often lose the original evidence link, which weakens auditability and post-trade review.
-- Daily conclusions are easy to overwrite, making historical replay unreliable.
+- Daily conclusions are easy to overwrite or regenerate, making historical replay unreliable.
 
 InvestPulse is designed to turn the flow of `post -> extraction -> review -> view -> digest replay` into a traceable and operational system.
 
@@ -31,6 +31,7 @@ InvestPulse is designed to turn the flow of `post -> extraction -> review -> vie
 - The extraction contract is normalized to `as_of/source_url/islibrary/hasview/asset_views/library_entry`.
 - `asset_views` keeps only rows with `confidence >= 70`, and `hasview` is recomputed from the final normalized result.
 - Invalid or missing `library_entry` downgrades `islibrary=1` to `islibrary=0` instead of failing the record.
+- The current library branch is still intentionally strict and test-shaped: `library_entry.summary` must equal `测试`.
 - `hasview=0` is auto rejected.
 - Confidence-based auto approval uses the `>=80` threshold path.
 - Rejection reasons are recorded under `meta.auto_review_reason`.
@@ -39,9 +40,11 @@ InvestPulse is designed to turn the flow of `post -> extraction -> review -> vie
 - `/ingest/x/import` now reports deduplicated raw posts whose latest extraction is still failed semantics via `pending_failed_dedup_*`, so follow-up extract jobs can target only the rows that still need AI work.
 - Daily digests use a 3-day retention window and purge expired rows on read/list paths.
 - Weekly digests purge stale rows whose anchor date no longer matches the current expected anchor for the selected `report_kind`.
+- Weekly digest AI input is aggregated by day, and the current prompt emphasizes intraday to `1w/1m` impact plus author-grouped short-term trading observations.
 - `/extractions` is ordered by business post time descending, using `raw_post.posted_at` and falling back to `created_at`.
 - The web UI includes recovery polling for digest generation requests that may succeed in the backend after a proxy-side failure, extraction repository stats on the review queue, and AI upload progress derived from `ai_call_used` when available.
 - `scripts/investpulse` can start/stop API and Web in the background, run migrations on start, and manage local logs/PID files.
+- Profile tables and server-side profile rule loading exist, but public profile-management routes are not exposed yet.
 
 ## Product Surface
 

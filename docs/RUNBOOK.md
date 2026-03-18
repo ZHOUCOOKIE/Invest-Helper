@@ -1,9 +1,6 @@
 # RUNBOOK
 
-## Start Local Services
-```bash
-docker compose up -d db db_test redis
-```
+Authoritative
 
 ## Install Dependencies
 ```bash
@@ -11,142 +8,107 @@ pnpm install
 cd /home/zhoucookie/code/investpulse/apps/api && uv sync
 ```
 
-## One-Command Reset Dev DB Only (Keep Test DB)
+## Start Infra
 ```bash
-bash -lc 'cd /home/zhoucookie/code/investpulse && docker compose exec -T db psql -U postgres -d postgres -c "DROP DATABASE IF EXISTS investpulse WITH (FORCE);" && docker compose exec -T db psql -U postgres -d postgres -c "CREATE DATABASE investpulse;" && cd /home/zhoucookie/code/investpulse/apps/api && ENV=local DEBUG=false DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse uv run alembic upgrade head'
+docker compose up -d db db_test redis
 ```
 
-## API Run
+## Reset Dev DB Only
+```bash
+/home/zhoucookie/code/investpulse/scripts/reset_db_local.sh
+```
+
+This only targets the local dev database. Tests must still use `DATABASE_URL_TEST`.
+
+## Run API
 ```bash
 cd /home/zhoucookie/code/investpulse/apps/api
 ENV=local DEBUG=true DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse uv run uvicorn main:app --reload
 ```
 
-## One-Command Start API + Web
+## Run Web
 ```bash
-bash -lc 'cd /home/zhoucookie/code/investpulse/apps/api && ENV=local DEBUG=true DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse uv run uvicorn main:app --reload & cd /home/zhoucookie/code/investpulse/apps/web && pnpm dev'
+cd /home/zhoucookie/code/investpulse/apps/web
+pnpm dev
 ```
 
-## Background Start/Stop Helper
-One-time install into current WSL user PATH:
+## Background Helper
+
+Install once:
 ```bash
 mkdir -p ~/.local/bin
 ln -sf /home/zhoucookie/code/investpulse/scripts/investpulse ~/.local/bin/investpulse
 ```
 
-Start in background and open browser tabs for Web + API docs:
+Common commands:
 ```bash
 investpulse start
-```
-
-Stop background services:
-```bash
-investpulse end
-```
-
-Check status / logs:
-```bash
 investpulse status
 investpulse logs
 investpulse logs api
 investpulse logs web
 investpulse restart
+investpulse end
 ```
-Behavior:
-- API runs at `http://localhost:8000`
-- Web runs at `http://localhost:3000`
-- logs are written to `logs/api.log` and `logs/web.log`
-- PID files are written to `.runtime/`
-- `start` tries `docker compose up -d db db_test redis` first; if WSL Docker integration is unavailable, it falls back to Windows Docker Desktop when available
-- API startup runs `alembic upgrade head` against dev DB `postgresql+asyncpg://postgres:postgres@localhost:5432/investpulse`
-- supported env overrides:
-  - `INVESTPULSE_API_PORT`
-  - `INVESTPULSE_WEB_PORT`
-  - `INVESTPULSE_DB_HOST`
-  - `INVESTPULSE_DB_PORT`
-  - `INVESTPULSE_OPEN_BROWSER=0` to disable auto-open browser tabs
 
-## Verify Extraction Output (latest)
+Current helper behavior:
+- API default URL: `http://127.0.0.1:8000`
+- Web default URL: `http://127.0.0.1:3000`
+- logs go to `logs/api.log` and `logs/web.log`
+- PID files go to `.runtime/`
+- `start` brings up `db`, `db_test`, `redis` when Docker is available
+- if WSL Docker is unavailable, it can fall back to Windows Docker Desktop
+- API start runs `alembic upgrade head` before boot
+
+Supported env overrides:
+- `INVESTPULSE_API_PORT`
+- `INVESTPULSE_WEB_PORT`
+- `INVESTPULSE_DB_HOST`
+- `INVESTPULSE_DB_PORT`
+- `INVESTPULSE_OPEN_BROWSER=0`
+
+## Basic Health Checks
 ```bash
-curl -s "http://localhost:8000/extractions?limit=1" | jq '.[0].extracted_json'
+curl -s http://127.0.0.1:8000/health | jq
+curl -s http://127.0.0.1:8000/extractor-status | jq
 ```
-Expected business keys:
-- `as_of`
-- `source_url`
-- `islibrary`
-- `hasview`
-- `asset_views`
-- `library_entry`
-Canonical key order:
-- top-level: `as_of, source_url, islibrary, hasview, asset_views, library_entry` (`meta` optional at tail)
-- `asset_views[*]`: `symbol, market, stance, horizon, confidence, summary`
 
-## Inspect Normalize/Auto-Review Meta
+## Inspect Extractions
 ```bash
-curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,status,last_error,extracted_json:{as_of:.extracted_json.as_of,source_url:.extracted_json.source_url,islibrary:.extracted_json.islibrary,hasview:.extracted_json.hasview,asset_views:.extracted_json.asset_views,library_entry:.extracted_json.library_entry},meta:.extracted_json.meta}'
+curl -s "http://127.0.0.1:8000/extractions?limit=5" | jq
+curl -s "http://127.0.0.1:8000/extractions/stats" | jq
+curl -s "http://127.0.0.1:8000/extractions/1" | jq
 ```
-Note:
-- `meta` is intentionally compact now; many legacy/debug counters are removed during read normalization
-- rows without meaningful meta will omit `extracted_json.meta`
 
-## Inspect Extraction Repository Counts
+Useful checks:
+- confirm normalized keys are `as_of/source_url/islibrary/hasview/asset_views/library_entry`
+- confirm `asset_views` rows below `confidence 70` do not survive normalization
+- confirm parse-failed rows still exist as `pending` with `last_error`
+
+## Inspect Ordered Parsed Payload
 ```bash
-curl -s "http://localhost:8000/extractions/stats" | jq
+curl -s "http://127.0.0.1:8000/extractions?limit=3" | jq '.[] | {id, parsed_model_output}'
 ```
-Returns:
-- `raw_posts_count`
-- `post_extractions_count`
-- `duplicate_raw_post_count`
 
-## Inspect Parsed Model Output (ordered)
+## Re-Extract One Row
 ```bash
-curl -s "http://localhost:8000/extractions?limit=5" | jq '.[] | {id,parsed_model_output}'
+curl -s -X POST "http://127.0.0.1:8000/extractions/123/re-extract" | jq
 ```
-Expected `parsed_model_output` order:
-- `as_of, source_url, islibrary, hasview, asset_views, library_entry`
-- stored as DB `JSON` (not `JSONB`) to keep insertion order
 
-## Cleanup Historical Extraction JSON/Parsed JSON
+Expected behavior:
+- replacement extraction is created for the same `raw_post`
+- valid new AI results may remove older extraction rows for that raw post
+- failed-semantics new results do not delete the old rows
+
+## Import And Job Checks
 ```bash
-# dry-run
-curl -s -X POST "http://localhost:8000/admin/extractions/cleanup-json?confirm=YES&days=3650&limit=5000&dry_run=true" | jq
-
-# apply
-curl -s -X POST "http://localhost:8000/admin/extractions/cleanup-json?confirm=YES&days=3650&limit=5000&dry_run=false" | jq
+curl -s "http://127.0.0.1:8000/ingest/x/progress" | jq
+curl -s -X POST "http://127.0.0.1:8000/ingest/x/retry-failed" | jq
+curl -s -X POST "http://127.0.0.1:8000/ingest/x/retry-pending-all" | jq
+curl -s "http://127.0.0.1:8000/extract-jobs/<job_id>" | jq
 ```
 
-## Refresh Approved Rows With Missing `asset_views`
-```bash
-# dry-run
-curl -s -X POST "http://localhost:8000/admin/extractions/refresh-wrong-extracted-json?confirm=YES&days=365&limit=2000&dry_run=true" | jq
-
-# apply
-curl -s -X POST "http://localhost:8000/admin/extractions/refresh-wrong-extracted-json?confirm=YES&days=365&limit=2000&dry_run=false" | jq
-```
-
-## Recompute Extraction Statuses
-```bash
-# dry-run
-curl -s -X POST "http://localhost:8000/admin/extractions/recompute-statuses?confirm=YES&days=365&limit=5000&dry_run=true" | jq
-
-# apply
-curl -s -X POST "http://localhost:8000/admin/extractions/recompute-statuses?confirm=YES&days=365&limit=5000&dry_run=false" | jq
-```
-
-## Force Replace One Extraction
-```bash
-curl -s -X POST "http://localhost:8000/extractions/123/re-extract" | jq
-```
-Behavior:
-- creates one replacement extraction for the same `raw_post`
-- when the new AI result is valid, older extraction rows for that `raw_post` are deleted together with `kol_views` referenced only by those deleted rows
-- when the new extraction is still failed semantics, old rows are kept
-
-## Inspect Async Extract Job
-```bash
-curl -s "http://localhost:8000/extract-jobs/<job_id>" | jq
-```
-Key fields:
+Job fields to watch:
 - `ai_call_used`
 - `openai_call_attempted_count`
 - `success_count`
@@ -155,54 +117,33 @@ Key fields:
 - `max_concurrency_used`
 - `last_error_summary`
 
-## Typical Checks
-- Enum strictness:
-  - `market` only: `CRYPTO|STOCK|ETF|FOREX|OTHER` (legacy auto enum removed)
-  - `stance` only: `bull|bear|neutral`
-  - `horizon` only: `intraday|1w|1m|3m|1y`
-  - no alias-map keyword/synonym normalization for these enum fields
-- Asset post:
-  - `islibrary=0`
-  - `asset_views` only contains `confidence>=70` (prompt 文本要求模型输出 `>=80`)
-  - `hasview` 由归一化后的 `asset_views` 自动回填
-- Library post:
-  - `islibrary=1`
-  - valid `library_entry={tag,summary}`
-  - `library_entry.summary` 必须是 `测试`
-- Invalid library entry:
-  - downgraded to `islibrary=0`
-  - `library_entry=null`
-
-## Generate And Replay Digest
+## Daily Digest
 ```bash
-# generate (overwrite same profile_id + date; current API writes profile_id=1)
-curl -s -X POST "http://localhost:8000/digests/generate?date=2026-03-06" | jq
-
-# replay by date (current API reads profile_id=1)
-curl -s "http://localhost:8000/digests?date=2026-03-06" | jq
-
-# list replayable dates
-curl -s "http://localhost:8000/digests/dates" | jq
-
-# replay by digest id
-curl -s "http://localhost:8000/digests/1" | jq
+curl -s -X POST "http://127.0.0.1:8000/digests/generate?date=2026-03-18" | jq
+curl -s "http://127.0.0.1:8000/digests?date=2026-03-18" | jq
+curl -s "http://127.0.0.1:8000/digests/dates" | jq
+curl -s "http://127.0.0.1:8000/digests/1" | jq
 ```
 
-## Generate And Replay Weekly Digest
+Current constraints:
+- only the most recent 3 days are supported
+- current public flow uses system `profile_id=1`
+
+## Weekly Digest
 ```bash
-# generate weekly digest (kind: recent_week|this_week|last_week)
-curl -s -X POST "http://localhost:8000/weekly-digests/generate?kind=recent_week&date=2026-03-06" | jq
-
-# replay by kind + anchor_date
-curl -s "http://localhost:8000/weekly-digests?kind=recent_week&anchor_date=2026-03-06" | jq
-
-# list replayable anchor dates by kind
-curl -s "http://localhost:8000/weekly-digests/dates?kind=recent_week" | jq
+curl -s -X POST "http://127.0.0.1:8000/weekly-digests/generate?kind=recent_week&date=2026-03-18" | jq
+curl -s "http://127.0.0.1:8000/weekly-digests?kind=recent_week&anchor_date=2026-03-18" | jq
+curl -s "http://127.0.0.1:8000/weekly-digests/dates?kind=recent_week" | jq
 ```
+
+Current windows:
+- `recent_week`: reference date and previous 6 days
+- `this_week`: latest Sunday through reference date
+- `last_week`: previous full Sunday-Saturday
 
 ## Portfolio Advice
 ```bash
-curl -s -X POST "http://localhost:8000/portfolio/advice" \
+curl -s -X POST "http://127.0.0.1:8000/portfolio/advice" \
   -H "Content-Type: application/json" \
   -d '{
     "user_goal": "控制回撤并优化调仓节奏",
@@ -210,8 +151,8 @@ curl -s -X POST "http://localhost:8000/portfolio/advice" \
       {
         "asset_id": 101,
         "symbol": "BTC",
-        "holding_reason_text": "中长期看好资金持续流入",
-        "sell_timing_text": "若结构破位且风险证据增多则分批减仓",
+        "holding_reason_text": "中长期继续观察资金流与结构",
+        "sell_timing_text": "若破位并且风险证据持续增加则分批减仓",
         "support_citations": [
           {
             "source_url": "https://x.com/example/post/1",
@@ -227,6 +168,14 @@ curl -s -X POST "http://localhost:8000/portfolio/advice" \
       }
     ]
   }' | jq
+```
+
+## Admin Repair Endpoints
+```bash
+curl -s -X POST "http://127.0.0.1:8000/admin/extractions/cleanup-json?confirm=YES&days=3650&limit=5000&dry_run=true" | jq
+curl -s -X POST "http://127.0.0.1:8000/admin/extractions/refresh-wrong-extracted-json?confirm=YES&days=365&limit=2000&dry_run=true" | jq
+curl -s -X POST "http://127.0.0.1:8000/admin/extractions/recompute-statuses?confirm=YES&days=365&limit=5000&dry_run=true" | jq
+curl -s -X POST "http://127.0.0.1:8000/admin/fix/approved-missing-views?confirm=YES&days=365&limit=2000&dry_run=true" | jq
 ```
 
 ## Full Validation

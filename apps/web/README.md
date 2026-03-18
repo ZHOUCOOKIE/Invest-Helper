@@ -28,6 +28,11 @@ TL;DR
 - `/weekly-digests`
 - `/health`
 
+Current UI notes:
+- digest pages include recovery polling after generate-call proxy failures
+- ingest progress prefers `ai_call_used` when the API provides it
+- extractions page shows repository totals from `/extractions/stats`
+
 ## Scope Note
 
 - Non-X UI remnants are legacy, not a core product target.

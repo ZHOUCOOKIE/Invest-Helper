@@ -16,3 +16,6 @@ twitter-*.json
 # local runtime artifacts
 logs/
 .runtime/
+
+# local prompt scratch copies
+apps/api/services/prompts/extraction_prompt copy*.py

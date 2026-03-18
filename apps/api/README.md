@@ -14,6 +14,7 @@ TL;DR
 - OpenAPI JSON: `GET /openapi.json`
 - Swagger UI: `GET /docs`
 - Detailed endpoint examples: `docs/API.md`
+- Current public route families include health, assets, kols, ingest, extract jobs, extractions, dashboard, digests, weekly digests, portfolio advice, and admin repair endpoints.
 
 ## Data And Replay Pointers
 
@@ -23,3 +24,4 @@ TL;DR
 ## Not Implemented (API scope)
 
 - Event reminder scheduling/triggering API.
+- Public profile-management API.

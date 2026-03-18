@@ -245,6 +245,8 @@ async def _purge_stale_weekly_digests(
         .order_by(WeeklyDigest.anchor_date.desc(), WeeklyDigest.id.desc())
     )
     items = list(result.scalars().all())
+    if not any(item.anchor_date == expected_anchor for item in items):
+        return 0
     to_delete = [item for item in items if item.anchor_date != expected_anchor]
     for item in to_delete:
         await db.delete(item)
@@ -287,11 +289,11 @@ async def _generate_weekly_ai_analysis(
                 "trading_observations": "string|null",
             },
             "section_constraints": {
-                "market_overview": "概括近一周市场情绪走向（只取情绪比较清晰的几个资产）、主要驱动因素和整体节奏。",
-                "market_signals": "指出近一周最值得注意的方向、风险偏好变化、可能影响接下来走势的信号。",
-                "focus_points": "列出接下来最需要盯的事件、板块、资产或宏观变量。",
-                "key_news": "提炼最重要的新闻/事件，并说明为什么重要（影响路径/传导逻辑）。",
-                "trading_observations": "如果能归纳交易层面的启发则简短给出；信息不足必须输出 null，不得强行下结论。",
+                "market_overview": "重点概括帖子所反映的日内及未来一周到一个月市场情绪走向、主线资产或板块、主要驱动因素和整体节奏。若有3个月及以上的中长期线索，只在最后简短概括。",
+                "market_signals": "优先指出会影响日内及未来一周到一个月走势的方向、风险偏好变化、强弱切换和关键信号。3个月及以上的中长期判断只在段末简短补充，不要展开。",
+                "focus_points": "列出接下来日内、未来一周到一个月最需要盯的事件、板块、资产或宏观变量，按时间优先级组织。若存在3个月及以上主线，只放在最后做简要提醒。",
+                "key_news": "提炼最重要的新闻或事件，并说明为什么它会影响日内及未来一周到一个月的走势（影响路径或传导逻辑）。若有3个月及以上影响，只在最后简述。",
+                "trading_observations": "如果帖子中存在博主短期交易操作、短期持仓/建仓/减仓建议、或强烈的短线观点，必须按人分类总结：每位博主分别写其短期操作观点、目标资产和主要依据；没有足够信息时必须输出 null，不得强行下结论。",
             },
         },
     }
@@ -301,8 +303,10 @@ async def _generate_weekly_ai_analysis(
         "请遵守以下硬性要求："
         "1) 输出语言必须为简体中文；"
         "2) 避免空话和套话，直接给结论与依据；"
-        "3) 必须体现观点中的共识与分歧；"
-        "4) 若交易观察信息不足，trading_observations 必须输出 null，不得强行下结论。"
+        "3) 周报重点必须落在帖子对日内及未来一周到一个月走势的影响，3个月及以上的内容只能在各段最后简短概括，不得喧宾夺主；"
+        "4) 必须清晰写出观点中的共识与分歧，并严格按以下标准执行：只有当至少2个不同博主对同一资产、同一板块或同一交易方向给出相同或明显一致的方向性判断时，才可写为“共识”；只有当不同博主对同一资产、同一板块或同一交易方向给出明显相反或不一致的方向性判断时，才可写为“分歧”。若不足以构成共识，不要强行写成共识；写分歧时必须明确指出涉及的博主、对应资产或方向，以及判断差异。"
+        "5) 若交易观察中存在明确短线操作、短期持仓或建仓建议，trading_observations 必须按博主/作者分类总结，不要混成一段泛化结论；"
+        "6) 若交易观察信息不足，trading_observations 必须输出 null，不得强行下结论。"
         "请严格遵守输入中的 output_schema 与 section_constraints，"
         "输出必须是 JSON 对象，不要输出 markdown，不要输出额外解释。输入数据：\n"
         + json.dumps(prompt_input, ensure_ascii=False)
